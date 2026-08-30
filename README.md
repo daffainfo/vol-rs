@@ -43,8 +43,10 @@ Both sides were run against the same captures and diffed, header framing and tra
 | Windows plugins with no arguments | 99 of 100 identical |
 | Linux plugins with no arguments | 56 of 57 identical |
 | Runs that take arguments | 43 of 43 identical |
-| Files written by extracting plugins | 1,747 compared, all equal but 8 |
+| Files written by extracting plugins | 1,747 compared, every file both tools wrote is equal |
 | Plugin help pages | 197 of 197 identical |
+
+The eight files that did not compare equal are the two cases listed under Known differences below. Seven are partial files the Python version leaves on disk after reporting that it could not dump them, which this port does not create, and one is a tarball whose contents match but whose timestamps record when each run happened.
 
 The two plugins missing from those counts are the ones the Python version cannot finish on the test machine. `windows.memmap.Memmap` is killed by the out of memory killer after 7.8 million lines, and `linux.pscallstack.PsCallStack` is killed before it ends. In both cases every line the Python version managed to write first is reproduced exactly.
 
