@@ -1,0 +1,54 @@
+[package]
+name = "vol-rs"
+version = "1.0.0"
+edition = "2024"
+description = "A port of the Volatility 3 memory forensics framework from Python to Rust"
+repository = "https://github.com/daffainfo/vol-rs"
+readme = "README.md"
+license-file = "LICENSE"
+
+[[bin]]
+name = "vol-rs"
+path = "src/main.rs"
+
+[dependencies]
+aes = "0.9.2"
+aho-corasick = "1.1.5"
+byteorder = "1.5.0"
+bincode = { version = "2.0.1", features = ["serde"] }
+bzip2 = "0.6.1"
+chrono = "0.4.45"
+clap = { version = "4.6.6", features = ["derive"] }
+des = "0.9.0"
+env_logger = "0.11.11"
+flate2 = "1.1.10"
+hex = "0.4.3"
+log = "0.4.34"
+lru = "0.18.3"
+md-5 = "0.11.0"
+memchr = "2.7.6"
+mimalloc = "0.1.48"
+memmap2 = "0.9.11"
+rayon = "1.11.1"
+rustc-hash = "2.1.1"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+snap = "1.1.2"
+thiserror = "2.0.20"
+xz2 = "0.1.7"
+yara-x = "1.20.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+ureq = { version = "3.4.0", features = ["rustls"] }
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+libz-sys = "1.1.29"
+
+[profile.release]
+# One codegen unit and whole program optimisation, then drop the symbol table:
+# the binary comes out smaller and marginally faster, at the cost of a slower
+# build.
+lto = "fat"
+codegen-units = 1
+strip = true
