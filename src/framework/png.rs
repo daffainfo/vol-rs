@@ -154,11 +154,14 @@ fn deflate(data: &[u8]) -> Vec<u8> {
             return Vec::new();
         }
 
-        let mut out = vec![0u8; libz_sys::deflateBound(&mut stream, data.len() as u64) as usize];
+        // zlib's own integer types are used throughout, because a C long is
+        // half as wide on Windows as it is elsewhere.
+        let bound = libz_sys::deflateBound(&mut stream, data.len() as libz_sys::uLong);
+        let mut out = vec![0u8; bound as usize];
         stream.next_in = data.as_ptr() as *mut u8;
-        stream.avail_in = data.len() as u32;
+        stream.avail_in = data.len() as libz_sys::uInt;
         stream.next_out = out.as_mut_ptr();
-        stream.avail_out = out.len() as u32;
+        stream.avail_out = out.len() as libz_sys::uInt;
         let finished = libz_sys::deflate(&mut stream, libz_sys::Z_FINISH);
         let written = out.len() - stream.avail_out as usize;
         libz_sys::deflateEnd(&mut stream);
