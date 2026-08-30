@@ -34,7 +34,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: macos-arm64
-          - os: macos-13
+          # Apple ships both architectures in one SDK, so the Intel build is
+          # made on the same runner rather than needing an Intel one.
+          - os: macos-latest
             target: x86_64-apple-darwin
             platform: macos-x86_64
           - os: windows-latest
@@ -50,10 +52,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.platform }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The two Mac builds share one runner, so the architecture is checked
+      # rather than assumed.
+      - name: Check the architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          want="${{ matrix.target == 'x86_64-apple-darwin' && 'x86_64' || 'arm64' }}"
+          got=$(lipo -archs "target/${{ matrix.target }}/release/vol-rs")
+          echo "wanted $want, built $got"
+          [ "$got" = "$want" ]
 
       - name: Package
         if: runner.os != 'Windows'
