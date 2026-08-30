@@ -86,4 +86,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.event.release.tag_name || inputs.tag }}"
-          gh release upload "$tag" vol-rs-*.tar.gz vol-rs-*.tar.gz.sha256 vol-rs-*.zip vol-rs-*.zip.sha256 --clobber
+          # Each platform builds one kind of archive, so a pattern that matches
+          # nothing here drops out rather than being passed along as it stands.
+          shopt -s nullglob
+          files=(vol-rs-*.tar.gz vol-rs-*.tar.gz.sha256 vol-rs-*.zip vol-rs-*.zip.sha256)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No archive was produced for ${{ matrix.platform }}" >&2
+            exit 1
+          fi
+          gh release upload "$tag" "${files[@]}" --clobber
