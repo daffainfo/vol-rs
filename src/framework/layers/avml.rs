@@ -169,6 +169,14 @@ fn read_snappy_frames(data: &[u8], expected_length: u64) -> Result<(Vec<Frame>, 
             }
             // Compressed (0x00) or verbatim (0x01) data.
             0x00 | 0x01 => {
+                // A data frame carries a checksum before its payload, so one
+                // that says it is shorter than that checksum is malformed.
+                if frame_size < CRC_LEN {
+                    return Err(VolatilityError::Other(format!(
+                        "Snappy frame at offset {offset} is {frame_size} bytes, \
+                         too short to hold its checksum"
+                    )));
+                }
                 let start = payload_start + CRC_LEN;
                 let end = payload_start + frame_size;
                 if end > data.len() {
@@ -330,5 +338,34 @@ impl DataLayer for AvmlLayer {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::layers::physical::BufferLayer;
+    use std::sync::Arc;
+
+    /// An AVML file whose data frame claims to be shorter than the checksum
+    /// every data frame begins with.
+    fn zero_length_frame() -> Vec<u8> {
+        let mut data = vec![0u8; 44];
+        data[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        data[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        data[8..16].copy_from_slice(&0u64.to_le_bytes());
+        data[16..24].copy_from_slice(&4u64.to_le_bytes());
+        // A verbatim frame of no length at all.
+        data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn a_frame_shorter_than_its_checksum_is_refused_rather_than_panicking() {
+        let layers = LayerContainer::new();
+        layers.add(Arc::new(BufferLayer::new("base", zero_length_frame())));
+
+        let result = AvmlLayer::build(&layers, "avml", "base");
+        assert!(result.is_err(), "a malformed frame must not be accepted");
     }
 }

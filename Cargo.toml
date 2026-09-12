@@ -52,3 +52,6 @@ libz-sys = "1.1.29"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[build-dependencies]
+xz2 = "0.1.7"

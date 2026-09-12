@@ -370,23 +370,25 @@ impl PluginRegistry {
         &self.plugins
     }
 
-    /// Look up a plugin by its exact name, or by a unique case-insensitive
-    /// suffix so `pslist` finds `windows.pslist.PsList`.
+    /// Look up a plugin by name, accepting any part of one.
+    ///
+    /// A name that appears inside exactly one plugin's name selects it, so
+    /// `windows.pslist` finds `windows.pslist.PsList`. A name that appears in
+    /// several selects none of them, which is what the reference
+    /// implementation does.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Plugin>> {
-        if let Some(exact) = self.plugins.iter().find(|plugin| plugin.name() == name) {
-            return Some(exact.clone());
+        match self.matching(name).as_slice() {
+            [only] => Some((*only).clone()),
+            _ => None,
         }
+    }
 
-        let lowered = name.to_ascii_lowercase();
-        let matches: Vec<&Arc<dyn Plugin>> = self
-            .plugins
+    /// Every plugin whose name contains `name`, in the order they are listed.
+    pub fn matching(&self, name: &str) -> Vec<&Arc<dyn Plugin>> {
+        self.plugins
             .iter()
-            .filter(|plugin| plugin.name().to_ascii_lowercase() == lowered)
-            .collect();
-        if matches.len() == 1 {
-            return Some(matches[0].clone());
-        }
-        None
+            .filter(|plugin| plugin.name().contains(name))
+            .collect()
     }
 
     /// Plugins whose name contains `needle`, for the listing command.

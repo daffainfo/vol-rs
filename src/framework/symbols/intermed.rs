@@ -125,11 +125,23 @@ pub fn load_isf_from_zip(archive_path: &Path, entry_name: &str) -> Result<IsfFil
     IsfFile::from_slice(&json)
 }
 
-/// A located symbol file: either a path on disk or an entry inside a zip.
+include!(concat!(env!("OUT_DIR"), "/bundled_symbols.rs"));
+
+/// The bundled copy of `name`, if one was built into the binary.
+fn bundled(name: &str) -> Option<&'static [u8]> {
+    BUNDLED_SYMBOLS
+        .iter()
+        .find(|(held, _)| *held == name)
+        .map(|(_, data)| *data)
+}
+
+/// A located symbol file: a path on disk, an entry inside a zip, or one of the
+/// files built into the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymbolLocation {
     File(PathBuf),
     ZipEntry { archive: PathBuf, entry: String },
+    Bundled { name: String },
 }
 
 impl SymbolLocation {
@@ -140,6 +152,7 @@ impl SymbolLocation {
             SymbolLocation::ZipEntry { archive, entry } => {
                 format!("{}!{entry}", archive.display())
             }
+            SymbolLocation::Bundled { name } => format!("<built in>/{name}"),
         }
     }
 
@@ -151,6 +164,7 @@ impl SymbolLocation {
             SymbolLocation::ZipEntry { archive, entry } => {
                 format!("jar:file://{}!/{entry}", archive.display())
             }
+            SymbolLocation::Bundled { name } => format!("bundled://{name}"),
         }
     }
 
@@ -190,6 +204,9 @@ impl SymbolLocation {
                 member.read_to_end(&mut raw).ok()?;
                 decompress(Path::new(entry), raw).ok()
             }
+            SymbolLocation::Bundled { name } => {
+                decompress(Path::new("bundled.json.xz"), bundled(name)?.to_vec()).ok()
+            }
         }
     }
 
@@ -197,6 +214,13 @@ impl SymbolLocation {
         match self {
             SymbolLocation::File(path) => load_isf_file(path),
             SymbolLocation::ZipEntry { archive, entry } => load_isf_from_zip(archive, entry),
+            SymbolLocation::Bundled { name } => {
+                let packed = bundled(name).ok_or_else(|| {
+                    VolatilityError::Io(format!("No symbol file '{name}' is built in"))
+                })?;
+                let json = decompress(Path::new("bundled.json.xz"), packed.to_vec())?;
+                IsfFile::from_slice(&json)
+            }
         }
     }
 }
@@ -228,6 +252,18 @@ impl SymbolFinder {
     /// Find a symbol file named `filename` under `sub_path` (`windows`,
     /// `linux`, `mac`, or `generic`).
     pub fn find(&self, sub_path: &str, filename: &str) -> Option<SymbolLocation> {
+        if let Some(found) = self.find_on_disk(sub_path, filename) {
+            return Some(found);
+        }
+        // Nothing on disk, so the copy built into the binary is used. This is
+        // what makes the small framework tables work without anything being
+        // installed alongside.
+        let name = format!("{sub_path}/{filename}.json");
+        bundled(&name).map(|_| SymbolLocation::Bundled { name })
+    }
+
+    /// The same search, over the directories only.
+    fn find_on_disk(&self, sub_path: &str, filename: &str) -> Option<SymbolLocation> {
         for base in &self.base_paths {
             let directory = base.join(sub_path);
             for extension in ISF_EXTENSIONS {
@@ -504,6 +540,9 @@ mod banner_cache {
         let path = match location {
             SymbolLocation::File(path) => path.clone(),
             SymbolLocation::ZipEntry { archive, .. } => archive.clone(),
+            // A file built into the binary cannot change without the binary
+            // changing, so there is nothing to stamp.
+            SymbolLocation::Bundled { .. } => return None,
         };
         let data = std::fs::metadata(&path).ok()?;
         let modified = data
@@ -513,8 +552,8 @@ mod banner_cache {
             .ok()?
             .as_secs();
         let entry = match location {
-            SymbolLocation::File(_) => String::new(),
             SymbolLocation::ZipEntry { entry, .. } => entry.clone(),
+            _ => String::new(),
         };
         Some(format!("{}\t{entry}\t{modified}\t{}", path.display(), data.len()))
     }

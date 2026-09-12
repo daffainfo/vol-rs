@@ -44,7 +44,27 @@ jobs:
             platform: windows-x86_64
 
     steps:
+      # The tag names what to build, so it is settled before anything is
+      # fetched and every later step reads it from here.
+      - name: Settle the tag
+        id: tag
+        shell: bash
+        run: echo "name=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.name }}
+
+      # A release must be built from the commit its tag names, so that is
+      # checked rather than assumed.
+      - name: Check the tag against what was checked out
+        shell: bash
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          want=$(git rev-list -n 1 "refs/tags/$tag")
+          got=$(git rev-parse HEAD)
+          echo "tag $tag names $want, building $got"
+          [ "$want" = "$got" ]
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -72,11 +92,15 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          tag="${{ steps.tag.outputs.name }}"
           name="vol-rs-${tag}-${{ matrix.platform }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/vol-rs" "$name/"
           cp README.md LICENSE BENCHMARKS.md "$name/"
+          # What this was built from, so an archive can be traced back to it.
+          printf 'tag %s\ncommit %s\nplatform %s\ntarget %s\n' \
+            "$tag" "$(git rev-parse HEAD)" "${{ matrix.platform }}" "${{ matrix.target }}" \
+            > "$name/BUILD-INFO"
           tar czf "${name}.tar.gz" "$name"
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
 
@@ -84,12 +108,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = "${{ github.event.release.tag_name }}"
-          if (-not $tag) { $tag = "${{ inputs.tag }}" }
+          $tag = "${{ steps.tag.outputs.name }}"
           $name = "vol-rs-$tag-${{ matrix.platform }}"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/vol-rs.exe" $name
           Copy-Item README.md, LICENSE, BENCHMARKS.md $name
+          # What this was built from, so an archive can be traced back to it.
+          $commit = git rev-parse HEAD
+          "tag $tag`ncommit $commit`nplatform ${{ matrix.platform }}`ntarget ${{ matrix.target }}" |
+            Out-File -Encoding ascii "$name/BUILD-INFO"
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash | Out-File -Encoding ascii "$name.zip.sha256"
 
@@ -98,7 +125,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          tag="${{ steps.tag.outputs.name }}"
           # Each platform builds one kind of archive, so a pattern that matches
           # nothing here drops out rather than being passed along as it stands.
           shopt -s nullglob

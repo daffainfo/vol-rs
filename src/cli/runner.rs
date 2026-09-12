@@ -87,23 +87,31 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     }
 
     let plugin_name = arguments.plugin.as_deref().unwrap();
-    let plugin = registry.get(plugin_name).ok_or_else(|| {
-        let suggestions = registry.search(plugin_name);
-        if suggestions.is_empty() {
-            VolatilityError::Other(format!(
-                "No plugin named '{plugin_name}'. Use --list-plugins to see what is available."
-            ))
-        } else {
-            VolatilityError::Other(format!(
-                "No plugin named '{plugin_name}'. Did you mean: {}?",
-                suggestions
-                    .iter()
-                    .map(|p| p.name())
-                    .collect::<Vec<&str>>()
-                    .join(", ")
-            ))
+    // Any part of a plugin's name selects it, as long as only one plugin
+    // carries that part. The complaints below are the ones the reference
+    // implementation makes, with the same usage block above them.
+    let candidates = registry.matching(plugin_name);
+    let plugin = match candidates.as_slice() {
+        [only] => (*only).clone(),
+        [] => {
+            let all: Vec<&str> = registry.all().iter().map(|p| p.name()).collect();
+            eprint!("{}", crate::cli::help::framework_usage_block());
+            eprintln!(
+                "vol: error: argument PLUGIN: invalid choice {plugin_name} (choose from {})",
+                all.join(", ")
+            );
+            return Ok(2);
         }
-    })?;
+        several => {
+            let names: Vec<&str> = several.iter().map(|p| p.name()).collect();
+            eprint!("{}", crate::cli::help::framework_usage_block());
+            eprintln!(
+                "vol: error: argument PLUGIN: plugin {plugin_name} matches multiple plugins ({})",
+                names.join(", ")
+            );
+            return Ok(2);
+        }
+    };
 
     let context = Arc::new(Context::new());
     let config = Configuration::new();
