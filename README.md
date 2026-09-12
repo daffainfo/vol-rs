@@ -32,7 +32,7 @@ Every option the Python version takes is taken here too, with the same names and
 
 ## Symbols
 
-Symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/symbols` when that variable is not set. A pack somewhere else is named with `--symbol-dirs` or through the `VOLRS_SYMBOL_PATH` environment variable. Windows symbols are fetched from the Microsoft symbol server on demand and cached under `~/.cache/vol-rs`.
+Symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/symbols` when that variable is not set. A pack somewhere else is named with `--symbol-dirs` or through the `VOLRS_SYMBOL_PATH` environment variable. A Windows kernel that no pack describes is looked up on the Microsoft symbol server, and the database found there is turned into a symbol file and kept, so the fetch happens once. The database itself is cached under `~/.cache/vol-rs` and the symbol file is written beside the packs.
 
 ## What has been checked
 
@@ -47,6 +47,8 @@ Both sides were run against the same captures and diffed, header framing and tra
 | Plugin help pages | 197 of 197 identical |
 
 The eight files that did not compare equal are the two cases listed under Known differences below. Seven are partial files the Python version leaves on disk after reporting that it could not dump them, which this port does not create, and one is a tarball whose contents match but whose timestamps record when each run happened.
+
+Windows symbols are built from the database Microsoft publishes for the kernel in the image. For the capture used here that description matches the one the Python version builds from the same database exactly, across all 16 base types, 293 enumerations, 1,653 structures and 40,007 symbols.
 
 The two plugins missing from those counts are the ones the Python version cannot finish on the test machine. `windows.memmap.Memmap` is killed by the out of memory killer after 7.8 million lines, and `linux.pscallstack.PsCallStack` is killed before it ends. In both cases every line the Python version managed to write first is reproduced exactly.
 

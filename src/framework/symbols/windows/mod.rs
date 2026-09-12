@@ -16,6 +16,7 @@ pub mod resolver;
 pub mod sam;
 pub mod versions;
 pub mod pdb;
+pub mod pdbconv;
 
 use std::sync::Arc;
 

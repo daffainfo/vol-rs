@@ -260,15 +260,24 @@ pub fn detect(
     };
 
     let identity = found.candidate.symbol_file_name();
-    let Some(location) = finder.find(&found.candidate.symbol_directory(), &identity) else {
-        log::warn!(
-            "This kernel is described by {}/{identity}, which is not installed",
-            found.candidate.symbol_directory()
-        );
-        return Ok(Some(DetectedOs {
-            layer_name,
-            module_name: None,
-        }));
+    let directory = found.candidate.symbol_directory();
+    let location = match finder.find(&directory, &identity) {
+        Some(location) => location,
+        // Nothing describes this kernel yet, so the database Microsoft
+        // publishes for it is fetched and turned into one.
+        None => match build_symbols(&found.candidate, finder) {
+            Ok(location) => location,
+            Err(error) => {
+                log::warn!(
+                    "This kernel is described by {directory}/{identity}, \
+                     which is not installed and could not be built: {error}"
+                );
+                return Ok(Some(DetectedOs {
+                    layer_name,
+                    module_name: None,
+                }));
+            }
+        },
     };
     log::info!(
         "Matched kernel {identity} to symbols at {}",
@@ -388,5 +397,48 @@ mod tests {
     fn a_zero_address_page_is_never_a_dtb() {
         let page = self_referential_page(0, 0x1ED, 8);
         assert_eq!(TEST_64.check(&page, 0), None);
+    }
+}
+
+/// Build a symbol file for a kernel nothing yet describes.
+///
+/// Microsoft publishes a database for every binary it ships, named by the
+/// identifier the binary carries. Fetching that database and converting it
+/// gives the same description a symbol pack would, and it is written into the
+/// symbol directory so the work is done only once.
+fn build_symbols(
+    candidate: &pdbscan::KernelCandidate,
+    finder: &SymbolFinder,
+) -> Result<crate::framework::symbols::intermed::SymbolLocation> {
+    use crate::framework::symbols::intermed::SymbolLocation;
+    use crate::framework::symbols::windows::{pdb, pdbconv};
+
+    let identity = candidate.symbol_file_name();
+    let database = candidate.pdb_name.trim_end_matches('\0').to_string();
+    log::info!("Fetching {database} for {identity} from the symbol server");
+
+    let raw = pdb::fetch(&database, &candidate.guid, candidate.age)?;
+    let isf = pdbconv::to_isf(&raw, &database, &candidate.guid, candidate.age)?;
+    let json = serde_json::to_vec(&isf)
+        .map_err(|error| crate::error::VolatilityError::Other(format!("{error}")))?;
+
+    // The first directory that can be written to is where it is kept, so a
+    // later run finds it without fetching anything.
+    let written = finder.base_paths().iter().find_map(|base| {
+        let directory = base.join(candidate.symbol_directory());
+        std::fs::create_dir_all(&directory).ok()?;
+        let path = directory.join(format!("{identity}.json"));
+        std::fs::write(&path, &json).ok()?;
+        Some(path)
+    });
+
+    match written {
+        Some(path) => {
+            log::info!("Built {} from {database}", path.display());
+            Ok(SymbolLocation::File(path))
+        }
+        None => Err(crate::error::VolatilityError::Other(
+            "Nowhere to keep the symbols that were built".to_string(),
+        )),
     }
 }

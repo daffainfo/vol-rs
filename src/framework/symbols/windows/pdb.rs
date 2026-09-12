@@ -181,7 +181,7 @@ pub fn public_symbols(data: &[u8]) -> Result<PublicSymbols> {
 }
 
 /// Where each section of the image begins, relative to its base.
-fn image_sections(data: &[u8]) -> Vec<u32> {
+pub fn image_sections(data: &[u8]) -> Vec<u32> {
     let mut found = Vec::new();
     let mut at = 0usize;
     while at + 40 <= data.len() {
@@ -196,7 +196,7 @@ fn image_sections(data: &[u8]) -> Vec<u32> {
 
 /// A database is a file of fixed-size blocks, with a directory saying which
 /// blocks make up each stream.
-struct MultiStreamFile<'a> {
+pub struct MultiStreamFile<'a> {
     data: &'a [u8],
     block_size: usize,
     /// The blocks of each stream, and its length in bytes.
@@ -204,7 +204,7 @@ struct MultiStreamFile<'a> {
 }
 
 impl<'a> MultiStreamFile<'a> {
-    fn parse(data: &'a [u8]) -> Result<Self> {
+    pub fn parse(data: &'a [u8]) -> Result<Self> {
         if data.len() < 56 || !data.starts_with(MSF_MAGIC) {
             return Err(VolatilityError::Other(
                 "Not a program database of a readable generation".to_string(),
@@ -255,7 +255,7 @@ impl<'a> MultiStreamFile<'a> {
     }
 
     /// The bytes of one stream, gathered from its blocks.
-    fn stream(&self, index: usize) -> Result<Vec<u8>> {
+    pub fn stream(&self, index: usize) -> Result<Vec<u8>> {
         let (length, blocks) = self
             .streams
             .get(index)
