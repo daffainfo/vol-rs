@@ -1,5 +1,3 @@
-//! List the kernel's notification callbacks.
-//!
 //! The kernel lets drivers register for events, process creation, image
 //! loading, registry access, shutdown, a bug check. Each registration is a
 //! function pointer in a kernel array, a list, or a pool allocation. Malware
@@ -26,6 +24,7 @@ use crate::framework::symbols::windows::poolscanner::{
 use crate::framework::symbols::windows::resolver::ModuleCollection;
 use crate::framework::symbols::windows::object_header;
 
+/// Lists kernel callbacks and notification routines.
 pub struct Callbacks;
 
 /// Where a callback's detail comes from, since the three kinds are reported
@@ -49,6 +48,10 @@ impl Detail {
 }
 
 /// One callback, before its address is attributed to a module.
+///
+/// We might have multiple symbols pointing to the same location. Where there
+/// are no symbols we can at least report the module name, and where no module
+/// was found at the absolute location the address stands alone.
 struct Callback {
     kind: Value,
     address: u64,
@@ -180,19 +183,33 @@ fn notify_routines(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<
     let generic = format!("{table}!_GENERIC_CALLBACK");
     let mut found = Vec::new();
 
+    // Vista lengthened the process and thread arrays. Earlier kernels keep
+    // eight entries in every one of them.
+    let vista_or_later = crate::framework::symbols::windows::versions::matches(
+        context,
+        kernel,
+        &crate::framework::symbols::windows::versions::IS_VISTA_OR_LATER,
+    );
+    // The entries are a structure whose width follows the architecture.
+    let stride = context
+        .symbol_space
+        .get_type(&kernel.qualified("_EX_FAST_REF"))
+        .and_then(|template| context.symbol_space.size_of(&template))
+        .unwrap_or(8)
+        .max(1);
+
     for (symbol, extended) in NOTIFY_ARRAYS {
         // A kernel that does not name the array simply has none.
         let Ok(base) = context.symbol_offset(kernel, symbol) else {
             continue;
         };
-        // Vista lengthened the process and thread arrays.
-        let count = if *extended { 64 } else { 8 };
+        let count = if vista_or_later && *extended { 64 } else { 8 };
 
         for index in 0..count {
             let Ok(reference) = context.object(
                 &kernel.qualified("_EX_FAST_REF"),
                 &kernel.layer_name,
-                base + index * 8,
+                base + index * stride,
             ) else {
                 continue;
             };
@@ -222,11 +239,7 @@ fn notify_routines(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<
 
 /// What an `_EX_FAST_REF` points at, with the reference count masked off.
 fn fast_reference(reference: &Object) -> Result<u64> {
-    let raw = reference
-        .member("Object")
-        .and_then(|object| object.pointer_value())
-        .or_else(|_| reference.pointer_value())?;
-    Ok(raw & !0xF)
+    crate::framework::symbols::windows::fast_reference(reference)
 }
 
 /// The routines called when the machine stops with a bug check.
@@ -404,6 +417,13 @@ fn registry_callbacks(context: &Arc<Context>, kernel: &Module, table: &str) -> V
     found
 }
 
+/// Scans for callback objects using the poolscanner module and constraints.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+///
 /// The callbacks that are only found by searching the pools for them.
 fn scan(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<Callback> {
     let type_map = object_type_map(context, kernel);
@@ -416,6 +436,12 @@ fn scan(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<Callback> {
         let type_name = object.type_name().to_string();
 
         if type_name.ends_with("_SHUTDOWN_PACKET") {
+            // A packet whose own members do not hold up, or whose device is
+            // not a device, is not a registration however well its tag
+            // matched.
+            if !shutdown_packet_is_parseable(context, kernel, &object, &type_map, cookie) {
+                continue;
+            }
             // The routine is the driver's own shutdown handler, and the detail
             // is the driver's name.
             let (address, detail) = shutdown_packet(context, kernel, &object)
@@ -492,6 +518,65 @@ fn scan(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<Callback> {
         }
     }
     found
+}
+
+/// Determines whether or not this `_SHUTDOWN_PACKET` callback can be reliably
+/// parsed.
+///
+/// `_SHUTDOWN_PACKET` objects are found in IoSh pools, and this serves for all
+/// pooled shutdown callback packets. Requires a type map that maps NT executive
+/// object type indices to string representations.
+///
+/// Its own list links and its device have to be readable, the device's driver
+/// has to start on a page boundary, and the kernel's own type table has to
+/// call that device a device.
+fn shutdown_packet_is_parseable(
+    context: &Arc<Context>,
+    kernel: &Module,
+    packet: &Object,
+    type_map: &HashMap<u64, String>,
+    cookie: Option<u64>,
+) -> bool {
+    let readable = |field: Result<Object>| -> bool {
+        field
+            .and_then(|field| field.pointer_value())
+            .map(|address| context.layers.is_valid(packet.native_layer_name(), address, 1))
+            .unwrap_or(false)
+    };
+    if !readable(
+        packet
+            .member("Entry")
+            .and_then(|entry| entry.member("Flink")),
+    ) || !readable(
+        packet
+            .member("Entry")
+            .and_then(|entry| entry.member("Blink")),
+    ) || !readable(packet.member("DeviceObject"))
+    {
+        return false;
+    }
+
+    let Ok(device) = packet
+        .member("DeviceObject")
+        .and_then(|device| device.dereference_as(&kernel.qualified("_DEVICE_OBJECT")))
+    else {
+        return false;
+    };
+    let starts_on_a_page = device
+        .member("DriverObject")
+        .and_then(|driver| driver.member("DriverStart"))
+        .and_then(|start| start.pointer_value())
+        .map(|start| start % 0x1000 == 0)
+        .unwrap_or(false);
+    if !starts_on_a_page {
+        return false;
+    }
+
+    crate::framework::symbols::windows::poolscanner::object_type_of(
+        context, kernel, &device, type_map, cookie,
+    )
+    .as_deref()
+        == Some("Device")
 }
 
 /// The shutdown handler a packet registers, and the driver it belongs to.

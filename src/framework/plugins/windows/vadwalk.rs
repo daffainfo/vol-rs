@@ -1,5 +1,3 @@
-//! Walk the VAD tree, reporting its structure rather than its contents.
-//!
 //! Where `vadinfo` describes what each region is, this shows how the tree is
 //! shaped, useful when the tree itself is suspected of being corrupt.
 //!
@@ -17,6 +15,7 @@ use crate::framework::symbols::windows::list_processes;
 
 use super::vadinfo;
 
+/// Walk the VAD tree.
 pub struct VadWalk;
 
 impl Plugin for VadWalk {

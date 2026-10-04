@@ -1,5 +1,3 @@
-//! Report when the system booted.
-//!
 //! The kernel tracks time since boot separately from wall-clock time. The boot
 //! moment is the difference between them. It anchors every other timestamp a
 //! Linux image yields.
@@ -18,6 +16,7 @@ use crate::framework::renderers::conversion::timespec_to_datetime;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::linux::{boot_time_timespec, list_tasks};
 
+/// Shows the time the system was started
 pub struct BootTime;
 
 impl Plugin for BootTime {
@@ -71,8 +70,10 @@ impl Plugin for BootTime {
         let mut grid = TreeGrid::new(self.columns());
         let mut seen: HashSet<Option<u64>> = HashSet::new();
 
-        // One row per time namespace: tasks in a namespace see a boot time
-        // shifted by that namespace's offset, so a container reports its own.
+        // Enumerates tasks' boot times based on their time namespaces, one row
+        // per namespace: tasks in a namespace see a boot time shifted by that
+        // namespace's offset, so a container reports its own. Unique namespaces
+        // only, so a namespace shared by many tasks is reported once.
         for task in list_tasks(&context, &kernel, false)? {
             let namespace = task.time_namespace_id();
             if !seen.insert(namespace) {

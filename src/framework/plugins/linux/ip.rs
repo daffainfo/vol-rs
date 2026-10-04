@@ -1,5 +1,3 @@
-//! Report the network interfaces and their addresses.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,7 +11,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::linux::{list_net_devices, list_net_namespaces};
 
-/// Reports each interface's configured addresses.
+/// Lists network interface information for all devices
 pub struct Addr;
 
 impl Plugin for Addr {
@@ -52,11 +50,10 @@ impl Plugin for Addr {
         let mut grid = TreeGrid::new(self.columns());
 
         for namespace in list_net_namespaces(&context, &kernel)? {
-            let namespace_id = namespace
-                .member("ns")
-                .and_then(|ns| ns.member("inum"))
-                .and_then(|inum| inum.as_u64())
-                .unwrap_or(0);
+            // A kernel before 3.8 has nothing to name a namespace by, and a
+            // zero is treated the same way, since upstream tests the number for
+            // truth rather than for presence.
+            let namespace_id = net_namespace_id(&namespace).filter(|id| *id != 0);
 
             for device in list_net_devices(&kernel, &namespace).unwrap_or_default() {
                 let mac = device.mac_address();
@@ -72,7 +69,10 @@ impl Plugin for Addr {
                     grid.push(
                         0,
                         vec![
-                            Value::int(namespace_id as i64),
+                            match namespace_id {
+                                Some(id) => Value::int(id as i64),
+                                None => Value::not_available(),
+                            },
                             or_unreadable(device.index(), Value::int),
                             or_unreadable(device.name(), Value::string),
                             match &mac {
@@ -93,7 +93,26 @@ impl Plugin for Addr {
     }
 }
 
-/// Reports each interface's link-layer configuration.
+/// A network namespace's own inode number, which is what names it.
+///
+/// Kernel 3.8 gave namespaces an inode, moving it into `ns` in 3.19. A kernel
+/// older than that has nothing to report here. `net_namespace_list` itself
+/// exists from kernels >= 2.6.24.
+fn net_namespace_id(namespace: &crate::framework::objects::Object) -> Option<u64> {
+    // 3.8.13 <= kernel < 3.19.8 keeps it in `proc_inum`, kernel >= 3.19.8 in
+    // `ns.inum`, and a kernel < 3.8.13 has no net_namespace inode at all.
+    if namespace.has_member("proc_inum") {
+        return namespace.member("proc_inum").and_then(|id| id.as_u64()).ok();
+    }
+    namespace
+        .member("ns")
+        .ok()
+        .filter(|ns| ns.has_member("inum"))
+        .and_then(|ns| ns.member("inum").ok())
+        .and_then(|inum| inum.as_u64().ok())
+}
+
+/// Lists information about network interfaces similar to `ip link show`
 pub struct Link;
 
 impl Plugin for Link {
@@ -131,17 +150,19 @@ impl Plugin for Link {
         let mut grid = TreeGrid::new(self.columns());
 
         for namespace in list_net_namespaces(&context, &kernel)? {
-            let namespace_id = namespace
-                .member("ns")
-                .and_then(|ns| ns.member("inum"))
-                .and_then(|inum| inum.as_u64())
-                .unwrap_or(0);
+            // A kernel before 3.8 has nothing to name a namespace by, and a
+            // zero is treated the same way, since upstream tests the number for
+            // truth rather than for presence.
+            let namespace_id = net_namespace_id(&namespace).filter(|id| *id != 0);
 
             for device in list_net_devices(&kernel, &namespace).unwrap_or_default() {
                 grid.push(
                     0,
                     vec![
-                        Value::int(namespace_id as i64),
+                        match namespace_id {
+                            Some(id) => Value::int(id as i64),
+                            None => Value::not_available(),
+                        },
                         or_unreadable(device.name(), Value::string),
                         device
                             .mac_address()

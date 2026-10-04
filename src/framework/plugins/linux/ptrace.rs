@@ -1,5 +1,3 @@
-//! Report which processes are tracing which others.
-//!
 //! `ptrace` gives one process complete control over another: reading its
 //! memory, altering its registers, intercepting its system calls. An unexpected
 //! tracing relationship is worth explaining.
@@ -18,6 +16,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Enumerates ptrace's tracer and tracee tasks
 pub struct Ptrace;
 
 /// The ptrace flags a traced task can carry.
@@ -69,6 +68,7 @@ impl Plugin for Ptrace {
         ]
     }
 
+    /// Enumerates ptrace's tracer and tracee tasks.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let filter = pid_filter(config);

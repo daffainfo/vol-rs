@@ -1,5 +1,3 @@
-//! Map strings found in an image back to the processes that own them.
-//!
 //! Given a list of `offset: text` pairs, which is what the `strings` utility
 //! writes for a raw image, this reports which process or kernel region each
 //! physical offset belongs to. That turns a flat list of interesting text into
@@ -21,6 +19,8 @@ use crate::framework::plugins::{
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 
+/// Reads output from the strings command and indicates which process(es) each
+/// string belongs to.
 pub struct Strings;
 
 impl Plugin for Strings {
@@ -118,42 +118,52 @@ fn read_strings_file(path: &str) -> Result<Vec<(u64, String)>> {
     Ok(entries)
 }
 
+/// Parses a single line from a strings file.
+///
+/// # Args
+///
+/// * `line` - bytes of the line of a strings file (an offset and a string)
+///
 /// Read one line of a strings file.
 ///
 /// The first run of digits that is preceded only by non-word characters is the
 /// offset, and the text is what follows once any further non-word characters
 /// are passed over.
 fn parse_line(line: &[u8]) -> Option<(u64, String)> {
-    let mut at = 0usize;
-    while at < line.len() {
-        // The offset must be preceded by non-word characters only.
-        let mut cursor = at;
-        while cursor < line.len() && !is_word(line[cursor]) {
-            cursor += 1;
-        }
-        let digits_start = cursor;
-        while cursor < line.len() && line[cursor].is_ascii_digit() {
-            cursor += 1;
-        }
-        if cursor == digits_start {
-            at += 1;
-            continue;
-        }
-        let offset: u64 = std::str::from_utf8(&line[digits_start..cursor])
-            .ok()?
-            .parse()
-            .ok()?;
+    // The reference implementation matches
+    // `^(?:\W*)([0-9]+)(?:\W*)(\w[\w\W]+)\n?` against the line. The pattern
+    // is anchored, so the digits are the first word characters on the line,
+    // and where the text after the separator does not begin with a word
+    // character the engine gives digits back from the right until it does. A
+    // line with a single digit has nothing to give back and is not a line.
+    let mut cursor = 0usize;
+    while cursor < line.len() && !is_word(line[cursor]) {
+        cursor += 1;
+    }
+    let digits_start = cursor;
+    while cursor < line.len() && line[cursor].is_ascii_digit() {
+        cursor += 1;
+    }
+    let digits_end = cursor;
+    if digits_end == digits_start {
+        return None;
+    }
 
+    for end in (digits_start + 1..=digits_end).rev() {
         // Whatever separates the offset from the text is passed over, and the
-        // text itself must begin with a word character.
-        let mut text_start = cursor;
+        // text itself must begin with a word character and carry another after
+        // it.
+        let mut text_start = end;
         while text_start < line.len() && !is_word(line[text_start]) {
             text_start += 1;
         }
         if text_start >= line.len() || line.len() - text_start < 2 {
-            at = digits_start + 1;
             continue;
         }
+        let offset: u64 = std::str::from_utf8(&line[digits_start..end])
+            .ok()?
+            .parse()
+            .ok()?;
         // The bytes are a byte per character, which is how the reference
         // implementation decodes them.
         let text: String = line[text_start..].iter().map(|byte| *byte as char).collect();
@@ -164,10 +174,12 @@ fn parse_line(line: &[u8]) -> Option<(u64, String)> {
 
 /// Whether a byte is one of the characters a word is made of.
 fn is_word(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+    // A pattern over bytes rather than text, which is what the reference
+    // implementation compiles, counts only ASCII as word characters.
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// Map each page to what has it mapped.
+/// Creates a reverse mapping between virtual addresses and physical addresses.
 ///
 /// The kernel's own space is recorded by the physical page each of its pages
 /// resolves to. A process's space is recorded by its *virtual* page instead,
@@ -215,6 +227,8 @@ fn build_reverse_map(
         log::debug!("Mapping the kernel space took {:?}", started.elapsed());
     }
 
+    // TODO: Include kernel modules.
+    //
     // A process contributes one entry per mapping, keyed on the page that
     // mapping starts at, so the only pages worth asking about are the ones a
     // string landed on. Asking about those directly answers the same question

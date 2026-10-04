@@ -1,10 +1,12 @@
 //! Layer stacking: work out what an image file actually is, and build the
 //! chain of layers needed to read it.
 //!
-//! Each format is tried in turn against the current top layer. When one
-//! matches, its layer is stacked on top and the process repeats, so a LiME file
-//! inside a raw file, or an ELF core holding a Windows crash dump, both resolve
-//! without the caller knowing the format in advance.
+//! This is the most important automagic and must happen first. Each format is
+//! tried in turn against the current top layer: repeatedly apply "determine
+//! what this is" code and build as much up as possible. When one matches, its
+//! layer is stacked on top and the process repeats, so a LiME file inside a raw
+//! file, or an ELF core holding a Windows crash dump, both resolve without the
+//! caller knowing the format in advance.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -13,7 +15,9 @@ use std::sync::Arc;
 
 use crate::error::{Result, VolatilityError};
 use crate::framework::layers::physical::FileLayer;
-use crate::framework::layers::{avml, crash, elf, lime, qemu, vmware, DataLayer, LayerContainer};
+use crate::framework::layers::{
+    avml, crash, elf, lime, qemu, vmware, xen, DataLayer, LayerContainer,
+};
 
 /// How many times a format may be stacked before we conclude something is
 /// looping. Real images need two or three levels at most.
@@ -33,7 +37,8 @@ pub struct StackResult {
 
 /// Build the layer stack for an image file.
 ///
-/// Returns the name of the layer that exposes physical memory.
+/// Bows out quickly if no location was provided. Returns the name of the layer
+/// that exposes physical memory.
 pub fn stack_image(layers: &LayerContainer, path: &std::path::Path) -> Result<StackResult> {
     // The names match the reference implementation's, since an image's
     // description reports them.
@@ -55,6 +60,20 @@ pub fn stack_image(layers: &LayerContainer, path: &std::path::Path) -> Result<St
             // Nothing else recognises this layer, so it is the physical layer.
             None => break,
         }
+    }
+
+    // A layer is named after the place it fills in the one above it. Where
+    // nothing was stacked, the file itself is what the kernel's own layer
+    // reads from, so it takes that name rather than the one below it.
+    if created.len() == 1 {
+        let wanted = layers.free_name("memory_layer");
+        layers.add(Arc::new(FileLayer::new(&wanted, path)?));
+        layers.remove(&current);
+        return Ok(StackResult {
+            top_layer: wanted.clone(),
+            created: vec![wanted],
+            directory_table_base,
+        });
     }
 
     Ok(StackResult {
@@ -111,6 +130,10 @@ fn try_stack_one(layers: &LayerContainer, base: &str) -> Option<(String, Option<
     // image matches nothing and ends the loop.
     let attempts: Vec<(&str, fn(&LayerContainer, &str, &str) -> Result<Arc<dyn DataLayer>>)> = vec![
         ("elf", stack_elf),
+        // A Xen dump is an ELF file whose sections, not program headers,
+        // describe its pages, so it is tried once the plain ELF layer has
+        // failed to find any.
+        ("xen", stack_xen),
         ("lime", stack_lime),
         ("avml", stack_avml),
         ("qemu", stack_qemu),
@@ -139,6 +162,10 @@ fn try_stack_one(layers: &LayerContainer, base: &str) -> Option<(String, Option<
 
 fn stack_elf(layers: &LayerContainer, name: &str, base: &str) -> Result<Arc<dyn DataLayer>> {
     Ok(Arc::new(elf::build(layers, name, base)?))
+}
+
+fn stack_xen(layers: &LayerContainer, name: &str, base: &str) -> Result<Arc<dyn DataLayer>> {
+    Ok(Arc::new(xen::build(layers, name, base)?))
 }
 
 fn stack_lime(layers: &LayerContainer, name: &str, base: &str) -> Result<Arc<dyn DataLayer>> {
@@ -205,7 +232,9 @@ mod tests {
         let result = stack_image(&layers, &path).unwrap();
 
         assert_eq!(result.created.len(), 1);
-        assert_eq!(result.top_layer, "base_layer");
+        // With nothing to stack, the file layer is the memory the plugins
+        // read, and it takes the name upstream gives that layer.
+        assert_eq!(result.top_layer, "memory_layer");
         std::fs::remove_file(&path).ok();
     }
 

@@ -24,6 +24,9 @@ const VALID_DUMP_32: u32 = 0x504D_5544;
 const VALID_DUMP_64: u32 = 0x3436_5544;
 
 /// Dump body formats this layer can read.
+///
+/// 0x5 is needed for 32-bit bitmaps too, and the `_SUMMARY_DUMP` that describes
+/// a bitmap dump is shared between 32- and 64-bit.
 const DUMP_TYPE_FULL: u32 = 0x1;
 const DUMP_TYPE_BITMAP: u32 = 0x5;
 
@@ -118,7 +121,12 @@ pub fn check_header(layers: &LayerContainer, layer: &str) -> Result<CrashHeader>
     })
 }
 
-/// Build a layer over a Windows crash dump.
+/// A Windows crash format TranslationLayer.
+///
+/// This TranslationLayer supports Microsoft complete memory dump files. It
+/// currently does not support kernel or small memory dump files.
+/// Read the header, extract the DTB, verify the format is supported, and then
+/// load the segments, which needs the base layer before it will work.
 pub fn build(
     layers: &LayerContainer,
     name: impl Into<String>,
@@ -151,7 +159,13 @@ pub fn build(
         if header.is_64bit { "Intel64" } else { "Intel32" }.to_string(),
     );
 
-    let layer = SegmentedLayer::new(name, base_layer, segments, metadata).map(|layer| layer.of_kind("WindowsCrashDump64Layer").in_module("volatility3.framework.layers.crash"))?;
+    let kind = if header.is_64bit {
+        "WindowsCrashDump64Layer"
+    } else {
+        "WindowsCrashDump32Layer"
+    };
+    let layer = SegmentedLayer::new(name, base_layer, segments, metadata)
+        .map(|layer| layer.of_kind(kind).in_module("volatility3.framework.layers.crash"))?;
     Ok((layer, header))
 }
 
@@ -204,10 +218,12 @@ fn bitmap_dump_segments(
     layer: &str,
     layout: &HeaderLayout,
 ) -> Result<Vec<Segment>> {
-    // The bitmap header sits at the start of the dump body.
+    // The bitmap header sits at the start of the dump body. It records where
+    // the pages themselves begin, how many of them are present, and how many
+    // pages the bitmap covers, which is the one that says how long it is.
     let summary = layout.header_size;
     let header_size = read_word(layers, layer, summary + 0x20, 8)?;
-    let bitmap_size = read_word(layers, layer, summary + 0x28, 8)?;
+    let bitmap_size = read_word(layers, layer, summary + 0x30, 8)?;
 
     if bitmap_size == 0 || bitmap_size > 1 << 32 {
         return Err(VolatilityError::layer(
@@ -216,8 +232,13 @@ fn bitmap_dump_segments(
         ));
     }
 
-    let bitmap_bytes = bitmap_size.div_ceil(8);
-    let bitmap = layers.read(layer, summary + 0x38, bitmap_bytes as usize, true)?;
+    // The bitmap is read as a run of thirty two bit words, and the last word
+    // is read whole even where the page count does not fill it. That is how
+    // the reference implementation reads it, and it means a run reaching the
+    // end of the bitmap is closed at the end of that word.
+    let words = bitmap_size.div_ceil(32);
+    let bitmap = layers.read(layer, summary + 0x38, (words * 4) as usize, true)?;
+    let covered = words * 32;
 
     let mut segments = Vec::new();
     // Present pages are packed in the file starting at header_size, in bitmap
@@ -227,7 +248,7 @@ fn bitmap_dump_segments(
     let mut run_start: Option<u64> = None;
     let mut run_file_offset = 0u64;
 
-    for page in 0..bitmap_size {
+    for page in 0..covered {
         let byte = bitmap[(page / 8) as usize];
         let present = byte & (1 << (page % 8)) != 0;
 
@@ -255,7 +276,7 @@ fn bitmap_dump_segments(
         segments.push(Segment::linear(
             start * PAGE_SIZE,
             run_file_offset,
-            (bitmap_size - start) * PAGE_SIZE,
+            (covered - start) * PAGE_SIZE,
         ));
     }
 
@@ -335,8 +356,11 @@ mod tests {
             .copy_from_slice(&DUMP_TYPE_BITMAP.to_le_bytes());
 
         let summary = body_start as usize;
+        // HeaderSize says where the pages start, Pages how many are present,
+        // and BitmapSize how many pages the bitmap covers.
         data[summary + 0x20..summary + 0x28].copy_from_slice(&data_start.to_le_bytes());
-        data[summary + 0x28..summary + 0x30].copy_from_slice(&4u64.to_le_bytes());
+        data[summary + 0x28..summary + 0x30].copy_from_slice(&3u64.to_le_bytes());
+        data[summary + 0x30..summary + 0x38].copy_from_slice(&4u64.to_le_bytes());
         // Bits 0, 1 and 3 set: pages 0, 1 and 3 are present.
         data[summary + 0x38] = 0b1011;
 

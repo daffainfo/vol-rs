@@ -8,26 +8,49 @@ use std::io::Write;
 use serde_json::{json, Map, Value as JsonValue};
 
 use crate::error::Result;
-use crate::framework::renderers::{Renderer, TreeGrid, Value};
+use crate::framework::renderers::{ColumnType, Renderer, TreeGrid, Value};
 
 /// Convert a cell into JSON, preserving its type rather than stringifying it.
-fn to_json(value: &Value) -> JsonValue {
+///
+/// What an absent cell becomes depends on the column holding it, because
+/// upstream writes each column type through a renderer of its own and those
+/// renderers disagree about absence: one writes `N/A`, one writes an empty
+/// string, and the rest write null.
+fn to_json(value: &Value, column: ColumnType) -> JsonValue {
     match value {
-        Value::Absent(_) => JsonValue::Null,
+        Value::Absent(absent) => match column {
+            // Both of these are written by a renderer that names the absence
+            // rather than passing it on.
+            ColumnType::HexBytes | ColumnType::LayerData => json!("N/A"),
+            // `quoted_optional` turns both kinds of absence into nothing at
+            // all, which is an empty string rather than a null.
+            ColumnType::MultiTypeData | ColumnType::Disassembly => json!(""),
+            // A plain byte column keeps the mark the table would show.
+            ColumnType::Bytes => json!(absent.to_string()),
+            _ => JsonValue::Null,
+        },
         Value::Bool(inner) => json!(inner),
         Value::Int(inner, _) => json!(inner),
         Value::UInt(inner, _) => json!(inner),
         Value::Float(inner) => json!(inner),
         Value::Str(inner) => json!(inner),
+        // Every byte column is written as space-separated hex pairs, which is
+        // what `bytes.hex(" ")` gives upstream.
         Value::Bytes(inner)
-        | Value::MultiTypeData(inner)
         | Value::HexDump(inner)
         | Value::LayerDump { bytes: inner, .. }
-        | Value::WideText(inner)
-        | Value::MultiString(inner)
         | Value::HexPairs(inner) => {
-            json!(hex::encode(inner))
+            let pairs: Vec<String> = inner.iter().map(|byte| format!("{byte:02x}")).collect();
+            json!(pairs.join(" "))
         }
+        // A text column built from bytes keeps its text, wrapped in a pair of
+        // literal quotes by `quoted_optional`.
+        Value::WideText(_) | Value::MultiString(_) | Value::MultiTypeHex(_) => {
+            json!(format!("\"{value}\""))
+        }
+        // The one exception is a value that began as a number, which the same
+        // wrapper leaves unquoted.
+        Value::MultiTypeData(_) => json!(value.to_string()),
         // Python writes a timestamp with six decimal places, or with none at
         // all when it falls on a whole second.
         Value::DateTime(inner) => {
@@ -50,8 +73,16 @@ fn to_json(value: &Value) -> JsonValue {
             };
             json!(text)
         }
-        Value::Disassembly { data, offset, .. } => {
-            json!({"offset": offset, "data": hex::encode(data)})
+        // Upstream writes the disassembly here as well, but through
+        // `quoted_optional`, which wraps it in a pair of literal quotes inside
+        // the JSON string.
+        Value::Disassembly {
+            data,
+            offset,
+            architecture,
+        } => {
+            let text = crate::framework::disassembly::text(data, *offset, architecture);
+            json!(format!("\"{text}\""))
         }
     }
 }
@@ -69,8 +100,8 @@ pub struct JsonRenderer {
 
 impl JsonRenderer {
     /// Build the tree of records the grid describes.
-    fn records(&self, grid: &TreeGrid) -> Vec<JsonValue> {
-        let ignored = self.options.ignored(grid);
+    fn records(&self, grid: &TreeGrid) -> Result<Vec<JsonValue>> {
+        let ignored = self.options.ignored(grid)?;
         let mut roots: Vec<JsonValue> = Vec::new();
         // The object most recently seen at each depth, so a row can be added to
         // the one above it.
@@ -92,7 +123,7 @@ impl JsonRenderer {
                 if ignored.contains(&index) {
                     continue;
                 }
-                object.insert(column.name.clone(), to_json(value));
+                object.insert(column.name.clone(), to_json(value, column.column_type));
             }
             object.insert("__children".to_string(), json!([]));
 
@@ -125,7 +156,7 @@ impl JsonRenderer {
                 roots.push(node);
             }
         }
-        roots
+        Ok(roots)
     }
 }
 
@@ -139,13 +170,13 @@ impl Renderer for JsonRenderer {
         // came. Where the failure was reported, two blank lines mark it.
         match grid.truncation() {
             Truncation::None => {}
-            Truncation::Abrupt => return Ok(()),
+            Truncation::Abrupt | Truncation::Discarded => return Ok(()),
             Truncation::Reported => {
                 write!(output, "\n\n")?;
                 return Ok(());
             }
         }
-        let records = self.records(grid);
+        let records = self.records(grid)?;
         if self.lines {
             for record in &records {
                 writeln!(output, "{}", compact(record))?;
@@ -214,7 +245,35 @@ fn indented(value: &JsonValue, depth: usize) -> String {
 }
 
 /// A scalar as a JSON document spells it.
+///
+/// Python escapes every character outside printable ASCII, so a string carries
+/// `\uXXXX` rather than the character itself. Nothing but a string can hold
+/// such a character, so the whole rendering goes through the same escape.
 fn scalar(value: &JsonValue) -> String {
-    value.to_string()
+    escape_non_ascii(&value.to_string())
+}
+
+/// Replace every character outside printable ASCII with its `\uXXXX` escape,
+/// as a surrogate pair where one escape cannot hold it.
+fn escape_non_ascii(text: &str) -> String {
+    if text.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+        return text.to_string();
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        let code = character as u32;
+        if code < 0x7f {
+            escaped.push(character);
+        } else if code <= 0xFFFF {
+            escaped.push_str(&format!("\\u{code:04x}"));
+        } else {
+            // Outside the basic plane a character is written as the two halves
+            // of a surrogate pair, which is what Python writes.
+            let value = code - 0x1_0000;
+            escaped.push_str(&format!("\\u{:04x}", 0xD800 + (value >> 10)));
+            escaped.push_str(&format!("\\u{:04x}", 0xDC00 + (value & 0x3FF)));
+        }
+    }
+    escaped
 }
 

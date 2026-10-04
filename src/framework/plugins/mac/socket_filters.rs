@@ -1,5 +1,3 @@
-//! List the registered socket filters.
-//!
 //! A socket filter sees, and can rewrite, traffic passing through any socket it
 //! attaches to. Legitimate firewalls use them. So does anything wanting to
 //! intercept network traffic from inside the kernel.
@@ -17,6 +15,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::{walk_tailq, ExtensionResolver};
 
+/// Enumerates kernel socket filters.
 pub struct SocketFilters;
 
 /// The callbacks a filter can install, each intercepting a different operation.

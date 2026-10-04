@@ -31,13 +31,13 @@ impl Renderer for PrettyTextRenderer {
         // table cannot be laid out until every row is in.
         match grid.truncation() {
             Truncation::None => {}
-            Truncation::Abrupt => return Ok(()),
+            Truncation::Abrupt | Truncation::Discarded => return Ok(()),
             Truncation::Reported => {
                 write!(output, "\n\n")?;
                 return Ok(());
             }
         }
-        let ignored = self.options.ignored(grid);
+        let ignored = self.options.ignored(grid)?;
         let shown = |index: usize| !ignored.contains(&index);
 
         // Rows are gathered first, since a column is only as wide as its widest
@@ -159,7 +159,12 @@ impl Default for QuickTextRenderer {
 
 impl Renderer for QuickTextRenderer {
     fn render(&self, grid: &TreeGrid, output: &mut dyn Write) -> Result<()> {
-        let ignored = self.options.ignored(grid);
+        // A plugin that gave up before it had a listing to render leaves
+        // nothing at all behind it, not even a header.
+        if grid.truncation() == Truncation::Discarded {
+            return Ok(());
+        }
+        let ignored = self.options.ignored(grid)?;
         let headers: Vec<String> = grid
             .columns()
             .iter()
@@ -203,6 +208,8 @@ impl Renderer for QuickTextRenderer {
             Truncation::Abrupt => {}
             // The error was reported, which leaves a blank line behind it.
             Truncation::Reported => write!(output, "\n\n")?,
+            // Nothing was written at all, not even the header.
+            Truncation::Discarded => {}
         }
         Ok(())
     }

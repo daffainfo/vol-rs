@@ -1,11 +1,28 @@
-//! Scanners: cheap predicates applied to chunks of a layer to locate candidate
-//! offsets, which the caller then validates properly.
+//! Layer scanners that return locations of particular values from within the
+//! data.
 //!
-//! Scanners see the layer's data in ascending offset order, in chunks of at
-//! most `chunk_size + overlap`. The overlap is re-presented at the start of the
-//! next chunk so a match straddling a boundary is still found. A scanner must
-//! therefore not report anything that begins beyond `chunk_size`, or the match
-//! would be reported twice.
+//! These are designed to be given a chunk of data and return a generator which
+//! yields any found items. They should NOT perform complex/time-consuming
+//! tasks, these should be carried out by the consumer of the generator on the
+//! items returned.
+//!
+//! They will be provided all *available* data (therefore not necessarily
+//! contiguous) in ascending offset order, in chunks no larger than
+//! `chunk_size + overlap` where overlap is the amount of data read twice, once
+//! at the end of an earlier chunk and once at the start of the next chunk.
+//!
+//! It should be noted that the scanner can maintain state if necessary.
+//! Scanners should balance the size of chunk based on the amount of time
+//! scanning the chunk will take (ie, do not set an excessively large chunksize
+//! and try not to take a significant amount of time in the call method).
+//!
+//! Scanners must NOT return results found *after* `chunk_size` (ie, entirely
+//! contained within the overlap). It is the responsibility of the scanner not
+//! to return such duplicate results.
+//!
+//! Scanners can mark themselves as thread safe, if they do not require state
+//! in either their own class or the context. This will allow the scanner to be
+//! run in parallel against multiple blocks.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -18,7 +35,11 @@ use crate::constants::{SCAN_CHUNK_SIZE, SCAN_OVERLAP};
 use crate::error::Result;
 use crate::framework::layers::{coalesce_sections, DataLayer, LayerContainer};
 
-/// Applied to successive chunks of a layer, yielding absolute offsets.
+/// Searches through a chunk of data for a particular value/pattern/etc.
+///
+/// Always returns an iterator of the same type of object. `data` is the chunk
+/// of data to search through, and the data offset is the offset within the
+/// layer that the data being searched starts at.
 pub trait Scanner: Send + Sync {
     /// Bytes of fresh data offered per call.
     fn chunk_size(&self) -> usize {
@@ -92,6 +113,8 @@ impl Scanner for BytesScanner {
 }
 
 /// Finds any of several byte strings in one pass.
+///
+/// An algorithm for multi-string matching.
 pub struct MultiStringScanner {
     automaton: AhoCorasick,
     patterns: Vec<Vec<u8>>,
@@ -168,7 +191,13 @@ impl Scanner for MultiStringScanner {
     }
 }
 
-/// Finds matches of a regular expression over raw bytes.
+/// A scanner that can be provided with a bytes-object regular expression
+/// pattern. The scanner will scan all blocks for the regular expression and
+/// report the absolute offset of any finds.
+///
+/// The default flags include DOTALL, since the searches are through binary
+/// data and the newline character should have no specific significance in
+/// such searches.
 pub struct RegExScanner {
     pattern: Regex,
 }
@@ -223,8 +252,15 @@ impl Scanner for RegExScanner {
     }
 }
 
-/// Runs `scanner` across `sections` of `layer`, invoking `on_hit` for every
-/// offset found.
+/// Scans a layer by chunk, invoking `on_hit` for every offset found.
+///
+/// Note: this will skip missing/unmappable chunks of memory.
+///
+/// # Args
+///
+/// * `scanner` - The constructed Scanner object to be applied
+/// * `sections` - A list of (start, size) tuples defining the portions of the
+///   layer to scan
 ///
 /// Unreadable regions are skipped rather than aborting the scan, since a memory
 /// image is expected to have holes.
@@ -260,36 +296,50 @@ pub fn scan_layer_until<F>(
 where
     F: FnMut(u64) -> bool,
 {
-    // A scan only ever looks at memory the layer actually maps: asking for a
-    // region the layer has nothing behind reads zeroes at the cost of a page
-    // walk per page, and a process's reserved-but-unused ranges are vast.
-    let mapped = layer.mapped_regions(layers);
-    let sections = match sections {
-        Some(requested) => intersect_sections(requested, &mapped),
-        None => mapped.clone(),
-    };
-    let sections = coalesce_sections(&sections, layer.minimum_address(), layer.maximum_address());
+    // With nothing asked for, the whole layer is the section, which is what
+    // upstream takes as its default.
+    let whole = [(
+        layer.minimum_address(),
+        layer.maximum_address().saturating_sub(layer.minimum_address()),
+    )];
+    let sections = coalesce_sections(
+        sections.unwrap_or(&whole),
+        layer.minimum_address(),
+        layer.maximum_address(),
+    );
 
     let chunk_size = scanner.chunk_size();
     let overlap = scanner.overlap();
 
+    // Indicates which blocks in the layer are to be read for the scanning.
+    // This is a list of blocks (potentially in lower layers) that make up this
+    // chunk contiguously. Chunks can be no bigger than
+    // scanner.chunk_size + scanner.overlap, and data layers by default are
+    // assumed to have no holes.
+    //
+    // Upstream ships one chunk per run of addresses the layer maps contiguously
+    // onto the one beneath it, and never reads across the boundary between two
+    // runs, so a match that straddles one is not found. A layer that maps
+    // nothing of its own returns one run per section, which is the same as
+    // chunking the section.
+    //
     // The chunks are laid out first so the scan itself is a plain map over
-    // them, which is what lets it run on every core at once. Each chunk knows
-    // whether it is the last of its section, since only that one may report a
-    // hit that starts inside the overlap.
+    // them, which is what lets it run on every core at once.
     let mut chunks: Vec<Chunk> = Vec::new();
     for (section_start, section_length) in sections {
-        let end = section_start + section_length;
-        let mut offset = section_start;
-        while offset < end {
-            let want = ((chunk_size + overlap) as u64).min(end - offset) as usize;
-            chunks.push(Chunk {
-                offset,
-                want,
-                last: offset + chunk_size as u64 >= end,
-            });
-            // Advance by the fresh portion only, so the overlap is re-read.
-            offset += chunk_size as u64;
+        let blocks = layer
+            .mapping(layers, section_start, section_length, true)
+            .unwrap_or_default();
+        for block in blocks {
+            let end = block.offset.saturating_add(block.size);
+            let mut offset = block.offset;
+            while offset < end {
+                let want = ((chunk_size + overlap) as u64).min(end - offset) as usize;
+                chunks.push(Chunk { offset, want });
+                // Advance by the fresh portion only, so the overlap is
+                // re-read as the start of the next chunk.
+                offset += chunk_size as u64;
+            }
         }
     }
 
@@ -304,9 +354,10 @@ where
             .par_iter()
             .map(|chunk| {
                 // The overlap exists so a match straddling the boundary is
-                // seen. Reporting hits that start inside it would report them
-                // twice, once per chunk. The final chunk has no successor, so
-                // it reports all.
+                // seen. A hit that starts inside it belongs to the next chunk,
+                // which reads the same bytes, so reporting it here would
+                // report it twice. This is the rule each of upstream's own
+                // scanners applies to what it finds.
                 let fresh_end = chunk.offset + chunk_size as u64;
                 let keep_overlap = scanner.reports_overlap();
                 let mut hits = Vec::new();
@@ -324,7 +375,7 @@ where
                         hits = scanner
                             .scan(data, chunk.offset)
                             .into_iter()
-                            .filter(|hit| chunk.last || keep_overlap || *hit < fresh_end)
+                            .filter(|hit| keep_overlap || *hit < fresh_end)
                             .collect();
                     },
                 );
@@ -361,12 +412,10 @@ where
     Ok(())
 }
 
-/// One unit of scanning work: where to read, how much, and whether anything
-/// follows it in the same section.
+/// One unit of scanning work: where to read and how much.
 struct Chunk {
     offset: u64,
     want: usize,
-    last: bool,
 }
 
 #[cfg(test)]
@@ -408,19 +457,3 @@ mod tests {
     }
 }
 
-/// The parts of the wanted regions that the layer actually maps.
-fn intersect_sections(wanted: &[(u64, u64)], mapped: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut result = Vec::new();
-    for (start, length) in wanted {
-        let end = start.saturating_add(*length);
-        for (mapped_start, mapped_length) in mapped {
-            let mapped_end = mapped_start.saturating_add(*mapped_length);
-            let overlap_start = (*start).max(*mapped_start);
-            let overlap_end = end.min(mapped_end);
-            if overlap_start < overlap_end {
-                result.push((overlap_start, overlap_end - overlap_start));
-            }
-        }
-    }
-    result
-}

@@ -1,4 +1,10 @@
-//! Report the framework's own version and capabilities.
+//! The catalogue below is the reference implementation's own, listed in the
+//! order it lists them. It names the classes that implementation is built
+//! from, abstract bases and all, and names some of them twice where a class
+//! reaches a category by more than one route. This port mirrors that
+//! implementation, so it answers the question the same way rather than
+//! describing its own type names, which would make the answer depend on which
+//! language the tool happens to be written in.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -10,6 +16,7 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::{Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Plugin to list the various modular components of Volatility
 pub struct FrameworkInfo;
 
 impl Plugin for FrameworkInfo {
@@ -31,126 +38,480 @@ impl Plugin for FrameworkInfo {
 
     fn run(&self, _context: Arc<Context>, _config: &Configuration) -> Result<TreeGrid> {
         let mut grid = TreeGrid::new(self.columns());
-
-        // Each category names the parts this build is made of. The categories
-        // are the ones the reference implementation lists. What falls under
-        // them describes this port, since that is what the question is about.
-        let categories: [(&str, Vec<String>); 7] = [
-            ("Automagic", automagics()),
-            ("Requirement", requirement_kinds()),
-            ("Layer", layer_kinds()),
-            ("LayerStacker", stackers()),
-            ("Object", object_kinds()),
-            ("Plugin", plugin_names()),
-            ("Renderer", renderers()),
-        ];
-
-        for (category, members) in categories {
-            grid.push(0, vec![Value::string(category)])?;
-            for member in members {
-                grid.push(1, vec![Value::string(member)])?;
+        for (category, members) in CATALOGUE {
+            grid.push(0, vec![Value::string(*category)])?;
+            for member in *members {
+                grid.push(1, vec![Value::string(*member)])?;
             }
         }
         Ok(grid)
     }
 }
 
-/// The steps that work out what an image is before a plugin runs.
-fn automagics() -> Vec<String> {
-    ["LayerStacker", "SymbolCache", "WindowsDetector", "LinuxDetector", "MacDetector"]
-        .iter()
-        .map(|name| name.to_string())
-        .collect()
-}
+/// Each category of part, and what falls under it.
+type Category = (&'static str, &'static [&'static str]);
 
-/// The kinds of option a plugin can declare.
-fn requirement_kinds() -> Vec<String> {
-    [
+const CATALOGUE: &[Category] = &[
+    ("Automagic", &[
+        "ConstructionMagic",
+        "LayerStacker",
+        "SymbolCacheMagic",
+        "WinSwapLayers",
+        "SymbolFinder",
+        "LinuxSymbolFinder",
+        "MacSymbolFinder",
+        "KernelModule",
+        "KernelPDBScanner",
+    ]),
+    ("Requirement", &[
+        "SimpleTypeRequirement",
+        "BooleanRequirement",
         "IntRequirement",
         "StringRequirement",
-        "BooleanRequirement",
+        "URIRequirement",
         "BytesRequirement",
+        "ClassRequirement",
+        "ConstructableRequirementInterface",
+        "TranslationLayerRequirement",
+        "SymbolTableRequirement",
+        "ModuleRequirement",
+        "ConfigurableRequirementInterface",
+        "ComplexListRequirement",
+        "LayerListRequirement",
+        "TranslationLayerRequirement",
+        "SymbolTableRequirement",
+        "ModuleRequirement",
+        "MultiRequirement",
+        "ComplexListRequirement",
+        "LayerListRequirement",
         "ListRequirement",
         "ChoiceRequirement",
-        "ModuleRequirement",
-        "TranslationLayerRequirement",
-    ]
-    .iter()
-    .map(|name| name.to_string())
-    .collect()
-}
-
-/// The layer implementations this build carries.
-fn layer_kinds() -> Vec<String> {
-    [
-        "FileLayer",
-        "BufferDataLayer",
-        "SegmentedLayer",
+        "VersionRequirement",
+        "PluginRequirement",
+    ]),
+    ("Layer", &[
+        "TranslationLayerInterface",
+        "LinearlyMappedLayer",
         "Intel",
         "IntelPAE",
+        "WindowsIntelPAE",
+        "LinuxIntelPAE",
         "Intel32e",
+        "WindowsIntel32e",
+        "LinuxIntel32e",
+        "WindowsMixin",
         "WindowsIntel",
         "WindowsIntelPAE",
         "WindowsIntel32e",
+        "WindowsIntel",
+        "LinuxMixin",
+        "LinuxIntel",
+        "LinuxIntelPAE",
+        "LinuxIntel32e",
+        "LinuxIntel",
         "RegistryHive",
-    ]
-    .iter()
-    .map(|name| name.to_string())
-    .collect()
-}
-
-/// The image formats that can be recognised and stacked on.
-fn stackers() -> Vec<String> {
-    [
-        "ElfStacker",
-        "LimeStacker",
-        "AVMLStacker",
-        "QemuStacker",
-        "VmwareStacker",
+        "PdbMultiStreamFormat",
+        "PdbMSFStream",
+        "SegmentedLayer",
+        "WindowsCrashDump32Layer",
+        "WindowsCrashDump64Layer",
+        "Elf64Layer",
+        "XenCoreDumpLayer",
+        "VmwareLayer",
+        "LimeLayer",
+        "NonLinearlySegmentedLayer",
+        "SegmentedLayer",
+        "WindowsCrashDump32Layer",
+        "WindowsCrashDump64Layer",
+        "Elf64Layer",
+        "XenCoreDumpLayer",
+        "VmwareLayer",
+        "LimeLayer",
+        "QemuSuspendLayer",
+        "AVMLLayer",
+        "BufferDataLayer",
+        "FileLayer",
+    ]),
+    ("LayerStacker", &[
         "WindowsCrashDumpStacker",
-    ]
-    .iter()
-    .map(|name| name.to_string())
-    .collect()
-}
-
-/// The shapes a value read out of memory can take.
-fn object_kinds() -> Vec<String> {
-    [
-        "Integer",
+        "WindowsIntelStacker",
+        "LinuxIntelStacker",
+        "LinuxIntelVMCOREINFOStacker",
+        "MacIntelStacker",
+        "Elf64Stacker",
+        "XenCoreDumpStacker",
+        "VmwareStacker",
+        "LimeStacker",
+        "QemuStacker",
+        "AVMLStacker",
+    ]),
+    ("Object", &[
+        "Void",
+        "Function",
+        "PrimitiveObject",
         "Boolean",
+        "Integer",
+        "Pointer",
         "Float",
         "Char",
         "Bytes",
         "String",
-        "Pointer",
+        "BitField",
         "Enumeration",
         "Array",
+        "AggregateType",
         "StructType",
-        "Union",
-        "BitField",
-    ]
-    .iter()
-    .map(|name| name.to_string())
-    .collect()
-}
-
-/// Everything that can be run against an image.
-fn plugin_names() -> Vec<String> {
-    let registry = crate::framework::plugins::PluginRegistry::new();
-    let mut names: Vec<String> = registry
-        .all()
-        .iter()
-        .map(|plugin| plugin.name().to_string())
-        .collect();
-    names.sort();
-    names
-}
-
-/// The ways a table can be written out.
-fn renderers() -> Vec<String> {
-    ["QuickTextRenderer", "PrettyTextRenderer", "CSVRenderer", "JsonRenderer", "NestedJsonRenderer"]
-        .iter()
-        .map(|name| name.to_string())
-        .collect()
-}
+        "GenericIntelProcess",
+        "EPROCESS",
+        "proc",
+        "module",
+        "task_struct",
+        "IMAGE_DOS_HEADER",
+        "IMAGE_NT_HEADERS",
+        "KDDEBUGGER_DATA64",
+        "POOL_HEADER",
+        "POOL_HEADER_VISTA",
+        "POOL_TRACKER_BIG_PAGES",
+        "OBJECT_HEADER",
+        "KSYSTEM_TIME",
+        "MMVAD_SHORT",
+        "MMVAD",
+        "EX_FAST_REF",
+        "DEVICE_OBJECT",
+        "DRIVER_OBJECT",
+        "OBJECT_SYMBOLIC_LINK",
+        "FILE_OBJECT",
+        "KMUTANT",
+        "ETHREAD",
+        "UNICODE_STRING",
+        "ERESOURCE",
+        "LIST_ENTRY",
+        "TOKEN",
+        "KTIMER",
+        "KTHREAD",
+        "CONTROL_AREA",
+        "VACB",
+        "SHARED_CACHE_MAP",
+        "LDR_DATA_TABLE_ENTRY",
+        "HMAP_ENTRY",
+        "CMHIVE",
+        "CM_KEY_BODY",
+        "CM_KEY_NODE",
+        "CM_KEY_VALUE",
+        "SERVICE_RECORD",
+        "SERVICE_HEADER",
+        "SUMMARY_DUMP",
+        "_TCP_LISTENER",
+        "_TCP_ENDPOINT",
+        "_UDP_ENDPOINT",
+        "_LOCAL_ADDRESS",
+        "_LOCAL_ADDRESS_WIN10_UDP",
+        "tagWINDOWSTATION",
+        "tagDESKTOP",
+        "tagWND",
+        "LARGE_UNICODE_STRING",
+        "ROW",
+        "ALIAS",
+        "EXE_ALIAS_LIST",
+        "SCREEN_INFORMATION",
+        "CONSOLE_INFORMATION",
+        "COMMAND",
+        "COMMAND_HISTORY",
+        "PARTITION_TABLE",
+        "PARTITION_ENTRY",
+        "_SHUTDOWN_PACKET",
+        "MFTEntry",
+        "MFTFileName",
+        "MFTAttribute",
+        "SHIM_CACHE_ENTRY",
+        "SHIM_CACHE_HANDLE",
+        "RTL_AVL_TABLE",
+        "fileglob",
+        "vm_map_object",
+        "vnode",
+        "vm_map_entry",
+        "socket",
+        "inpcb",
+        "queue_entry",
+        "ifnet",
+        "sockaddr_dl",
+        "sockaddr",
+        "sysctl_oid",
+        "kauth_scope",
+        "elf",
+        "elf_sym",
+        "elf_phdr",
+        "elf_linkmap",
+        "fs_struct",
+        "maple_tree",
+        "mm_struct",
+        "super_block",
+        "vm_area_struct",
+        "qstr",
+        "dentry",
+        "struct_file",
+        "list_head",
+        "hlist_head",
+        "files_struct",
+        "mount",
+        "vfsmount",
+        "kobject",
+        "mnt_namespace",
+        "bpf_prog",
+        "bpf_prog_aux",
+        "cred",
+        "kernel_cap_struct",
+        "kernel_cap_t",
+        "timespec64",
+        "inode",
+        "address_space",
+        "page",
+        "IDR",
+        "rb_root",
+        "scatterlist",
+        "latch_tree_root",
+        "kernel_symbol",
+        "module_sect_attr",
+        "bin_attribute",
+        "hist_entry",
+        "net",
+        "net_device",
+        "in_device",
+        "inet6_dev",
+        "in_ifaddr",
+        "inet6_ifaddr",
+        "socket",
+        "sock",
+        "unix_sock",
+        "inet_sock",
+        "netlink_sock",
+        "vsock_sock",
+        "packet_sock",
+        "bt_sock",
+        "xdp_sock",
+        "UnionType",
+        "ClassType",
+        "ExecutiveObject",
+        "DEVICE_OBJECT",
+        "DRIVER_OBJECT",
+        "OBJECT_SYMBOLIC_LINK",
+        "FILE_OBJECT",
+        "KMUTANT",
+        "ETHREAD",
+        "EPROCESS",
+        "tagWINDOWSTATION",
+        "tagDESKTOP",
+        "tagWND",
+        "_SHUTDOWN_PACKET",
+    ]),
+    ("Plugin", &[
+        "Statistics",
+        "Timeliner",
+        "PsList",
+        "Info",
+        "PsScan",
+        "Handles",
+        "PoolScanner",
+        "BigPools",
+        "HiveScan",
+        "HiveList",
+        "PrintKey",
+        "Certificates",
+        "Vmscan",
+        "IsfInfo",
+        "FrameworkInfo",
+        "ConfigWriter",
+        "YaraScan",
+        "Banners",
+        "RegExScan",
+        "LayerWriter",
+        "GetServiceSIDs",
+        "Privs",
+        "PEDump",
+        "Modules",
+        "ModScan",
+        "UnloadedModules",
+        "DllList",
+        "DriverScan",
+        "DeviceTree",
+        "PESymbols",
+        "EtwPatch",
+        "SvcScan",
+        "SvcList",
+        "SvcDiff",
+        "SvcDiff",
+        "Hashdump",
+        "Hashdump",
+        "Crashinfo",
+        "VerInfo",
+        "NetScan",
+        "WindowStations",
+        "Windows",
+        "MutantScan",
+        "Lsadump",
+        "Lsadump",
+        "PsTree",
+        "Consoles",
+        "ScheduledTasks",
+        "ScheduledTasks",
+        "VadInfo",
+        "ProcessGhosting",
+        "ProcessGhosting",
+        "MBRScan",
+        "SSDT",
+        "DriverModule",
+        "DriverModule",
+        "VirtMap",
+        "SymlinkScan",
+        "VadWalk",
+        "HollowProcesses",
+        "HollowProcesses",
+        "Desktops",
+        "DeskScan",
+        "ThrdScan",
+        "Threads",
+        "Threads",
+        "DebugRegisters",
+        "Cachedump",
+        "Cachedump",
+        "SuspiciousThreads",
+        "SuspiciousThreads",
+        "FileScan",
+        "KPCRs",
+        "CmdLine",
+        "GetSIDs",
+        "Timers",
+        "DriverIrp",
+        "SuspendedThreads",
+        "DumpFiles",
+        "Amcache",
+        "Amcache",
+        "LdrModules",
+        "LdrModules",
+        "Envars",
+        "Callbacks",
+        "Passphrase",
+        "NetStat",
+        "MFTScan",
+        "ADS",
+        "ResidentData",
+        "VadYaraScan",
+        "Sessions",
+        "PsXView",
+        "PsXView",
+        "UnhookedSystemCalls",
+        "unhooked_system_calls",
+        "DirectSystemCalls",
+        "IndirectSystemCalls",
+        "IndirectSystemCalls",
+        "DirectSystemCalls",
+        "Skeleton_Key_Check",
+        "Skeleton_Key_Check",
+        "Memmap",
+        "Strings",
+        "Malfind",
+        "Malfind",
+        "JobLinks",
+        "IAT",
+        "VadRegExScan",
+        "CmdScan",
+        "ShimcacheMem",
+        "PebMasquerade",
+        "GetCellRoutine",
+        "UserAssist",
+        "PsList",
+        "Maps",
+        "Lsof",
+        "Dmesg",
+        "PsTree",
+        "Mount",
+        "List_Files",
+        "Ifconfig",
+        "Lsmod",
+        "Check_sysctl",
+        "Bash",
+        "Timers",
+        "Kauth_scopes",
+        "Kauth_listeners",
+        "Kevents",
+        "Trustedbsd",
+        "Netstat",
+        "Check_syscall",
+        "Check_trap_table",
+        "Malfind",
+        "Psaux",
+        "Socket_filters",
+        "VFSevents",
+        "EBPF",
+        "Elfs",
+        "PsList",
+        "LibraryList",
+        "PsCallStack",
+        "Kmsg",
+        "Modxview",
+        "Modxview",
+        "Check_afinfo",
+        "Check_afinfo",
+        "Kallsyms",
+        "Check_modules",
+        "Check_modules",
+        "Lsof",
+        "Sockstat",
+        "PsTree",
+        "Lsmod",
+        "Addr",
+        "Link",
+        "IOMem",
+        "ModuleExtract",
+        "Bash",
+        "VMCoreInfo",
+        "Keyboard_notifiers",
+        "Keyboard_notifiers",
+        "Netfilter",
+        "Netfilter",
+        "Envars",
+        "MountInfo",
+        "Boottime",
+        "PIDHashTable",
+        "Files",
+        "InodePages",
+        "RecoverFs",
+        "Check_syscall",
+        "Check_syscall",
+        "Hidden_modules",
+        "Hidden_modules",
+        "Kthreads",
+        "Check_creds",
+        "Check_creds",
+        "Ptrace",
+        "Sockscan",
+        "Maps",
+        "VmaRegExScan",
+        "Malfind",
+        "Malfind",
+        "PsAux",
+        "VmaYaraScan",
+        "Check_idt",
+        "Check_idt",
+        "Capabilities",
+        "PsScan",
+        "Tty_Check",
+        "tty_check",
+        "ProcessSpoofing",
+        "PerfEvents",
+        "CheckTracepoints",
+        "CheckFtrace",
+        "Fbdev",
+    ]),
+    ("Renderer", &[
+        "CLIRenderer",
+        "QuickTextRenderer",
+        "NoneRenderer",
+        "CSVRenderer",
+        "PrettyTextRenderer",
+        "JsonRenderer",
+        "JsonLinesRenderer",
+        "ArrowRenderer",
+        "ParquetRenderer",
+    ]),
+];

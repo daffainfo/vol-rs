@@ -1,5 +1,3 @@
-//! Report the network interfaces and their addresses.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,6 +11,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::mac::{format_sockaddr, format_sockaddr_dl, walk_tailq};
 
+/// Lists network interface information for all devices
 pub struct IfConfig;
 
 /// The interface is capturing all traffic, not just its own.

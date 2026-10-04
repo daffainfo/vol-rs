@@ -41,7 +41,10 @@ pub fn join_name(table: &str, name: &str) -> String {
     format!("{table}{BANG}{name}")
 }
 
-/// A resolved symbol: where it lives and, if known, what type it has.
+/// Contains information about a named location in a program's memory.
+///
+/// Holds the name of the symbol, the numeric address value, and optional type
+/// structure information associated with it.
 #[derive(Debug, Clone)]
 pub struct Symbol {
     pub name: String,
@@ -50,7 +53,11 @@ pub struct Symbol {
     pub constant_data: Option<Vec<u8>>,
 }
 
-/// One ISF file, plus the machinery to turn its types into templates.
+/// Handles a table of symbols.
+///
+/// One ISF file, plus the machinery to turn its types into templates. The
+/// native types are used to resolve any base/native types the file leaves
+/// undefined.
 pub struct SymbolTable {
     /// Where the file was read from, as a URL. Plugins that describe an image
     /// report this, so it has to survive loading.
@@ -102,6 +109,9 @@ impl SymbolTable {
 
     /// The width of a pointer in this table, which decides the architecture's
     /// bitness for most purposes.
+    ///
+    /// Note: changing the underlying native table would change the size of all
+    /// the other types referenced in the symbol table.
     pub fn pointer_size(&self) -> usize {
         self.isf
             .base_types
@@ -110,7 +120,7 @@ impl SymbolTable {
             .unwrap_or(self.native.pointer_size())
     }
 
-    /// Every type name the table can produce.
+    /// Returns an iterable of the available symbol type names.
     pub fn types(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self
             .isf
@@ -125,7 +135,7 @@ impl SymbolTable {
         names
     }
 
-    /// Every symbol name in the table.
+    /// Returns an iterable of the available symbol names.
     pub fn symbols(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.isf.symbols.keys().map(String::as_str).collect();
         names.sort_unstable();
@@ -143,7 +153,26 @@ impl SymbolTable {
         self.isf.symbols.contains_key(name)
     }
 
-    /// Look up a symbol, resolving its type if it has one.
+    /// Look up an enumeration by name.
+    ///
+    /// A type and an enumeration are the same thing to the rest of this port,
+    /// but asking for one by name is how a plugin says which it expects, and
+    /// the complaint when it is absent says so too.
+    pub fn get_enumeration(&self, name: &str) -> Result<Arc<Template>> {
+        if !self.isf.enums.contains_key(name) {
+            return Err(VolatilityError::symbol(
+                Some(self.name.clone()),
+                Some(name.to_string()),
+                format!("Enumeration not found in {} table: {name}", self.name),
+            ));
+        }
+        self.get_type(name)
+    }
+
+    /// Resolves a symbol name into a symbol object, and then resolves the
+    /// symbol's type.
+    ///
+    /// Returns an error if the symbol isn't found.
     pub fn get_symbol(&self, name: &str) -> Result<Symbol> {
         let entry = self.isf.symbols.get(name).ok_or_else(|| {
             VolatilityError::symbol(
@@ -168,7 +197,8 @@ impl SymbolTable {
         })
     }
 
-    /// Symbol names at an exact address.
+    /// Returns the name of all symbols in this table that live at a particular
+    /// offset.
     pub fn symbols_at(&self, address: u64) -> Vec<String> {
         let index = self.address_index();
         index.get(&address).cloned().unwrap_or_default()
@@ -191,7 +221,10 @@ impl SymbolTable {
         index
     }
 
-    /// Resolve a type name into a template, expanding user types and enums.
+    /// Resolves a symbol name into an object template.
+    ///
+    /// Returns an error if the symbol isn't found. User types and enums are
+    /// expanded as part of the resolution.
     pub fn get_type(&self, name: &str) -> Result<Arc<Template>> {
         if let Some(cached) = self.cache.read().unwrap().get(name) {
             return Ok(cached.clone());
@@ -370,7 +403,10 @@ fn base_template(base: &isf::BaseType) -> Template {
     }
 }
 
-/// Holds every symbol table in play and resolves references between them.
+/// Handles an ordered collection of SymbolTables.
+///
+/// This collection is ordered so that resolution of symbols can proceed down
+/// through the ranks if a namespace isn't specified.
 #[derive(Default)]
 pub struct SymbolSpace {
     tables: RwLock<HashMap<String, Arc<SymbolTable>>>,
@@ -470,6 +506,17 @@ impl SymbolSpace {
             ))
         })?;
         self.table(table_name)?.get_symbol(symbol_name)
+    }
+
+    /// Look up an enumeration by its qualified name.
+    pub fn get_enumeration(&self, full_name: &str) -> Result<Arc<Template>> {
+        let (table_name, type_name) = split_name(full_name);
+        let table_name = table_name.ok_or_else(|| {
+            VolatilityError::SymbolSpace(format!(
+                "Type name '{full_name}' must be qualified with a table name"
+            ))
+        })?;
+        self.table(table_name)?.get_enumeration(type_name)
     }
 
     pub fn has_type(&self, full_name: &str) -> bool {

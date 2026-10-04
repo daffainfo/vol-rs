@@ -1,5 +1,3 @@
-//! List the kernel events each process is waiting on.
-//!
 //! A kevent registration says what a process wants to be told about: a file
 //! changing, a process exiting, a signal arriving. Malware uses them to react
 //! to defensive tooling starting or stopping.
@@ -16,6 +14,7 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::mac::{list_processes, walk_slist};
 
+/// Lists event handlers registered by processes
 pub struct Kevents;
 
 /// The filter each registration selects, named by the kernel's own numbering.
@@ -181,10 +180,13 @@ impl Plugin for Kevents {
     }
 }
 
-/// Walk a table of registration lists, giving every registration on it.
+/// Convenience wrapper for walking an array of lists of kernel events. Handles
+/// invalid address references.
 ///
-/// The table's address is taken the way the reference implementation takes it,
-/// which shifts it by where the kernel sits.
+/// Enumerates event filters per task, using smear-safe APIs throughout as these
+/// data structures see a significant amount of smear. The table's address is
+/// taken the way the reference implementation takes it, which shifts it by
+/// where the kernel sits.
 fn walk_klist_array(
     context: &Arc<Context>,
     kernel: &crate::framework::context::Module,

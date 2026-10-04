@@ -1,7 +1,8 @@
-//! LiME format layer.
+//! A Lime format TranslationLayer.
 //!
-//! LiME stores physical memory as a sequence of `(header, bytes)` records, so
-//! large holes in the physical address space cost nothing.
+//! Lime is generally used to store physical memory images where there are large
+//! holes in the physical layer: it stores memory as a sequence of
+//! `(header, bytes)` records, so those holes cost nothing.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -14,7 +15,7 @@ use crate::framework::layers::LayerContainer;
 
 const MAGIC: u32 = 0x4C69_4D45;
 const VERSION: u32 = 1;
-/// magic, version, start, end, reserved
+/// Magic[4], Version[4], Start[8], End[8], Reserved[8].
 const HEADER_SIZE: u64 = 4 + 4 + 8 + 8 + 8;
 
 /// Read and validate a LiME record header, returning its `(start, end)` range.
@@ -38,7 +39,12 @@ pub fn check(layers: &LayerContainer, layer: &str) -> Result<()> {
     check_header(layers, layer, 0).map(|_| ())
 }
 
-/// Walk the record chain and build a layer from it.
+/// A Lime format TranslationLayer.
+///
+/// Lime is generally used to store physical memory images where there are
+/// large holes in the physical layer.
+///
+/// The layer is built by walking the chain of records the file holds.
 pub fn build(
     layers: &LayerContainer,
     name: impl Into<String>,

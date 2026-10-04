@@ -1,5 +1,11 @@
 //! Object templates: a type resolved far enough to lay bytes out in memory.
 //!
+//! A class for all factories that take offsets and data layers and produce
+//! objects. This is effectively currying object calls: it creates something
+//! that can be called with the context containing the memory layers and
+//! symbols required to construct the object, plus basic information about the
+//! object, and returns the constructed object.
+//!
 //! A template is produced from an ISF type descriptor. References to named
 //! types stay unresolved (`Template::Reference`), so that a type may refer to
 //! itself, `_LIST_ENTRY.Flink` points at another `_LIST_ENTRY`, without the
@@ -59,9 +65,10 @@ impl StructTemplate {
         self.index.get(name).map(|position| &self.members[*position])
     }
 
-    /// Member names, sorted by offset so output reads in declaration order.
     /// The member names, in the order the symbol file lists them, which is by
-    /// name rather than by where each one sits.
+    /// name rather than by where each one sits. A caller that reports every
+    /// member of a structure reports them in this order, as upstream does by
+    /// walking the symbol file's own mapping.
     pub fn member_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.members.iter().map(|member| member.name.as_str()).collect();
         names.sort_unstable();
@@ -100,6 +107,10 @@ impl EnumTemplate {
 }
 
 /// A type, laid out and ready to read bytes with.
+///
+/// Templates such as those for string objects may carry different length
+/// limits without affecting all other strings using the same template from a
+/// symbol table, which is constructed at resolution time and then cached.
 #[derive(Debug, Clone)]
 pub enum Template {
     /// A type with no representation. Reading one yields nothing.

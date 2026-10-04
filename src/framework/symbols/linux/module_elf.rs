@@ -1,11 +1,27 @@
-//! Rebuilding a loadable ELF file from a module the kernel has already loaded.
+//! Extracts Linux kernel module structures into an analyzable ELF file.
 //!
-//! The kernel keeps a module's sections where it placed them, but it does not
-//! keep the file they came from, and it rewrites parts of the symbol table as
-//! it relocates the module. Putting a usable file back together therefore
-//! means collecting the sections by address, working out their sizes from the
-//! gaps between them, undoing the loader's changes to the symbol table, and
-//! writing fresh headers around the result.
+//! This module is responsible for producing an ELF file of a kernel module
+//! (LKM) loaded in memory. This extraction task is quite complicated as the
+//! Linux kernel discards the ELF header at load time. Due to this, to support
+//! static analysis, we must create an ELF header and proper file based on the
+//! sections.
+//!
+//! There are also several other significant complications that we must deal
+//! with when trying to extract an LKM that can be analyzed with static analysis
+//! tools:
+//!
+//! * First, the `.strtab` points somewhere random and is kept off the module
+//!   structure, not with the other sections.
+//! * Second, all of the symbols (`.symtab`) have mangled members that we must
+//!   patch for anything to make sense.
+//! * Third, the section name string table (`.shstrtab`) is not an allocated
+//!   section, meaning its not in memory.
+//!
+//! Not having the `.shstrtab` makes analysis impossible-to-difficult for static
+//! analysis tools. To work around this, we create the `.shstrtab` based on the
+//! sections in memory and then glue it in as the final section.
+//!
+//! [`extract_module`] is the entry point and only visible method for plugins.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -53,6 +69,8 @@ struct Section {
 }
 
 /// Rebuild an ELF file for a loaded module, or `None` if it cannot be read.
+///
+/// This is the entry point and only visible method for plugins.
 pub fn extract_module(
     context: &Arc<Context>,
     kernel: &Module,
@@ -531,18 +549,25 @@ fn fixed_symbol_table(
 }
 
 /// The binding and type byte a symbol should carry.
+///
+/// Built as `ELF32_ST_INFO`/`ELF64_ST_INFO` does it.
 fn symbol_info(st_name: u64, address: u64, section: Option<&str>) -> u8 {
     let (bind, kind) = if st_name > 0 {
+        // Global symbol.
         let kind = match section {
+            // An address of zero puts the symbol outside the module being
+            // extracted.
             _ if address == 0 => STT_NOTYPE,
             // Code in a text section is a function. Anything else with a
-            // section behind it is data. Relocations only describe code.
+            // section behind it is data. `rela` is relocations, which only
+            // describe code rather than being code themselves.
             Some(name) if name.contains(".text") && !name.contains(".rela") => STT_FUNC,
             Some(_) => STT_OBJECT,
             None => STT_NOTYPE,
         };
         (STB_GLOBAL, kind)
     } else {
+        // Local symbol.
         (STB_LOCAL, STT_SECTION)
     };
     ((bind << 4) & 0xf0) | (kind & 0x0f)

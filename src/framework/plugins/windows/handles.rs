@@ -1,5 +1,3 @@
-//! List the handles each process holds.
-//!
 //! The handle table is a sparse, multi-level array of `_HANDLE_TABLE_ENTRY`.
 //! Each entry encodes a pointer to the kernel object it refers to, with the low
 //! bits used as flags.
@@ -18,8 +16,8 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::poolscanner::{header_cookie, object_type_map};
 use crate::framework::symbols::windows::{header_name, Process};
-use std::collections::HashMap;
 
+/// Lists process open handles.
 pub struct Handles;
 
 /// The table's low bits record its depth rather than forming part of the
@@ -27,6 +25,9 @@ pub struct Handles;
 const LEVEL_MASK: u64 = 7;
 
 /// A handle table is one page wide at every level.
+///
+/// The first entry in the table is always null, so the loop ends at the first
+/// null entry after that.
 const TABLE_PAGE: u64 = 0x1000;
 
 /// Handle values count in fours, one per pointer-sized slot.
@@ -75,9 +76,20 @@ impl Plugin for Handles {
         let cookie = header_cookie(&context, &kernel);
         let mut grid = TreeGrid::new(self.columns());
 
-        for process in
-            crate::framework::plugins::windows::selected_processes(&context, &kernel, config)?
-        {
+        // Upstream pulls the processes while the grid is being rendered, so a
+        // failure in choosing them is reported under the header rather than
+        // instead of it.
+        let selected =
+            match crate::framework::plugins::windows::selected_processes(&context, &kernel, config)
+            {
+                Ok(selected) => selected,
+                Err(error) => {
+                    grid.mark_failed(error);
+                    return Ok(grid);
+                }
+            };
+
+        for process in selected {
             let Ok(pid) = process.pid() else { continue };
             let Ok(object_table) = process.object.member("ObjectTable") else {
                 continue;
@@ -160,6 +172,10 @@ pub struct Handle {
     pub granted_access: u64,
 }
 
+/// Takes a context, kernel module name, and handle table structure
+/// (_HANDLE_TABLE), and yields _HANDLE_TABLE_ENTRY structures from the handle
+/// table.
+///
 /// Every handle a table holds, descending through however many levels it has.
 pub fn handles(context: &Arc<Context>, kernel: &Module, object_table: &Object) -> Vec<Handle> {
     let Ok(table) = object_table.dereference() else {
@@ -245,14 +261,18 @@ fn collect(
         let Some(handle) = item(context, kernel, &entry, value) else {
             continue;
         };
-        // A slot naming no kind of object was never used.
-        if handle
-            .header
-            .member("TypeIndex")
-            .and_then(|index| index.as_u64())
-            .map(|index| index == 0)
-            .unwrap_or(true)
-        {
+        // A slot naming no kind of object was never used. Before Vista the
+        // header names its type through a pointer rather than by index, and
+        // every entry whose type can be reached counts.
+        let used = match handle.header.member("TypeIndex") {
+            Ok(index) => index.as_u64().map(|value| value != 0).unwrap_or(false),
+            Err(_) => handle
+                .header
+                .member("Type")
+                .and_then(|kind| kind.member("Name"))
+                .is_ok(),
+        };
+        if !used {
             continue;
         }
         found.push(handle);
@@ -277,9 +297,8 @@ fn item(context: &Arc<Context>, kernel: &Module, entry: &Object, value: u64) -> 
         if !context.layers.is_valid(&kernel.layer_name, raw, 1) {
             return None;
         }
-        let header = context
-            .object(&header_type, &kernel.layer_name, raw & !0xF)
-            .ok()?;
+        let address = crate::framework::symbols::windows::fast_reference(entry).ok()?;
+        let header = context.object(&header_type, &kernel.layer_name, address).ok()?;
         let granted_access = entry
             .member("GrantedAccess")
             .and_then(|access| access.as_u64())
@@ -334,30 +353,8 @@ fn body_of(context: &Arc<Context>, kernel: &Module, header: &Object) -> Result<O
     ))
 }
 
-/// What the kernel's own table says an object header describes.
-pub fn object_type_of_header(
-    header: &Object,
-    type_map: &HashMap<u64, String>,
-    cookie: Option<u64>,
-) -> Option<String> {
-    // Vista and earlier point straight at the type object.
-    if let Ok(kind) = header.member("Type").and_then(|kind| kind.dereference()) {
-        if let Ok(name) = kind.member("Name").and_then(|name| unicode_string(&name)) {
-            if !name.is_empty() && name.len() <= 128 {
-                return Some(name);
-            }
-        }
-    }
-
-    let index = header.member("TypeIndex").and_then(|index| index.as_u64()).ok()?;
-    // Windows 10 obfuscates the index with the header's own address and a
-    // per-boot cookie.
-    let index = match cookie {
-        Some(cookie) => ((header.offset() >> 8) ^ cookie ^ index) & 0xFF,
-        None => index,
-    };
-    type_map.get(&index).cloned()
-}
+/// What the kernel says the object behind a header is.
+pub use crate::framework::symbols::windows::poolscanner::object_type_of_header;
 
 /// A file object's name, prefixed by the device it lives on.
 fn file_name_with_device(

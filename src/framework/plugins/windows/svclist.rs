@@ -1,5 +1,3 @@
-//! List services from the controller's own list, and find the ones it hides.
-//!
 //! The service controller keeps every service on a linked list reachable from a
 //! marker inside its own executable. Walking that list is what the system
 //! itself does, so a service present in memory but absent from the walk is one
@@ -19,6 +17,11 @@ use crate::framework::plugins::windows::{kernel_module, physical_layer};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Lists services contained with the services.exe doubly linked list of
+/// services
+///
+/// The list is reached through the VAD containing services.exe, whose starting
+/// address and size bound the search.
 pub struct SvcList;
 
 impl Plugin for SvcList {
@@ -55,7 +58,13 @@ impl Plugin for SvcList {
     }
 }
 
-/// Services that scanning finds but the controller's own list does not.
+/// Compares services found through list walking versus scanning, with the aim
+/// of finding hidden services.
+///
+/// For background of hidden services and a real-world example of the use of this
+/// plugin, please see our blogpost:
+///
+/// <https://volatilityfoundation.org/memory-forensics-rd-illustrated-detecting-hidden-windows-services/>
 pub struct SvcDiff {
     /// The name this view is registered under, since it is reachable at two.
     pub name: &'static str,
@@ -100,13 +109,16 @@ impl Plugin for SvcDiff {
             return Ok(TreeGrid::new(self.columns()));
         }
 
+        // collect unique service names from scanning
         let scanned = service_scan(&context, &kernel, &physical, &table, &registry)?;
+        // collect services from listing walking
         let listed = service_list(&context, &kernel, &physical, &table, &registry)?;
 
         // A service is recognised by its name, so one record standing in for
         // another spelling of the same service is not reported as hidden.
         let listed_names: Vec<String> = listed.iter().filter_map(service_name).collect();
 
+        // report services found from scanning but not list walking
         let mut grid = TreeGrid::new(self.columns());
         let mut reported: Vec<String> = Vec::new();
         for row in scanned {

@@ -8,7 +8,8 @@
 
 use crate::framework::renderers::{AbsentValue, NumberFormat, Value};
 
-/// A value rendered in hexadecimal.
+/// Indicates that the integer value should be represented as a hexadecimal
+/// value.
 pub fn hex(value: u64) -> Value {
     Value::UInt(value, NumberFormat::Hex)
 }
@@ -18,7 +19,8 @@ pub fn hex_signed(value: i64) -> Value {
     Value::Int(value, NumberFormat::Hex)
 }
 
-/// A value rendered in binary.
+/// Indicates that the integer value should be represented as a binary
+/// value.
 pub fn binary(value: u64) -> Value {
     Value::UInt(value, NumberFormat::Binary)
 }
@@ -28,12 +30,14 @@ pub fn octal(value: u64) -> Value {
     Value::UInt(value, NumberFormat::Octal)
 }
 
-/// Raw bytes, rendered as hex or as text depending on their content.
+/// Indicates that the bytes should be displayed in an extended format showing
+/// hexadecimal and ascii printable display.
 pub fn hex_bytes(data: impl Into<Vec<u8>>) -> Value {
     Value::Bytes(data.into())
 }
 
-/// Bytes that are probably text: decoded leniently, falling back to hex.
+/// The contents are supposed to be a string, but may contain binary data, so
+/// they are decoded leniently and fall back to hex.
 pub fn multi_type_data(data: &[u8]) -> Value {
     // The choice between text and a hex dump is made when the cell is rendered,
     // so that it follows one rule everywhere.

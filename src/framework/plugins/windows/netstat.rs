@@ -1,5 +1,3 @@
-//! List the network connections the stack is still tracking.
-//!
 //! Where scanning finds every endpoint structure the pools ever held, this
 //! walks the tables the network driver keeps: the partitions holding
 //! established connections, and the port pools holding listeners and datagram
@@ -21,16 +19,26 @@ use crate::framework::plugins::windows::pe_symbols::resolve_across_instances;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid};
 
+/// Traverses network tracking structures present in a particular windows memory
+/// image.
 pub struct NetStat;
 
 /// The driver that tracks the connections.
 const DRIVER: &str = "tcpip.sys";
 
-/// A bitmap of ports is one page and a half at most. Anything larger means the
-/// size was smeared.
+/// A bitmap of ports is one page and a half at most.
+///
+/// This value is broken in many samples and was causing essentially infinite
+/// loops. Testing showed that 8192 is the current size across all Windows
+/// versions. We give some leeway in case it increases in later versions, while
+/// still keeping it sane. The problematic samples had values that looked like
+/// addresses, so in the billions.
 const MAXIMUM_BITMAP: u64 = 8192 * 10;
 
 /// A hash table larger than this has been smeared rather than grown.
+///
+/// A smear sanity check from mass testing. We are looking for entries whose
+/// values are not their own address.
 const MAXIMUM_TABLE: u64 = 4096;
 
 impl Plugin for NetStat {
@@ -82,7 +90,13 @@ impl Plugin for NetStat {
         use crate::framework::plugins::timeline_helpers::{is_time, number, text};
 
         let mut timeline = Timeline::new();
-        for row in self.run(context, config).ok()?.rows() {
+        let grid = self.run(context, config).ok()?;
+        // An image these structures are not described for contributes nothing,
+        // and the failure is what upstream reports rather than an empty list.
+        if grid.aborted() {
+            return None;
+        }
+        for row in grid.rows() {
             let values = &row.values;
             if !is_time(&values[9]) {
                 continue;
@@ -107,7 +121,16 @@ impl Plugin for NetStat {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let corrupt = config.get_bool("include-corrupt").unwrap_or(false);
-        let table = netscan::netscan_table(&context, &kernel)?;
+        let mut grid = TreeGrid::new(self.columns());
+        // As in `netscan`: the header is written before the table is chosen.
+        let table = match netscan::netscan_table(&context, &kernel) {
+            Ok(table) => table,
+            Err(error) => {
+                eprintln!("NotImplementedError: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
 
         // The tables belong to the driver, and are found by the names its own
         // database gives them.
@@ -146,7 +169,6 @@ impl Plugin for NetStat {
         endpoints.extend(partitions(&context, &kernel, &table, &address_of));
         endpoints.extend(port_pools(&context, &kernel, &table, &address_of));
 
-        let mut grid = TreeGrid::new(self.columns());
         let mut seen: HashSet<u64> = HashSet::new();
         for endpoint in endpoints {
             if !seen.insert(endpoint.offset()) {
@@ -279,6 +301,8 @@ fn partitions(
 }
 
 /// The listeners and datagram sockets, which the driver keeps by port.
+///
+/// The given port serves as a shifted index into the port pool lists.
 fn port_pools(
     context: &Arc<Context>,
     kernel: &Module,
@@ -387,6 +411,16 @@ fn pool_ports(context: &Arc<Context>, kernel: &Module, table: &str, pool: u64) -
 }
 
 /// The sockets bound to one port.
+///
+/// First, grab the given port's PortAssignment (`_PORT_ASSIGNMENT`), then
+/// parse the port assignment list (`_PORT_ASSIGNMENT_LIST`) and grab the
+/// correct entry. The value within the assignment's entry is both masked and
+/// points inside of the network object, so the pointer is decoded first and
+/// the actual object address is then calculated by subtracting the offset.
+///
+/// If the same port is used on different interfaces, multiple objects are
+/// created. Those can be found by following the pointer within the object's
+/// `Next` field until it is empty.
 fn sockets_on_port(
     context: &Arc<Context>,
     kernel: &Module,
@@ -454,12 +488,27 @@ fn sockets_on_port(
     found
 }
 
+/// Copied from `windows.handles`.
+///
+/// Windows encodes pointers to objects and decodes them on the fly before using
+/// them.
+///
+/// This function mimics the decoding routine so we can generate the proper
+/// pointer values as well.
+///
 /// The address a recorded pointer names, with the bits the driver keeps for
 /// itself removed.
 fn decode_pointer(value: u64) -> u64 {
     value & 0xFFFF_FFFF_FFFF_FFFC
 }
 
+/// Reads a pointer at a given offset and returns the address it points to.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+///
 /// Read a pointer-sized word.
 fn read_pointer(context: &Arc<Context>, layer: &str, at: u64) -> Result<u64> {
     let data = context.layers.read(layer, at, 8, false)?;

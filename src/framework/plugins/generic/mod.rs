@@ -1,5 +1,3 @@
-//! Plugins that work on any image, or on none at all.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 

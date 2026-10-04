@@ -1,5 +1,3 @@
-//! Report the ELF images mapped into each task.
-//!
 //! A mapping whose first bytes are an ELF header is a loaded executable or
 //! shared library, which is what distinguishes it from ordinary anonymous
 //! memory.
@@ -14,8 +12,9 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::linux::list_tasks;
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Lists all memory mapped ELF files for all processes.
 pub struct Elfs;
 
 /// The four bytes every ELF image opens with.
@@ -64,11 +63,16 @@ impl Plugin for Elfs {
         let dump = config.get_bool("dump").unwrap_or(false);
         let mut grid = TreeGrid::new(self.columns());
 
-        for task in list_tasks(&context, &kernel, false)? {
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
             let Ok(pid) = task.tid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
             let comm = task.comm().unwrap_or_default();
             // The ELF headers live in the task's own address space.
             let Ok(Some(layer)) = task.process_layer() else {
@@ -124,15 +128,19 @@ impl Plugin for Elfs {
     }
 }
 
-/// The largest image written back out. Anything larger is a misread header.
+/// The largest image written back out. A file with a larger size is not
+/// legitimate, so it is not saved out.
 const MAX_EXTRACTION_SIZE: u64 = 1024 * 1024 * 1024;
 
-/// Write out the ELF mapped at `start`, rebuilt from its own program headers.
+/// Extracts the ELF mapped at `start`, rebuilt from its own program headers.
 ///
 /// Only the parts the file says are loaded are written, each rounded out to
 /// whole pages, which is what makes the result usable by a tool that expects a
 /// file rather than a memory image.
-fn dump_elf(
+///
+/// TODO: Apply more effort to reconstruct ELF, e.g.:
+/// <https://github.com/enbarberis/core2ELF64> ?
+pub(crate) fn dump_elf(
     context: &Arc<Context>,
     layer: &str,
     start: u64,
@@ -168,7 +176,9 @@ fn dump_elf(
         return Some(name);
     }
 
-    // Each loadable segment, as whole pages.
+    // Use complete memory pages for dumping. If start isn't a multiple of a
+    // page, stick to the highest multiple < start, and if end isn't a multiple
+    // of a page, stick to the lowest multiple > end.
     let mut sections: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     for index in 0..count {
         let at = start + table_at + index * entry_size;

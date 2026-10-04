@@ -1,5 +1,3 @@
-//! Report the job objects processes belong to.
-//!
 //! A job groups processes under shared limits. Sandboxes and container runtimes
 //! use them, so a process's job membership says something about how it was
 //! launched and what constrains it.
@@ -19,6 +17,7 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::pslist_session_id;
 use crate::framework::symbols::windows::{list_processes, Process};
 
+/// Print process job link information
 pub struct JobLinks;
 
 impl Plugin for JobLinks {

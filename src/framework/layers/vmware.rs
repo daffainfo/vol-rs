@@ -5,6 +5,11 @@
 //! store. The `memory` group's `region*` tags say which parts of the `.vmem`
 //! correspond to which guest physical addresses.
 //!
+//! The header is read first, and then the segments are loaded, which needs the
+//! base layer before it will work. Special data sizes indicate a longer data
+//! stream, where the size is read, two bytes of padding skipped, and then the
+//! actual data read.
+//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 

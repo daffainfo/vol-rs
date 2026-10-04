@@ -1,5 +1,22 @@
 //! Locating and loading ISF symbol files from disk.
 //!
+//! Reads a JSON file and conducts common tasks such as validation, construction
+//! by looking up a JSON file from the available files and ensuring the
+//! appropriate version of the schema and proxy are chosen.
+//!
+//! The JSON format itself is made up of various groups (symbols, user_types,
+//! base_types, enums and metadata):
+//!
+//! * Symbols link a name to a particular offset relative to the start of a
+//!   section of memory
+//! * Base types define the simplest primitive data types, these can make more
+//!   complex structure
+//! * User types define the more complex types by specifying members at a
+//!   relative offset from the start of the type
+//! * Enums can specify a list of names and values and a type inside which the
+//!   numeric encoding will fit
+//! * Metadata defines information about the originating file
+//!
 //! Symbol files are looked up by name under a set of base directories, and may
 //! be stored plain, compressed (`.gz`, `.xz`, `.bz2`), or inside a `.zip`.
 //!
@@ -17,6 +34,8 @@ use crate::framework::symbols::native::native_table_for_pointer_size;
 use crate::framework::symbols::SymbolTable;
 
 /// Extensions an ISF file may carry, in the order they are tried.
+///
+/// User-modifiable files are checked first, then compressed ones.
 pub const ISF_EXTENSIONS: &[&str] = &[".json", ".json.xz", ".json.gz", ".json.bz2"];
 
 /// The directories searched for symbol files.
@@ -135,6 +154,33 @@ fn bundled(name: &str) -> Option<&'static [u8]> {
         .map(|(_, data)| *data)
 }
 
+/// A path as it appears in a URL, which names the file from the root rather
+/// than from wherever the run was started.
+pub fn absolute(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(directory) => normalise(&directory.join(path)),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// A path with its `.` and `..` components resolved away.
+fn normalise(path: &std::path::Path) -> std::path::PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_os_string()),
+        }
+    }
+    parts.iter().collect()
+}
+
 /// A located symbol file: a path on disk, an entry inside a zip, or one of the
 /// files built into the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,9 +206,9 @@ impl SymbolLocation {
     /// reports the symbols it used.
     pub fn url(&self) -> String {
         match self {
-            SymbolLocation::File(path) => format!("file://{}", path.display()),
+            SymbolLocation::File(path) => format!("file://{}", absolute(path).display()),
             SymbolLocation::ZipEntry { archive, entry } => {
-                format!("jar:file://{}!/{entry}", archive.display())
+                format!("jar:file://{}!/{entry}", absolute(archive).display())
             }
             SymbolLocation::Bundled { name } => format!("bundled://{name}"),
         }
@@ -251,6 +297,10 @@ impl SymbolFinder {
 
     /// Find a symbol file named `filename` under `sub_path` (`windows`,
     /// `linux`, `mac`, or `generic`).
+    /// Locate the symbol file named `filename` under `sub_path`.
+    ///
+    /// The user symbol directory is checked first, then the framework's own
+    /// library, to allow for overloading.
     pub fn find(&self, sub_path: &str, filename: &str) -> Option<SymbolLocation> {
         if let Some(found) = self.find_on_disk(sub_path, filename) {
             return Some(found);
@@ -274,8 +324,8 @@ impl SymbolFinder {
             }
         }
 
-        // Fall back to searching inside zip archives, which is how large symbol
-        // packs are usually distributed.
+        // Finally try looking in zip files, which is how large symbol packs
+        // are usually distributed.
         for base in &self.base_paths {
             let directory = base.join(sub_path);
             if let Some(found) = self.search_archives(&directory, filename) {
@@ -303,7 +353,11 @@ impl SymbolFinder {
                     continue;
                 };
                 let name = zip_entry.name().to_string();
-                // Zip paths always use forward slashes regardless of platform.
+                // We have a zipfile, so run through it and look for sub files
+                // that match the filename. For zipfiles, the path separator is
+                // always "/", so the path is matched that way regardless of
+                // platform. By ending with an extension (and therefore, not /),
+                // we should not return any directories.
                 let matches = ISF_EXTENSIONS.iter().any(|extension| {
                     name.ends_with(&format!("{filename}{extension}"))
                 });
@@ -350,6 +404,8 @@ impl SymbolFinder {
 ///
 /// The native table is chosen from the file's own pointer width, so a 32-bit
 /// kernel gets 32-bit defaults for any base type it leaves undefined.
+///
+/// TODO: Consider how to generate the natives entirely from the ISF.
 pub fn create_table(name: impl Into<String>, isf: IsfFile) -> Arc<SymbolTable> {
     let pointer_size = isf
         .base_types

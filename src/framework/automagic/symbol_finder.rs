@@ -1,5 +1,9 @@
 //! Matching an image against the symbol files available on disk.
 //!
+//! Runs through all symbol tables and caches their identifiers, where an
+//! identifier is the string that uniquely identifies a particular symbol
+//! table, extracted from a particular operating system's JSON.
+//!
 //! Linux and Mac kernels embed a version banner in memory. The same banner is
 //! recorded in the ISF file built from that kernel, so finding the banner in an
 //! image and looking it up identifies the exact kernel build.
@@ -41,6 +45,9 @@ const BANNER_ALPHABET: &[u8] =
 const BANNER_READ: usize = 0xFFF;
 
 /// Scan a layer for kernel version banners.
+///
+/// Returns the location of the symbols file that matches each identifier
+/// found.
 ///
 /// Each match is extended to the following NUL and then validated against the
 /// permitted alphabet, which is what keeps format strings and binary noise out

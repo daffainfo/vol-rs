@@ -1,5 +1,3 @@
-//! Scan memory for network connections and listening sockets.
-//!
 //! The network stack allocates its endpoint structures from the pools, so
 //! searching for their tags finds connections that have already been torn down
 //! as well as live ones.
@@ -21,14 +19,19 @@ use crate::framework::symbols::windows::poolscanner::{
 };
 use crate::framework::symbols::windows::Process;
 
+/// Scans for network objects present in a particular windows memory image.
 pub struct NetScan;
 
-/// Address families, as the network stack records them. The stack's own value
-/// for the sixth version is not the one the C library uses.
+/// Address families, as the network stack records them.
+///
+/// Python's `socket.AF_INET6` is 0x1e but Microsoft defines it as a constant
+/// value of 0x17 in their source code. Thus we need Microsoft's, since that's
+/// what is found in memory.
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 0x17;
 
-/// The years outside which a recorded time is not believable.
+/// The years outside which a recorded time is not believable, so a timestamp
+/// outside them is reported as absent.
 const EARLIEST_YEAR: i32 = 1950;
 const LATEST_YEAR: i32 = 2200;
 
@@ -81,8 +84,15 @@ impl Plugin for NetScan {
         use crate::framework::plugins::timeline_helpers::{is_time, number, text};
 
         let mut timeline = Timeline::new();
-        for row in self.run(context, config).ok()?.rows() {
+        let grid = self.run(context, config).ok()?;
+        // An image these structures are not described for contributes nothing,
+        // and the failure is what upstream reports rather than an empty list.
+        if grid.aborted() {
+            return None;
+        }
+        for row in grid.rows() {
             let values = &row.values;
+            // Skip network connections without creation time
             if !is_time(&values[9]) {
                 continue;
             }
@@ -114,11 +124,18 @@ impl Plugin for NetScan {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let corrupt = config.get_bool("include-corrupt").unwrap_or(false);
-        // The network structures belong to the network driver, not the kernel,
-        // and are described by a file chosen for this build of Windows.
-        let table = netscan_table(&context, &kernel)?;
-
         let mut grid = TreeGrid::new(self.columns());
+        // The network structures belong to the network driver, not the kernel,
+        // and are described by a file chosen for this build of Windows. An
+        // image no file covers leaves the header written and the run aborted.
+        let table = match netscan_table(&context, &kernel) {
+            Ok(table) => table,
+            Err(error) => {
+                eprintln!("NotImplementedError: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
         for object in scan(&context, &kernel, &table)? {
             for row in rows_for(&context, &kernel, &object, corrupt) {
                 grid.push(0, row)?;
@@ -152,10 +169,13 @@ pub fn rows_for(
 
         match kind.as_str() {
                 "_UDP_ENDPOINT" => {
+                    // Objects passed pool header constraints. Check for
+                    // additional constraints if the strict flag is set.
                     if !corrupt && !listener_is_valid(object) {
                         return rows;
                     }
-                    // A datagram socket has no far end and no state at all.
+                    // For UdpA, the state is always blank and the remote end
+                    // is asterisks.
                     for (version, local, _) in dual_stack(object) {
                         grid.push(
                             row(
@@ -203,8 +223,9 @@ pub fn rows_for(
                     if !corrupt && !listener_is_valid(object) {
                         return rows;
                     }
-                    // A listener is listening, and the far end is whatever
-                    // reaches it.
+                    // For TcpL, the state is always listening and the remote
+                    // port is zero. This kind is checked for last, because
+                    // every other object is inherited from it.
                     for (version, local, remote) in dual_stack(object) {
                         grid.push(
                             row(
@@ -341,7 +362,13 @@ fn bound_address(object: &Object) -> Option<Object> {
     } else {
         data.dereference().ok()?.dereference().ok()?
     };
-    // A pointer to address zero reads without error but names nothing.
+    // There is a rare edge case here we have to consider: if the struct has a
+    // null pointer at the LocalAddr offset, this generally means this struct
+    // has no associated local address. However, sometimes a pointer to the
+    // offset of 0 can be valid because it points to a valid virtual memory
+    // address of 0. That confuses the plugin, because trying to access the null
+    // pointer does not raise any errors, leading to errors later down the line
+    // when accessing the address itself.
     address.member("addr4").ok()?.index(0).ok()?.as_u64().ok()?;
     Some(address)
 }
@@ -473,7 +500,16 @@ fn state_is_known(state: &Object) -> bool {
         .unwrap_or(false)
 }
 
-/// Scan for every kind of network object the stack allocates.
+/// Scans for network objects using the poolscanner module and constraints.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+///
+/// Scans for network objects using the poolscanner module and constraints.
+///
+/// Creates a list of Pool Tag Constraints for network objects.
 fn scan(context: &Arc<Context>, kernel: &Module, table: &str) -> Result<Vec<Object>> {
     let size_of = |name: &str| {
         context
@@ -484,12 +520,15 @@ fn scan(context: &Arc<Context>, kernel: &Module, table: &str) -> Result<Vec<Obje
     };
 
     let mut constraints = vec![
+        // TCP listener
         PoolConstraint::new(b"TcpL", "_TCP_LISTENER", NONPAGED | FREE)
             .in_table(table)
             .with_size(size_of("_TCP_LISTENER"), None),
+        // TCP Endpoint
         PoolConstraint::new(b"TcpE", "_TCP_ENDPOINT", NONPAGED | FREE)
             .in_table(table)
             .with_size(size_of("_TCP_ENDPOINT"), None),
+        // UDP Endpoint
         PoolConstraint::new(b"UdpA", "_UDP_ENDPOINT", NONPAGED | FREE)
             .in_table(table)
             .with_size(size_of("_UDP_ENDPOINT"), None),
@@ -509,11 +548,16 @@ fn scan(context: &Arc<Context>, kernel: &Module, table: &str) -> Result<Vec<Obje
         .collect())
 }
 
-/// Load the description of the network structures for this build of Windows.
+/// Creates a symbol table for TCP Listeners and TCP/UDP Endpoints.
 ///
-/// The structures belong to the network driver, whose layout changed often
-/// enough that a file is kept for each build. The build is read from the
-/// kernel's own version records rather than from the driver.
+/// Tries to determine which symbol filename to use for the image's tcpip
+/// driver. The logic is partially taken from the info plugin.
+///
+/// While the failsafe way to determine the version of tcpip.sys would be to
+/// extract the driver and parse its PE header containing the versionstring,
+/// unfortunately that header is not guaranteed to persist within memory.
+/// Therefore we determine the version based on the kernel version as testing
+/// with several windows versions has showed this to work out correctly.
 pub fn netscan_table(context: &Arc<Context>, kernel: &Module) -> Result<String> {
     let sixty_four_bit = context
         .symbol_space
@@ -551,8 +595,14 @@ pub fn netscan_table(context: &Arc<Context>, kernel: &Module) -> Result<String> 
 
 /// The file describing the network structures of one build of Windows.
 ///
-/// A build newer than any listed uses the newest that is, since the structures
-/// change rarely once a release has settled.
+/// These versions are listed explicitly because symbol files differ based on
+/// version *and* architecture. This is currently the clearest way to show the
+/// differences, even if it introduces a fair bit of redundancy. Furthermore,
+/// it is easy to append new versions.
+///
+/// No match on a name means that we possibly have a version newer than those
+/// listed here, so the latest supported version of the current image's NT
+/// version is taken. If that does not work, support has to be added manually.
 fn choose_table(
     sixty_four_bit: bool,
     major: u64,

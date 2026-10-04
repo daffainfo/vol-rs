@@ -20,12 +20,12 @@ use crate::error::{Result, VolatilityError};
 /// their characters appear in the scrambled key.
 pub const BOOTKEY_SUBKEYS: [&str; 4] = ["JD", "Skew1", "GBG", "Data"];
 
-/// The permutation Windows applies to the assembled key bytes.
+/// Permutation matrix for boot key.
 const BOOTKEY_PERMUTATION: [usize; 16] =
     [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7];
 
-/// Salts mixed into the hashed boot key derivation. These are fixed strings
-/// compiled into Windows, including their trailing NUL.
+/// Constants for SAM decrypt algorithm. These are fixed strings compiled into
+/// Windows, including their trailing NUL.
 const AQWERTY: &[u8] = b"!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\0";
 const ANUM: &[u8] = b"0123456789012345678901234567890123456789\0";
 
@@ -122,7 +122,8 @@ pub enum SamEncryption {
     Aes,
 }
 
-/// Derive the hashed boot key from the domain's `F` value.
+/// Returns the scrambled bootkey necessary to decrypt hashes, derived from the
+/// domain's `F` value.
 pub fn hashed_bootkey(f_value: &[u8], bootkey: &[u8; 16]) -> Result<([u8; 16], SamEncryption)> {
     if f_value.len() < 0xA0 {
         return Err(VolatilityError::Other(
@@ -151,8 +152,8 @@ pub fn hashed_bootkey(f_value: &[u8], bootkey: &[u8; 16]) -> Result<([u8; 16], S
             Ok((hashed, SamEncryption::Rc4))
         }
         2 | 3 => {
-            // The newer scheme stores an IV alongside the ciphertext and uses
-            // AES in CBC mode with the boot key directly.
+            // AES encrypted. The newer scheme stores an IV alongside the
+            // ciphertext and uses AES in CBC mode with the boot key directly.
             if f_value.len() < 0xD0 {
                 return Err(VolatilityError::Other(
                     "Domain F value is too short for the AES layout".to_string(),
@@ -178,7 +179,7 @@ pub fn hashed_bootkey(f_value: &[u8], bootkey: &[u8; 16]) -> Result<([u8; 16], S
     }
 }
 
-/// Expand a seven-byte key into the eight-byte form DES expects.
+/// Builds the final DES key from the strings generated in [`rid_des_keys`].
 ///
 /// DES keys carry a parity bit in each byte, so 56 bits of key material are
 /// spread across 64 bits.
@@ -200,7 +201,8 @@ fn expand_des_key(key: &[u8]) -> [u8; 8] {
     expanded
 }
 
-/// Derive the two DES keys an account's RID produces.
+/// Takes the rid of a user and converts it to a key to be used by the DES
+/// cipher.
 pub fn rid_des_keys(rid: u32) -> ([u8; 8], [u8; 8]) {
     let bytes = rid.to_le_bytes();
     // The RID's four bytes are repeated to fill each seven-byte key.
@@ -394,7 +396,7 @@ pub fn lsa_key(policy_value: &[u8], bootkey: &[u8; 16], is_vista_or_later: bool)
         }
         Ok(decrypted[68..100].to_vec())
     } else {
-        if policy_value.len() < 0x60 {
+        if policy_value.len() < 0x4C {
             return Err(VolatilityError::Other(
                 "Policy value is too short for the RC4 layout".to_string(),
             ));
@@ -408,7 +410,7 @@ pub fn lsa_key(policy_value: &[u8], bootkey: &[u8; 16], is_vista_or_later: bool)
         }
         let key = hasher.finalize();
 
-        let mut buffer = policy_value[0x10..0x3C].to_vec();
+        let mut buffer = policy_value[0x0C..0x3C].to_vec();
         rc4(&key, &mut buffer);
         // The secret key is the second sixteen bytes of the unwrapped blob.
         Ok(buffer[0x10..0x20].to_vec())
@@ -469,10 +471,51 @@ pub fn decrypt_secret(secret: &[u8], lsa_key: &[u8], is_vista_or_later: bool) ->
             .unwrap_or_default()
             .to_vec())
     } else {
-        // The older scheme applies DES in a chain keyed by successive slices of
-        // the LSA key, which is not reimplemented here.
-        Err(VolatilityError::Other(
-            "Pre-Vista LSA secret decryption is not supported".to_string(),
-        ))
+        // The older scheme keeps a twelve-byte header before the ciphertext.
+        if secret.len() < 0x0C {
+            return Ok(Vec::new());
+        }
+        Ok(decrypt_secret_des(&secret[0x0C..], lsa_key))
     }
+}
+
+/// Decrypt a secret the way `SystemFunction005` does.
+///
+/// Each eight-byte block is decrypted with DES under a seven-byte slice of the
+/// key, the slice moving along by seven for each block and wrapping round when
+/// fewer than seven bytes are left. The plaintext opens with its own length.
+fn decrypt_secret_des(secret: &[u8], key: &[u8]) -> Vec<u8> {
+    use des::cipher::BlockCipherDecrypt;
+    use des::cipher::KeyInit;
+
+    let mut plaintext: Vec<u8> = Vec::new();
+    let mut position = 0usize;
+    for chunk in secret.chunks(8) {
+        let mut block = [0u8; 8];
+        block[..chunk.len()].copy_from_slice(chunk);
+
+        let mut slice = [0u8; 7];
+        let available = key.len().saturating_sub(position).min(7);
+        slice[..available].copy_from_slice(&key[position..position + available]);
+        let expanded = expand_des_key(&slice);
+        let cipher = des::Des::new((&expanded).into());
+        let mut buffer = block.into();
+        cipher.decrypt_block(&mut buffer);
+        plaintext.extend_from_slice(&buffer);
+
+        position += 7;
+        // Where fewer than seven bytes are left, the slice starts again from
+        // however many that was.
+        let remaining = key.len().saturating_sub(position).min(7);
+        if remaining < 7 {
+            position = remaining;
+        }
+    }
+
+    if plaintext.len() < 8 {
+        return Vec::new();
+    }
+    let length = u32::from_le_bytes(plaintext[..4].try_into().unwrap()) as usize;
+    let end = (8 + length).min(plaintext.len());
+    plaintext[8..end].to_vec()
 }

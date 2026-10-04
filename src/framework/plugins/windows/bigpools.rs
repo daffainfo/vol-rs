@@ -1,5 +1,3 @@
-//! List the kernel's large pool allocations.
-//!
 //! Allocations too big for the ordinary pool are tracked in a separate table
 //! rather than being given a pool header, so they are enumerated from that
 //! table rather than found by scanning.
@@ -16,6 +14,7 @@ use crate::framework::plugins::windows::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// List big page pools.
 pub struct BigPools;
 
 impl Plugin for BigPools {
@@ -108,7 +107,18 @@ pub struct BigPoolAllocation {
     pub entry: crate::framework::objects::Object,
 }
 
-/// The kernel's table of allocations too large for the pools.
+/// Returns the big page pool objects from the kernel PoolBigPageTable array.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The module for the kernel
+/// * `tags` - An optional list of pool tags to filter big page pool tags by
+///
+/// # Returns
+///
+/// The big page pool objects from the kernel PoolBigPageTable array.
 ///
 /// Several plugins look for their own structures here rather than scanning,
 /// because an allocation of this size is recorded rather than searched for.
@@ -119,7 +129,9 @@ pub fn list_big_pools(
     show_free: bool,
 ) -> Result<Vec<BigPoolAllocation>> {
     let mut results = Vec::new();
-    // The table's address and its size are held in separate symbols.
+    // We have to manually load a symbol table, since whether the entry has a
+    // pool type at all depends on the release. The table's address and its size
+    // are held in separate symbols.
     let table_address = context
         .object_from_symbol(kernel, "PoolBigPageTable", Some("pointer"))?
         .pointer_value()?;

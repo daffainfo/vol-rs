@@ -1,5 +1,3 @@
-//! List the network connections open on the system.
-//!
 //! Sockets are reached through each process's file descriptors, so a connection
 //! is reported alongside the process that owns it.
 //!
@@ -17,12 +15,47 @@ use crate::framework::renderers::conversion::{convert_ipv4, convert_ipv6};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::{descriptor_kind, list_processes};
 
+/// Lists all network connections for all processes.
+///
+/// Returns the open socket descriptors of a process: the name of the process
+/// that opened the socket, its process ID, and the address of the associated
+/// socket structure. The listing method is hardcoded, since a change in the
+/// default method would change the expected results.
 pub struct NetStat;
 
 /// Address families, as the socket layer records them.
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 30;
+
+/// The number the machine running this reports for `AF_INET6`.
+///
+/// Upstream converts an address with Python's `socket.AF_INET6`, which is the
+/// running machine's own constant rather than the one the image was taken on.
+/// Away from a BSD the two disagree, and an IPv6 socket is then left out of
+/// the listing altogether. The same constant is used here so that the same
+/// sockets are reported.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+const HOST_AF_INET6: u64 = 30;
+#[cfg(target_os = "windows")]
+const HOST_AF_INET6: u64 = 23;
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly",
+    target_os = "windows"
+)))]
+const HOST_AF_INET6: u64 = 10;
 
 /// TCP connection states, indexed by the control block's state field.
 const TCP_STATES: &[&str] = &[
@@ -214,6 +247,11 @@ fn describe(
         ""
     };
 
+    // The address is only converted for the two families the running machine
+    // names, so a socket of any other family is left out.
+    if family != AF_INET && family != HOST_AF_INET6 {
+        return None;
+    }
     let is_v6 = family == AF_INET6;
     let local = address_of(&pcb, "inp_dependladdr", is_v6)?;
     let remote = address_of(&pcb, "inp_dependfaddr", is_v6)?;

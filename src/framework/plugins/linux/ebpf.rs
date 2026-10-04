@@ -1,5 +1,3 @@
-//! List the loaded eBPF programs.
-//!
 //! eBPF runs verified bytecode inside the kernel, attached to tracepoints,
 //! sockets and system calls. It is a legitimate and widely used mechanism, and
 //! also a way to run kernel-level code without loading a module, so what is
@@ -18,6 +16,7 @@ use crate::framework::symbols::linux::xarray_entries;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Enumerate eBPF programs
 pub struct Ebpf;
 
 impl Plugin for Ebpf {
@@ -49,13 +48,20 @@ impl Plugin for Ebpf {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
 
-        // Programs are registered in an IDR, which the kernel walks by ID.
+        let mut grid = TreeGrid::new(self.columns());
+
+        // Enumerate eBPF programs walking their IDR, which a kernel without
+        // eBPF support does not have.
+        if context.symbol_offset(&kernel, "prog_idr").is_err() {
+            grid.mark_failed(crate::error::VolatilityError::Other(
+                "Cannot find the eBPF prog idr. Unsupported kernel".to_string(),
+            ));
+            return Ok(grid);
+        }
         // Reading the radix tree is version-specific, so the entries are taken
         // from the id-to-pointer array the IDR keeps.
         let idr = context.object_from_symbol(&kernel, "prog_idr", Some("idr"))?;
         let template = context.symbol_space.get_type(&kernel.qualified("bpf_prog"))?;
-
-        let mut grid = TreeGrid::new(self.columns());
 
         for address in xarray_entries(&context, &kernel, &idr.member("idr_rt")?)? {
             let program =

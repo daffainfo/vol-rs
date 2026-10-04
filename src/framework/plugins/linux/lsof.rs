@@ -1,5 +1,3 @@
-//! List the files each task has open.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -16,6 +14,7 @@ use crate::framework::symbols::linux::{
     list_tasks_filtered, path_for_file_of_kind, task_root_readable, OpenFile, Task,
 };
 
+/// Lists open files for each processes.
 pub struct Lsof;
 
 impl Plugin for Lsof {
@@ -117,8 +116,9 @@ impl Plugin for Lsof {
         let files_only = config.get_bool("files_only").unwrap_or(false);
         let mut grid = TreeGrid::new(self.columns());
 
-        // The filter selects processes. A selected process brings its
-        // threads with it, whatever their own ids.
+        // Enumerates open file descriptors in tasks. The filter selects
+        // processes, and a selected process brings its threads with it,
+        // whatever their own ids.
         let selected = |task: &Task| match task.tid() {
             Ok(tid) => pid_matches(&filter, tid),
             Err(_) => false,
@@ -141,6 +141,10 @@ impl Plugin for Lsof {
                     None => String::new(),
                 };
                 let inode = open.inode();
+                // Augment the FD information to be presented to the user.
+                // Upstream ensures all the types it carries over are atomic and
+                // immutable, since otherwise its own `astuple()` spends a long
+                // time deep-copying the Volatility objects.
                 grid.push(
                     0,
                     vec![
@@ -253,25 +257,7 @@ fn mode(inode: &Option<crate::framework::objects::Object>) -> String {
     let Some(mode) = read_mode(inode) else {
         return "-".to_string();
     };
-    let mut text = String::with_capacity(10);
-    // The leading character names the kind of file, as `ls -l` shows it.
-    text.push(match mode & 0xF000 {
-        0x4000 => 'd',
-        0x8000 => '-',
-        0xA000 => 'l',
-        0x1000 => 'p',
-        0xC000 => 's',
-        0x2000 => 'c',
-        0x6000 => 'b',
-        _ => '?',
-    });
-    for shift in [6, 3, 0] {
-        let bits = (mode >> shift) & 0x7;
-        text.push(if bits & 0x4 != 0 { 'r' } else { '-' });
-        text.push(if bits & 0x2 != 0 { 'w' } else { '-' });
-        text.push(if bits & 0x1 != 0 { 'x' } else { '-' });
-    }
-    text
+    crate::framework::symbols::linux::filemode(mode)
 }
 
 fn read_mode(inode: &Option<crate::framework::objects::Object>) -> Option<u64> {

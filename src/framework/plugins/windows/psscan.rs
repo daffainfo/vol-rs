@@ -1,6 +1,3 @@
-//! Find processes by scanning physical memory for pool allocations, rather than
-//! by walking the kernel's list.
-//!
 //! A process that has been unlinked from the active process list (by a rootkit,
 //! or simply by having exited) is invisible to `pslist`, but its pool
 //! allocation may still be present in memory. Scanning for the pool tag finds
@@ -23,6 +20,7 @@ use crate::framework::symbols::windows::Process;
 
 use super::pslist::{process_columns, process_row};
 
+/// Scans for processes present in a particular windows memory image.
 pub struct PsScan;
 
 /// The pool tag the kernel allocates `_EPROCESS` structures under. The tag's
@@ -49,7 +47,7 @@ impl Plugin for PsScan {
                 "Display physical offset instead of virtual",
                 RequirementKind::Bool,
             )
-            .with_default(ConfigValue::Bool(true)),
+            .with_default(ConfigValue::Bool(false)),
         ]
     }
 
@@ -58,8 +56,8 @@ impl Plugin for PsScan {
     }
 
     fn columns(&self) -> Vec<Column> {
-        // The objects come out of whichever layer was scanned, and on a modern
-        // kernel that is the kernel's own, so the offsets are virtual.
+        // The offset column is named for the address space the run asks for,
+        // which the grid itself settles once the configuration is known.
         process_columns(false)
     }
 
@@ -90,29 +88,62 @@ impl Plugin for PsScan {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let filter = pid_filter(config);
+        let physical = config.get_bool("physical").unwrap_or(false);
         let physical_name = crate::framework::plugins::windows::physical_layer(config);
         let dump = config.get_bool("dump").unwrap_or(false);
 
-        let mut grid = TreeGrid::new(self.columns());
+        let mut grid = TreeGrid::new(process_columns(physical));
 
         for process in scan_processes(&context, &kernel)? {
             let Ok(pid) = process.pid() else { continue };
             if !pid_matches(&filter, pid) {
                 continue;
             }
-            let offset = process.offset();
             let file_output = if dump {
+                // A scanned process sits in physical memory, where nothing it
+                // points at can be followed, so the same process is found in
+                // the kernel's own space before anything is read through it.
+                // windows 10 objects (maybe others in the future) are already
+                // in virtual memory
+                let virtual_process = if process.object.layer_name() == kernel.layer_name {
+                    Some(Process::new(process.object.clone()))
+                } else {
+                    virtual_process_from_physical(&context, &kernel, &process)
+                };
                 // This listing names the file as it opens it, so two
                 // processes sharing an image both report the same name even
                 // though the second is written beside the first.
-                match crate::framework::plugins::windows::pslist::dump_process_image(
-                    &context, &physical_name, &process, pid,
-                ) {
+                match virtual_process.and_then(|process| {
+                    crate::framework::plugins::windows::pslist::dump_process_image(
+                        &context,
+                        &physical_name,
+                        &process,
+                        pid,
+                    )
+                }) {
                     Some((preferred, _)) => Value::string(preferred),
                     None => Value::string("Error outputting file"),
                 }
             } else {
                 Value::string("Disabled")
+            };
+
+            // Upstream translates the offset through the kernel's own layer,
+            // which a scanned process does not live in, and guards none of it.
+            // Where the pool scan works in physical memory the translation
+            // faults on the first process and ends the listing.
+            let offset = if physical {
+                match crate::framework::plugins::windows::physical_offset_from_virtual(
+                    &context, &kernel, &process,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        grid.mark_failed(error);
+                        break;
+                    }
+                }
+            } else {
+                process.object.offset()
             };
             grid.push(0, process_row(&process, pid, offset, file_output))?;
         }
@@ -120,12 +151,134 @@ impl Plugin for PsScan {
     }
 }
 
-/// The processes the pools still hold, whether or not the kernel still lists
-/// them.
+/// Scans for processes using the poolscanner module and constraints.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The module for the kernel
+///
+/// # Returns
+///
+/// A list of processes found by scanning the kernel's layer for process pool
+/// signatures, whether or not the kernel still lists them.
 pub fn scan_processes(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Process>> {
     let constraints = builtin_constraints(&PROCESS_POOL_TAGS);
     Ok(generate_pool_scan(context, kernel, &constraints)?
         .into_iter()
         .map(|hit| Process::new(hit.object))
         .collect())
+}
+
+/// Returns a virtual process from a physical addressed one
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The module for the kernel
+/// * `process` - the process object with physical address
+///
+/// # Returns
+///
+/// A process object on virtual address layer.
+///
+/// Nothing a physically addressed process points at can be followed, so
+/// upstream bounces off the first entry of its thread list to reach an
+/// `_ETHREAD` in the kernel's own space, asks that thread which process owns
+/// it, and keeps the answer only when translating it leads back to where the
+/// scan found it.
+fn virtual_process_from_physical(
+    context: &Arc<Context>,
+    kernel: &Module,
+    process: &Process,
+) -> Option<Process> {
+    let thread_template = context
+        .symbol_space
+        .get_type(&kernel.qualified("_ETHREAD"))
+        .ok()?;
+    let link = context
+        .symbol_space
+        .find_member(&thread_template, "ThreadListEntry")
+        .ok()?
+        .map(|(offset, _)| offset)?;
+
+    // Start out with the member offset
+    let mut offsets = vec![link];
+    // If (and only if) we're dealing with 64-bit Windows 7 SP1 then add the
+    // other commonly seen member offset to the list
+    let sixty_four_bit = context
+        .layers
+        .get(&kernel.layer_name)
+        .ok()
+        .and_then(|layer| {
+            layer
+                .as_any()
+                .downcast_ref::<crate::framework::layers::intel::IntelLayer>()
+                .map(|layer| layer.config().bits_per_register)
+        })
+        .unwrap_or(32)
+        == 64;
+    if sixty_four_bit && os_version(context, kernel) == Some((6, 1, 7601)) {
+        offsets.push(link + 8);
+    }
+
+    let head = process
+        .object
+        .member("ThreadListHead")
+        .and_then(|list| list.member("Flink"))
+        .and_then(|flink| flink.pointer_value())
+        .ok()?;
+    let layer = context.layers.get(&kernel.layer_name).ok()?;
+
+    // Now we can try to bounce back
+    for offset in offsets {
+        let Some(address) = head.checked_sub(offset) else {
+            continue;
+        };
+        let thread =
+            context.object_from_template(thread_template.clone(), &kernel.layer_name, address);
+        // Ask for the thread's process to get an _EPROCESS with a virtual
+        // address layer
+        let Some(candidate) = owning_process(&thread, kernel) else {
+            continue;
+        };
+        // Sanity check the bounce. This compares the original offset with the
+        // new one (translated from virtual layer).
+        let Ok(mapping) = layer.mapping(&context.layers, candidate.object.offset(), 0, false)
+        else {
+            continue;
+        };
+        let Some(entry) = mapping.first() else {
+            continue;
+        };
+        if entry.mapped_offset == process.object.offset() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The process a thread belongs to.
+fn owning_process(thread: &crate::framework::objects::Object, kernel: &Module) -> Option<Process> {
+    let process = thread
+        .member("Tcb")
+        .and_then(|tcb| tcb.member("Process"))
+        .or_else(|_| thread.member("ThreadsProcess"))
+        .and_then(|process| process.dereference_as(&kernel.qualified("_EPROCESS")))
+        .ok()?;
+    Some(Process::new(process))
+}
+
+/// Returns the complete OS version (MAJ,MIN,BUILD).
+fn os_version(context: &Arc<Context>, kernel: &Module) -> Option<(u64, u64, u64)> {
+    let (major, minor) = crate::framework::plugins::windows::info::windows_version(context, kernel)?;
+    let build = context
+        .object_from_symbol(kernel, "KdVersionBlock", Some("_DBGKD_GET_VERSION64"))
+        .ok()?
+        .member("MinorVersion")
+        .and_then(|value| value.as_u64())
+        .ok()?;
+    Some((major, minor, build))
 }

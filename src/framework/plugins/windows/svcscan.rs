@@ -1,5 +1,3 @@
-//! List the services the service controller knows about.
-//!
 //! The controller keeps a record for every service in its own memory, so the
 //! records are found by searching that process rather than the kernel. Each
 //! record is paired with what the registry says the service runs, which is how
@@ -22,9 +20,13 @@ use crate::framework::symbols::windows::list_processes;
 use crate::framework::symbols::windows::registry::{read_key, subkeys, values, RegistryKey};
 use crate::framework::symbols::windows::versions;
 
+/// Scans for windows services.
 pub struct SvcScan;
 
 /// What the registry says a service runs.
+///
+/// Depending on whether the service is for a process or a kernel driver, the
+/// binary path is stored differently.
 #[derive(Clone)]
 pub struct BinaryInfo {
     binary: Value,
@@ -78,7 +80,8 @@ impl Plugin for SvcScan {
 /// The record layout and the registry's view of every service.
 ///
 /// The layout belongs to the service controller rather than to the kernel, and
-/// ships as a file of its own for each release it changed in.
+/// ships as a file of its own for each release it changed in. These checks
+/// must be completed from newest to oldest OS version.
 pub fn prerequisites(
     context: &Arc<Context>,
     kernel: &Module,
@@ -115,7 +118,7 @@ pub fn service_scan(
 ) -> Result<Vec<Vec<Value>>> {
     let record_type = format!("{table}!_SERVICE_RECORD");
     let header_type = format!("{table}!_SERVICE_HEADER");
-    let vista_or_later = versions::matches(context, kernel, versions::IS_VISTA_OR_LATER);
+    let vista_or_later = versions::matches(context, kernel, &versions::IS_VISTA_OR_LATER);
     // The tag the controller marks its records with changed with Vista.
     let tag: &[u8] = if vista_or_later { b"serH" } else { b"sErv" };
 
@@ -165,11 +168,20 @@ pub fn service_scan(
             {
                 let built = row(offset, &record, registry);
                 // Chains overlap, so reaching a record already reported ends
-                // this one. A row that could not report a process or a running
-                // image is never recognised as one already seen, so it is
-                // reported once per chain that reaches it.
-                let comparable = !matches!(built[2], Value::Absent(_))
-                    && !matches!(built[8], Value::Absent(_));
+                // this one. Upstream compares whole rows, and a row holding
+                // anything absent never matches one it has already kept: the
+                // absent values it builds are fresh each time and compare by
+                // identity. The two columns that come from the registry are
+                // the exception, since a service the registry names reuses
+                // the same values every time it is reached.
+                let named = match &built[6] {
+                    Value::Str(name) => registry.contains_key(name.as_str()),
+                    _ => false,
+                };
+                let comparable = named
+                    && built[..9]
+                        .iter()
+                        .all(|value| !matches!(value, Value::Absent(_)));
                 if comparable && seen.contains(&(offset, record.offset())) {
                     break;
                 }
@@ -182,6 +194,9 @@ pub fn service_scan(
 }
 
 /// Find every service by walking the list the controller itself keeps.
+///
+/// Since we walk the s-list backwards, if we've seen an object then we've also
+/// seen all objects that exist before it, thus we can break at that time.
 ///
 /// The list runs from a marker inside the controller's own executable, so only
 /// that one region is searched rather than everything the process maps.
@@ -237,7 +252,7 @@ pub fn supports_service_list(context: &Arc<Context>, kernel: &Module) -> bool {
         .map(|table| table.pointer_size())
         .unwrap_or(8)
         == 8;
-    sixty_four_bit && versions::matches(context, kernel, versions::IS_WIN10_15063_OR_LATER)
+    sixty_four_bit && versions::matches(context, kernel, &versions::IS_WIN10_15063_OR_LATER)
 }
 
 /// Every record a header names, newest first.
@@ -422,6 +437,9 @@ fn traverse(record: &Object) -> Vec<(u64, Object)> {
         if address == 0 {
             break;
         }
+        // Make sure we dereference these pointers, or the validity checks will
+        // apply to the pointer and not the `_SERVICE_RECORD` object as
+        // intended.
         let Ok(next) = link.dereference() else { break };
         if !record_is_valid(&next) {
             break;
@@ -657,23 +675,25 @@ fn service_table(context: &Arc<Context>, kernel: &Module) -> Result<String> {
         == 8;
 
     // Newest first: the first release whose marks are all present is the one.
-    let candidates: &[(&[versions::Check], bool, &str)] = &[
-        (versions::IS_WIN10_25398_OR_LATER, true, "services-win10-25398-x64"),
-        (versions::IS_WIN10_19041_OR_LATER, true, "services-win10-19041-x64"),
-        (versions::IS_WIN10_19041_OR_LATER, false, "services-win10-19041-x86"),
-        (versions::IS_WIN10_18362_OR_LATER, true, "services-win10-18362-x64"),
-        (versions::IS_WIN10_18362_OR_LATER, false, "services-win10-18362-x86"),
-        (versions::IS_WIN10_17763_OR_LATER, false, "services-win10-17763-x86"),
-        (versions::IS_WIN10_16299_OR_LATER, true, "services-win10-16299-x64"),
-        (versions::IS_WIN10_16299_OR_LATER, false, "services-win10-16299-x86"),
-        (versions::IS_WIN10_15063, true, "services-win10-15063-x64"),
-        (versions::IS_WIN10_15063, false, "services-win10-15063-x86"),
-        (versions::IS_WIN10_UP_TO_15063, true, "services-win8-x64"),
-        (versions::IS_WIN10_UP_TO_15063, false, "services-win8-x86"),
-        (versions::IS_WINDOWS_8_OR_LATER, true, "services-win8-x64"),
-        (versions::IS_WINDOWS_8_OR_LATER, true, "services-win8-x86"),
-        (versions::IS_VISTA_OR_LATER, true, "services-vista-x64"),
-        (versions::IS_VISTA_OR_LATER, false, "services-vista-x86"),
+    let candidates: &[(&versions::Distinguisher, bool, &str)] = &[
+        (&versions::IS_WIN10_25398_OR_LATER, true, "services-win10-25398-x64"),
+        (&versions::IS_WIN10_19041_OR_LATER, true, "services-win10-19041-x64"),
+        (&versions::IS_WIN10_19041_OR_LATER, false, "services-win10-19041-x86"),
+        (&versions::IS_WIN10_18362_OR_LATER, true, "services-win10-18362-x64"),
+        (&versions::IS_WIN10_18362_OR_LATER, false, "services-win10-18362-x86"),
+        (&versions::IS_WIN10_17763_OR_LATER, false, "services-win10-17763-x86"),
+        (&versions::IS_WIN10_16299_OR_LATER, true, "services-win10-16299-x64"),
+        (&versions::IS_WIN10_16299_OR_LATER, false, "services-win10-16299-x86"),
+        (&versions::IS_WIN10_15063, true, "services-win10-15063-x64"),
+        (&versions::IS_WIN10_15063, false, "services-win10-15063-x86"),
+        (&versions::IS_WIN10_UP_TO_15063, true, "services-win8-x64"),
+        (&versions::IS_WIN10_UP_TO_15063, false, "services-win8-x86"),
+        (&versions::IS_WINDOWS_8_OR_LATER, true, "services-win8-x64"),
+        (&versions::IS_WINDOWS_8_OR_LATER, true, "services-win8-x86"),
+        (&versions::IS_VISTA_OR_LATER, true, "services-vista-x64"),
+        (&versions::IS_VISTA_OR_LATER, false, "services-vista-x86"),
+        (&versions::IS_WINDOWS_XP, false, "services-xp-x86"),
+        (&versions::IS_XP_OR_2003, true, "services-xp-2003-x64"),
     ];
 
     let table = candidates

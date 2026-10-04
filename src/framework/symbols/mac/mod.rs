@@ -239,11 +239,27 @@ fn hash_table(
 /// A loaded kernel extension.
 pub struct KernelExtension {
     pub object: Object,
+    /// The address reported for this extension, which is not always the
+    /// address of the extension itself. See `offset`.
+    reported_offset: u64,
 }
 
 impl KernelExtension {
     pub fn new(object: Object) -> Self {
-        Self { object }
+        let reported_offset = object.offset();
+        Self {
+            object,
+            reported_offset,
+        }
+    }
+
+    /// An extension found by following a link, which reports the address of
+    /// the link rather than its own.
+    fn linked(object: Object, link: u64) -> Self {
+        Self {
+            object,
+            reported_offset: link,
+        }
     }
 
     pub fn name(&self) -> Result<String> {
@@ -254,8 +270,14 @@ impl KernelExtension {
         self.object.member("size")?.as_u64()
     }
 
+    /// The address this extension is reported at.
+    ///
+    /// Upstream hands the walk's own pointer to the renderer rather than the
+    /// structure it points at, so every extension after the first is reported
+    /// at the address of the previous one's `next` member. The column is its
+    /// public interface, so the same address is reported here.
     pub fn offset(&self) -> u64 {
-        self.object.offset()
+        self.reported_offset
     }
 }
 
@@ -291,7 +313,7 @@ pub fn list_extensions(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Ke
             break;
         }
         seen.insert(pointer.pointer_value().unwrap_or(0));
-        results.push(KernelExtension::new(extension.clone()));
+        results.push(KernelExtension::linked(extension.clone(), pointer.offset()));
 
         let Ok(next) = extension.member("next") else {
             break;
@@ -302,46 +324,6 @@ pub fn list_extensions(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Ke
 }
 
 impl Proc {
-    /// The task's command line arguments.
-    ///
-    /// Darwin records the argument count and the address of the block holding
-    /// the strings. The block also carries the executable path ahead of them.
-    pub fn arguments(&self) -> Result<(u64, Vec<String>)> {
-        let argc = self.object.member("p_argc")?.as_u64()?;
-        let start = self.object.member("user_stack")?.as_u64()?;
-        if start == 0 || argc == 0 || argc > 1024 {
-            return Ok((argc, Vec::new()));
-        }
-
-        // The arguments sit just below the top of the user stack. Read a bounded
-        // window and split it rather than trusting a length from the image.
-        const WINDOW: usize = 0x2000;
-        let base = start.saturating_sub(WINDOW as u64);
-        let data = self
-            .object
-            .context()
-            .layers
-            .read(self.object.layer_name(), base, WINDOW, true)?;
-
-        let strings: Vec<String> = data
-            .split(|&byte| byte == 0)
-            .filter(|part| {
-                !part.is_empty() && part.iter().all(|&b| b.is_ascii_graphic() || b == b' ')
-            })
-            .map(|part| String::from_utf8_lossy(part).to_string())
-            .collect();
-
-        // The last `argc` plausible strings are the arguments themselves.
-        let taken = strings
-            .iter()
-            .rev()
-            .take(argc as usize)
-            .rev()
-            .cloned()
-            .collect();
-        Ok((argc, taken))
-    }
-
     /// The process's open file descriptors, as `(file, path, descriptor)`.
     ///
     /// The path names the file a descriptor refers to, and for everything that
@@ -392,18 +374,30 @@ impl Proc {
             return Vec::new();
         };
 
+        // The table is an array of pointers, so its stride follows the width
+        // of a pointer in the kernel this image came from.
+        let stride = context
+            .symbol_space
+            .table(&table_name)
+            .map(|table| table.pointer_size())
+            .unwrap_or(8) as u64;
+
         let mut results = Vec::new();
         let mut path: Option<String> = None;
 
         for descriptor in 0..count as u64 {
-            let Ok(raw) =
-                context
-                    .layers
-                    .read(self.object.layer_name(), table + descriptor * 8, 8, false)
-            else {
+            let Ok(raw) = context.layers.read(
+                self.object.layer_name(),
+                table + descriptor * stride,
+                stride as usize,
+                false,
+            ) else {
                 continue;
             };
-            let entry = u64::from_le_bytes(raw.try_into().unwrap());
+            let entry = raw
+                .iter()
+                .rev()
+                .fold(0u64, |value, byte| (value << 8) | *byte as u64);
             if entry == 0 {
                 continue;
             }
@@ -663,6 +657,19 @@ pub fn walk_tailq(head: &Object, element_type: &str, link_member: &str) -> Resul
     walk_iterable(head, "tqh_first", "tqe_next", element_type, link_member)
 }
 
+/// The same walk, giving the address of the link that led to each element
+/// alongside the element itself.
+///
+/// Upstream hands the link to its caller rather than the element, so a caller
+/// that reports an address needs to know which one it would have reported.
+pub fn walk_tailq_links(
+    head: &Object,
+    element_type: &str,
+    link_member: &str,
+) -> Result<Vec<(u64, Object)>> {
+    walk_iterable_links(head, "tqh_first", "tqe_next", element_type, link_member)
+}
+
 /// Walk a list whose head names its first element, giving each in turn.
 pub fn walk_list_head(head: &Object, element_type: &str, link_member: &str) -> Result<Vec<Object>> {
     walk_iterable(head, "lh_first", "le_next", element_type, link_member)
@@ -685,6 +692,22 @@ fn walk_iterable(
     element_type: &str,
     link_member: &str,
 ) -> Result<Vec<Object>> {
+    Ok(
+        walk_iterable_links(head, first_member, next_member, element_type, link_member)?
+            .into_iter()
+            .map(|(_, element)| element)
+            .collect(),
+    )
+}
+
+/// The walk itself, which keeps the address of each link it followed.
+fn walk_iterable_links(
+    head: &Object,
+    first_member: &str,
+    next_member: &str,
+    element_type: &str,
+    link_member: &str,
+) -> Result<Vec<(u64, Object)>> {
     let context = head.context().clone();
     let template = context.symbol_space.get_type(element_type)?;
 
@@ -706,7 +729,7 @@ fn walk_iterable(
         let address = pointer.pointer_value()?;
         let element = context.object_from_template(template.clone(), head.layer_name(), address);
         if pointer.is_readable() {
-            results.push(element.clone());
+            results.push((pointer.offset(), element.clone()));
         }
 
         let Ok(next) = element
@@ -844,19 +867,22 @@ impl VmMapEntry {
         }
     }
 
+    /// Whether the mapping holds another map rather than memory of its own.
+    pub fn is_sub_map(&self) -> bool {
+        self.object
+            .member("is_sub_map")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            == 1
+    }
+
     /// The vnode backing this mapping, when a file backs it.
     ///
     /// The mapping names a memory object, which may be shadowed by others, and
     /// the last of those names the pager that reads it. Only a pager that
     /// reads from a file leads to a vnode.
     pub fn vnode_handle(&self, kernel: &Module) -> Option<Object> {
-        if self
-            .object
-            .member("is_sub_map")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0)
-            == 1
-        {
+        if self.is_sub_map() {
             return None;
         }
 
@@ -938,7 +964,13 @@ impl VmMapEntry {
     }
 
     /// The name of whatever backs this mapping.
+    ///
+    /// A mapping that holds another map is named for what it is, which is the
+    /// one path upstream reports that is not a file's.
     pub fn path(&self, kernel: &Module) -> String {
+        if self.is_sub_map() {
+            return "sub_map".to_string();
+        }
         match self.vnode_handle(kernel) {
             Some(handle) if handle.pointer_value().unwrap_or(0) != 0 => vnode_map_path(&handle),
             _ => String::new(),

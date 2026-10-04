@@ -1,6 +1,6 @@
 [package]
 name = "vol-rs"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2024"
 description = "A port of the Volatility 3 memory forensics framework from Python to Rust"
 repository = "https://github.com/daffainfo/vol-rs"
@@ -42,8 +42,8 @@ xz2 = "0.1.7"
 yara-x = "1.20.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 ureq = { version = "3.4.0", features = ["rustls"] }
-iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
 libz-sys = "1.1.29"
+capstone = { version = "0.14.0", default-features = false, features = ["full", "std", "arch_x86", "arch_arm", "arch_arm64"] }
 
 [profile.release]
 # One codegen unit and whole program optimisation, then drop the symbol table:

@@ -1,5 +1,3 @@
-//! Check the Mac system call table for hooked entries.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -12,6 +10,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::ExtensionResolver;
 
+/// Check system call table for hooks.
 pub struct CheckSyscall;
 
 

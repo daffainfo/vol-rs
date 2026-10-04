@@ -1,5 +1,3 @@
-//! Check the TrustedBSD policy hooks.
-//!
 //! TrustedBSD lets an extension register a callback for almost every security
 //! decision the kernel makes. It is a legitimate mechanism that antivirus uses,
 //! but also a complete interception point, so which extension owns each hook
@@ -18,6 +16,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::ExtensionResolver;
 
+/// Checks for malicious trustedbsd modules
 pub struct TrustedBsd;
 
 impl Plugin for TrustedBsd {
@@ -51,7 +50,10 @@ impl Plugin for TrustedBsd {
         let kernel = kernel_module(&context, config)?;
         let resolver = ExtensionResolver::new(&context, &kernel).ok();
 
-        // Registered policies are on a list the kernel keeps.
+        // Registered policies are on a list the kernel keeps. A policy with
+        // no ops is skipped: the kernel makes this check all over the place,
+        // and the policy isn't useful without any ops so a rootkit can't abuse
+        // this.
         let head = context.object_from_symbol(&kernel, "mac_policy_list", Some("mac_policy_list"))?;
         // The table has one more slot than its highest index.
         let count = head.member("staticmax")?.as_u64()?.wrapping_add(1);

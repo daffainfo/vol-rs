@@ -1,5 +1,3 @@
-//! Report the SIDs owning each process.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -15,6 +13,7 @@ use crate::framework::plugins::windows::registry;
 use crate::framework::symbols::windows::registry as registry_symbols;
 use crate::framework::symbols::windows::sid_data;
 
+/// Print the SIDs owning each process
 pub struct GetSids;
 
 impl Plugin for GetSids {
@@ -46,7 +45,7 @@ impl Plugin for GetSids {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let filter = pid_filter(config);
-        // The users a machine knows are named in its registry.
+        // Enumerate the registry for all the users.
         let users = user_names(&context, &kernel).unwrap_or_default();
         let mut grid = TreeGrid::new(self.columns());
 
@@ -57,7 +56,24 @@ impl Plugin for GetSids {
             }
             let name = process.image_file_name().unwrap_or_default();
 
-            for sid in process.sids().unwrap_or_default() {
+            // Go all over the process list, get the token, and make sure we
+            // have a valid one. Then go all over the sids and try to translate
+            // them with one of the tables we have. A process whose token cannot
+            // be read is still listed, saying so.
+            let Ok(sids) = process.sids() else {
+                grid.push(
+                    0,
+                    vec![
+                        Value::int(pid as i64),
+                        Value::string(name.clone()),
+                        Value::string("Token unreadable"),
+                        Value::string(String::new()),
+                    ],
+                )?;
+                continue;
+            };
+
+            for sid in sids {
                 // A fixed identifier first, then the service accounts, then
                 // the users the registry names, and finally the patterns for
                 // identifiers that carry a domain in the middle.
@@ -66,6 +82,11 @@ impl Plugin for GetSids {
                     .map(|name| Value::string(name))
                     .or_else(|| users.get(&sid).map(|name| Value::string(name.clone())))
                     .or_else(|| sid_data::by_pattern(&sid).map(Value::string))
+                    // An identifier no pattern names is reported as not
+                    // available. The reference implementation has a branch
+                    // for an empty name here, but the value it tests is an
+                    // object rather than a string, so that branch is never
+                    // reached.
                     .unwrap_or_else(Value::not_available);
                 grid.push(
                     0,

@@ -1,5 +1,3 @@
-//! Scan physical memory for file objects.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -11,8 +9,9 @@ use crate::framework::objects::utility::unicode_string;
 use crate::framework::plugins::windows::{kernel_module, physical_layer};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::windows::poolscanner::scan_for_tag;
+use crate::framework::symbols::windows::poolscanner::scan_for_tags;
 
+/// Scans for file objects present in a particular windows memory image.
 pub struct FileScan;
 
 impl Plugin for FileScan {
@@ -39,18 +38,24 @@ impl Plugin for FileScan {
         ]
     }
 
+    /// Scans for file objects using the poolscanner module and constraints.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let _layer = physical_layer(config);
 
-        let objects = scan_for_tag(&context, &kernel, b"File")?;
+        // The tag gained its high bit when the allocation moved into the
+        // protected pool, so both spellings are searched for.
+        let objects = scan_for_tags(&context, &kernel, &[b"Fil\xe5", b"File"])?;
 
         let mut grid = TreeGrid::new(self.columns());
         for object in objects {
-            let name = object
+            // A file whose name cannot be read is not reported at all.
+            let Ok(name) = object
                 .member("FileName")
                 .and_then(|name| unicode_string(&name))
-                .unwrap_or_default();
+            else {
+                continue;
+            };
             grid.push(0, vec![Value::hex(object.offset()), Value::string(name)])?;
         }
         Ok(grid)

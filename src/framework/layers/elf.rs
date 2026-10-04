@@ -32,6 +32,10 @@ fn read_uint(data: &[u8], at: usize, width: usize) -> Option<u64> {
 
 /// Verify that `layer` starts with a little-endian ELF core header and report
 /// its class (32- or 64-bit).
+///
+/// We read the MAGIC at 0x0 to 0x4 (`0x7f 0x45 0x4c 0x46`, e.g. ELF), check its
+/// validity, and then read the EI_CLASS at the 0x4 offset before constructing
+/// the full header.
 pub fn check_header(layers: &LayerContainer, layer: &str) -> Result<u8> {
     let header = layers
         .read(layer, 0, 0x40, false)
@@ -57,7 +61,10 @@ pub fn check_header(layers: &LayerContainer, layer: &str) -> Result<u8> {
     Ok(class)
 }
 
-/// Build a layer over the `PT_LOAD` segments of an ELF core dump.
+/// A layer that supports the Elf64 format as documented at:
+/// <http://ftp.openwatcom.org/devel/docs/elf-64-gen.pdf>
+///
+/// The layer covers the `PT_LOAD` segments the file declares.
 pub fn build(
     layers: &LayerContainer,
     name: impl Into<String>,

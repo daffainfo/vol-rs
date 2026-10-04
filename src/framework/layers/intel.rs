@@ -22,7 +22,8 @@ use crate::framework::layers::{DataLayer, LayerContainer, MappingEntry};
 /// Bit positions within a page table entry that the translation logic cares
 /// about.
 const PAGE_BIT_PRESENT: u32 = 0;
-/// Page Size Extension: this entry maps a large page rather than a table.
+/// Page Size Extension: 4 MB (or 2MB) page. This entry maps a large page
+/// rather than a table.
 const PAGE_BIT_PSE: u32 = 7;
 /// Linux marks `PROT_NONE` pages present-but-inaccessible with this bit.
 const PAGE_BIT_PROTNONE: u32 = 8;
@@ -74,8 +75,9 @@ pub struct IntelConfig {
     pub page_size_in_bits: u32,
     /// Width of the architecture's registers, which bounds virtual addresses.
     pub bits_per_register: u32,
-    /// MAXPHYADDR as defined by Intel: the number of significant physical
-    /// address bits, *not* the maximum physical address.
+    /// NOTE: this is MAXPHYADDR as defined in the Intel specs *NOT* the
+    /// maximum physical address. It is the number of significant physical
+    /// address bits.
     pub maxphyaddr: u32,
     /// Number of significant virtual address bits.
     pub maxvirtaddr: u32,
@@ -145,8 +147,14 @@ pub const INTEL_32E: IntelConfig = IntelConfig {
     swap_bit_offset: 32,
 };
 
-/// Windows flavours. The 64-bit variant narrows MAXPHYADDR to 45 bits because
-/// Windows repurposes a high bit of the PFN field for pages in transition.
+/// Windows flavours.
+///
+/// The 64-bit variant narrows MAXPHYADDR to 45 bits. TODO: Fix appropriately in
+/// a future release. Currently just a temporary workaround to deal with a
+/// custom bit flag in the PFN field for pages in transition state.
+///
+/// These must be full separate classes upstream so that JSON configs re-create
+/// them properly.
 pub const WINDOWS_INTEL: IntelConfig = IntelConfig {
     flavour: Flavour::Windows,
     class_name: "WindowsIntel",
@@ -167,9 +175,19 @@ pub const WINDOWS_INTEL_32E: IntelConfig = IntelConfig {
     ..INTEL_32E
 };
 
-/// Linux flavours. The 64-bit variant uses a 46-bit physical mask, which
-/// matches what the kernel used before 4.17 and still gives correct results for
-/// `PROT_NONE` pages on later kernels.
+/// Linux flavours.
+///
+/// In the Linux kernel, the `__PHYSICAL_MASK_SHIFT` is a mask used to extract
+/// the physical address from a PTE. In Volatility3, this is referred to as
+/// `maxphyaddr`. Until kernel version 4.17, Linux x86-64 used a 46-bit mask.
+/// With commit b83ce5ee91471d19c403ff91227204fb37c95fb2, this was extended to
+/// 52 bits, applying to both 4 and 5-level page tables.
+///
+/// We initially used 52 bits for all Intel 64-bit systems, but this produced
+/// incorrect results for PROT_NONE pages. Since the mask value is defined by a
+/// preprocessor macro, it's difficult to detect the exact bit shift used in the
+/// current kernel. Using 46 bits has proven reliable for our use case, as seen
+/// in tools like crashtool.
 pub const LINUX_INTEL: IntelConfig = IntelConfig {
     flavour: Flavour::Linux,
     ..INTEL
@@ -200,7 +218,7 @@ pub fn config_by_name(name: &str) -> Option<IntelConfig> {
     })
 }
 
-/// Extract bits `[low_bit, high_bit]` inclusive from `value`.
+/// Returns the bits of a value between highbit and lowbit inclusive.
 fn mask_bits(value: u64, high_bit: u32, low_bit: u32) -> u64 {
     let high_mask = if high_bit >= 63 {
         u64::MAX
@@ -225,7 +243,12 @@ struct TranslatedEntry {
     position: u32,
 }
 
-/// An Intel paging layer over a physical base layer.
+/// Translation Layer for the Intel IA32 memory mapping.
+///
+/// One layer serves the three classes upstream splits this into, since the only
+/// difference between `Intel`, `IntelPAE` (Physical Address Extensions) and
+/// `Intel32e` (64-bit, 32-bit extensions) is the table shape, which the
+/// configuration carries.
 pub struct IntelLayer {
     name: String,
     base_layer: String,
@@ -335,21 +358,30 @@ impl IntelLayer {
         &self.config
     }
 
+    /// Page shift for the intel memory layers.
     pub fn page_shift(&self) -> u32 {
         self.config.page_size_in_bits
     }
 
+    /// Page size for the intel memory layers.
+    ///
+    /// All Intel layers work on 4096 byte pages.
     pub fn page_size(&self) -> u64 {
         1 << self.config.page_size_in_bits
     }
 
-    /// Page mask, limited to the register width so the complement stays inside
-    /// the architecture's pointer size.
+    /// Page mask for the intel memory layers.
+    ///
+    /// Note that within the Intel class it's a class method upstream. However,
+    /// since it uses complement operations and we are working in Python, it
+    /// would be more careful to limit it to the architecture's pointer size.
     fn page_mask(&self) -> u64 {
         let register_mask = self.register_mask();
         !(self.page_size() - 1) & register_mask
     }
 
+    /// Returns the bits_per_register to determine the range of an
+    /// IntelTranslationLayer.
     fn register_mask(&self) -> u64 {
         if self.config.bits_per_register >= 64 {
             u64::MAX
@@ -358,6 +390,13 @@ impl IntelLayer {
         }
     }
 
+    /// Gets a mask to AND with the page table entry to get the correct PFN.
+    ///
+    /// From kernels 4.18 the physical mask is dynamic: See AMD SME, Intel
+    /// Multi-Key Total Memory Encryption and CONFIG_DYNAMIC_PHYSICAL_MASK:
+    /// 94d49eb30e854c84d1319095b5dd0405a7da9362.
+    ///
+    /// TODO: Come back once SME support is available in the framework.
     fn physical_mask(&self) -> u64 {
         if self.config.maxphyaddr >= 64 {
             u64::MAX
@@ -366,8 +405,8 @@ impl IntelLayer {
         }
     }
 
-    /// Sign-extend an address into its canonical form on architectures whose
-    /// virtual space is narrower than their registers.
+    /// Canonicalizes an address by performing an appropriate sign extension on
+    /// the higher addresses.
     pub fn canonicalize(&self, address: u64) -> u64 {
         if self.config.bits_per_register <= self.config.maxvirtaddr {
             address & self.address_mask
@@ -378,7 +417,11 @@ impl IntelLayer {
         }
     }
 
-    /// Undo canonicalization, bringing a sign-extended address back into range.
+    /// Removes canonicalization to ensure an address fits within the correct
+    /// range if it has been canonicalized.
+    ///
+    /// This will produce an address outside the range if the canonicalization
+    /// is incorrect.
     pub fn decanonicalize(&self, address: u64) -> u64 {
         if address < (1u64 << (self.config.maxvirtaddr - 1)) {
             address
@@ -387,7 +430,15 @@ impl IntelLayer {
         }
     }
 
-    /// Whether an entry marks a usable page, per the OS flavour.
+    /// Returns whether a particular page is valid based on its entry.
+    ///
+    /// Windows uses additional "available" bits to store flags. These flags
+    /// allow windows to determine whether a page is still valid. Bit 11 is the
+    /// transition flag, and Bit 10 is the prototype flag. For more information,
+    /// see Windows Internals (6th Ed, Part 2, pages 268-269).
+    ///
+    /// The Linux arm overrides the Intel static method with the Linux-specific
+    /// implementation.
     fn page_is_valid(&self, entry: u64) -> bool {
         match self.config.flavour {
             Flavour::Generic => entry & PAGE_PRESENT != 0,
@@ -410,12 +461,12 @@ impl IntelLayer {
         self.page_mask() & self.physical_mask()
     }
 
-    /// Extract the page frame number from a page table entry.
+    /// Extracts the page frame number (PFN) from the page table entry (PTE).
     fn pte_pfn(&self, entry: u64) -> u64 {
         match self.config.flavour {
             Flavour::Linux => {
-                // A PROT_NONE entry has its bits inverted by the kernel to keep
-                // it from being confused with a genuine mapping. Undo that.
+                // Entries that were set to PROT_NONE (PAGE_PRESENT) are
+                // inverted. A clear PTE shouldn't be inverted. See f19f5c4.
                 let needs_invert = entry != 0 && entry & PAGE_PRESENT == 0;
                 let pfn = if needs_invert {
                     entry ^ self.register_mask()
@@ -428,15 +479,41 @@ impl IntelLayer {
         }
     }
 
+    /// Returns whether a particular page is dirty based on its entry.
     fn page_is_dirty(entry: u64) -> bool {
         entry & (1 << 6) != 0
     }
 
-    /// Read a page table, rejecting tables whose entries are all identical.
+    /// Extracts the table, validates it and returns it if it's valid.
     ///
-    /// Windows 10 and later map large stretches of unused virtual memory to a
-    /// single physical page. Treating such a table as absent costs a rare false
-    /// negative but saves scans from walking millions of duplicate mappings.
+    /// If the table is entirely duplicates, then mark the whole table as bad.
+    /// This is because Windows 10 onwards has a tendency to map unused pages as
+    /// present. This had the following consequences:
+    ///
+    /// * Used very litle physical memory
+    /// * Exploded virtual memory
+    /// * Causes *scan plugins to take multiple hours to complete even on small
+    ///   images
+    ///
+    /// Previous versions of volatility would ignore a page during a scan when
+    /// it matched the one directly preceding it in physical memory. This could
+    /// trip if only two pages were identical and still required enumerating all
+    /// the invalid pages (which itself was quite time consuming).
+    ///
+    /// For this reason, volatility 3 shifted to looking at entire page tables
+    /// (1,024 pages) and if all the pages mapped to the same place the table
+    /// would be skipped. This could also be applied to the Directory level as
+    /// well as the Table level, allowing Volatility to skip huge sections of
+    /// virtual memory very efficiently, without missing any pages that were
+    /// distinct within a particular page table (or directory).
+    ///
+    /// In order to work at this level, the logic was moved out of the scanning
+    /// component and directly into the layer logic itself. This does have the
+    /// side effect of preventing entirely duplicated page tables from reporting
+    /// as present, however, the trade off between Windows 10+ reduced scanning
+    /// times (common amongst scan plugins) versus incorrectly reporting entire
+    /// page tables of identically mapped repeating *valid* data (rare) was
+    /// accepted in favour of the more common occurance.
     fn get_valid_table(&self, layers: &LayerContainer, base_address: u64) -> Option<Vec<u8>> {
         if let Some(cached) = self.table_cache.lock().unwrap().get(&base_address) {
             return cached.clone();
@@ -474,6 +551,15 @@ impl IntelLayer {
     }
 
     /// Walk the paging structures for a page-aligned virtual address.
+    /// Translates a page address based on paging tables.
+    ///
+    /// # Args
+    ///
+    /// * `page_address` - The page base address
+    ///
+    /// # Returns
+    ///
+    /// The translated entry value.
     fn translate_entry(&self, layers: &LayerContainer, page_address: u64) -> Result<TranslatedEntry> {
         if let Some(cached) = self.entry_cache.lock().unwrap().get(&page_address) {
             return match cached {
@@ -530,7 +616,7 @@ impl IntelLayer {
                     page_address,
                     position + 1,
                     entry,
-                    format!("Page fault at entry {entry:#x} in table {}", level.name),
+                    format!("Page Fault at entry {entry:#x} in table {}", level.name),
                 ));
             }
 
@@ -547,7 +633,7 @@ impl IntelLayer {
                     page_address,
                     position + 1,
                     entry,
-                    format!("Page fault at entry {entry:#x} in table {}", level.name),
+                    format!("Page Fault at entry {entry:#x} in table {}", level.name),
                 )
             })?;
 
@@ -569,7 +655,11 @@ impl IntelLayer {
         Ok(TranslatedEntry { entry, position })
     }
 
-    /// Translate a virtual address to `(physical offset, page size, layer)`.
+    /// Translates a specific offset based on paging tables.
+    ///
+    /// Returns the translated offset, the contiguous pagesize that the
+    /// translated address lives in and the layer_name that the address lives
+    /// in.
     fn translate(&self, layers: &LayerContainer, offset: u64) -> Result<(u64, u64, String)> {
         let result = self.translate_entry(layers, offset & self.page_mask());
 
@@ -584,7 +674,7 @@ impl IntelLayer {
                 offset,
                 translated.position + 1,
                 translated.entry,
-                format!("Page fault at entry {:#x} in page entry", translated.entry),
+                format!("Page Fault at entry {:#x} in page entry", translated.entry),
             );
             return self.handle_swap(offset, error);
         }
@@ -639,7 +729,7 @@ impl IntelLayer {
         })
     }
 
-    /// Whether the page backing `offset` is marked dirty.
+    /// Returns whether the page at offset is marked dirty.
     pub fn is_dirty(&self, layers: &LayerContainer, offset: u64) -> bool {
         self.translate_entry(layers, offset & self.page_mask())
             .map(|t| Self::page_is_dirty(t.entry))
@@ -675,6 +765,8 @@ impl DataLayer for IntelLayer {
         (1u64 << self.config.maxvirtaddr) - 1
     }
 
+    /// Returns whether the address offset can be translated to a valid
+    /// address.
     fn is_valid(&self, layers: &LayerContainer, offset: u64, length: u64) -> bool {
         match self.mapping(layers, offset, length, false) {
             Ok(entries) => entries
@@ -684,6 +776,8 @@ impl DataLayer for IntelLayer {
         }
     }
 
+    /// Returns a list of the lower layer names that this layer is dependent
+    /// upon.
     fn dependencies(&self) -> Vec<String> {
         let mut deps = vec![self.base_layer.clone()];
         deps.extend(self.swap_layers.iter().cloned());
@@ -703,6 +797,11 @@ impl DataLayer for IntelLayer {
         }
     }
 
+    /// Returns a sorted iterable of (offset, sublength, mapped_offset,
+    /// mapped_length, layer) mappings.
+    ///
+    /// This allows translation layers to provide maps of contiguous regions in
+    /// one layer.
     fn mapping(
         &self,
         layers: &LayerContainer,
@@ -822,12 +921,15 @@ impl IntelLayer {
             let mut skip_mask: Option<u64> = None;
             let outcome = match self.translate(layers, offset) {
                 Ok((chunk_offset, page_size, layer)) => {
+                    // Page align the chunk size value
                     let chunk_size = (page_size - (offset % page_size)).min(length);
                     if layers.is_valid(&layer, chunk_offset, chunk_size) {
                         Ok((chunk_offset, chunk_size, layer))
                     } else {
-                        // Translation is contiguous across the chunk, so a failure
-                        // here means the whole chunk is absent and can be skipped.
+                        // Virtual -> physical is contiguous in the chunk_size
+                        // range. If we fail, we can jump directly to the end as
+                        // we know all bytes in between aren't mapped (virtually
+                        // and) physically anyway.
                         skip_mask = Some(chunk_size - 1);
                         Err(VolatilityError::invalid_address(
                             &layer,
@@ -855,9 +957,8 @@ impl IntelLayer {
                     if !ignore_errors {
                         return Err(error);
                     }
-                    // Jump past the whole unmapped region. When the fault came
-                    // from a specific paging level we know exactly how much of
-                    // the address space it covers.
+                    // We can jump more if we know where the page fault
+                    // occured.
                     let mask = skip_mask.unwrap_or_else(|| {
                         let bits = error.invalid_bits().unwrap_or(self.config.page_size_in_bits);
                         (1u64 << bits) - 1

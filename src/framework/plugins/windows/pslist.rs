@@ -1,5 +1,3 @@
-//! List the processes on the kernel's active process list.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -16,6 +14,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, Process};
 
+/// Lists the processes present in a particular windows memory image.
 pub struct PsList;
 
 impl Plugin for PsList {

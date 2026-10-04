@@ -1,5 +1,3 @@
-//! Scan for the window stations the interactive subsystem keeps.
-//!
 //! Every interactive session has at least one window station, and each station
 //! owns the desktops that windows are drawn on. The structures belong to the
 //! graphics subsystem rather than the kernel, and live in each session's own
@@ -20,11 +18,19 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::poolscanner::{
     generate_pool_scan, PoolConstraint, NONPAGED, PAGED,
 };
-use crate::framework::symbols::windows::{header_name, object_header, versions};
+use crate::framework::symbols::windows::{
+    header_name, header_name_checked, object_header, versions,
+};
 
+/// Scans for top level Windows Stations
 pub struct WindowStations;
 
 /// How many stations a chain may name before it has stopped being one.
+///
+/// These checks must be completed from newest to oldest OS version. Objects
+/// are enforced to be in a valid session, which prevents smear and also
+/// ensures future pointer dereferences are performed in the correct address
+/// space (layer). Each object is created in its own per-session address space.
 const MAXIMUM_STATIONS: usize = 15;
 
 impl Plugin for WindowStations {
@@ -57,7 +63,17 @@ impl Plugin for WindowStations {
         let physical = physical_layer(config);
 
         let mut grid = TreeGrid::new(self.columns());
-        for (station, name, session) in scan_window_stations(&context, &kernel, &physical)? {
+        // The GUI types are read while rows are being produced, so an image
+        // they do not cover leaves the header written and the run aborted.
+        let stations = match scan_window_stations(&context, &kernel, &physical) {
+            Ok(stations) => stations,
+            Err(error) => {
+                eprintln!("NotImplementedError: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
+        for (station, name, session) in stations {
             grid.push(
                 0,
                 vec![
@@ -71,6 +87,9 @@ impl Plugin for WindowStations {
     }
 }
 
+/// Scans for window stations through `scan_gui_object` Yields each window
+/// station along with its name and session_id
+///
 /// Every window station, with the name and session each reports.
 pub fn scan_window_stations(
     context: &Arc<Context>,
@@ -141,12 +160,14 @@ fn station_is_valid(station: &Object) -> bool {
 
 /// The name and session of a station, where both are believable.
 ///
-/// A station whose session is out of range, or whose name is a single
-/// character, is smear rather than a station.
+/// This attempts to avoid smear: a station whose session is out of range, or
+/// whose name is a single character, is smear rather than a station.
 pub fn station_info(station: &Object, kernel: &Module) -> Option<(String, u64)> {
     let session = session_id(station)?;
     let header = object_header(station, kernel).ok()?;
-    let name = header_name(&header, kernel)?;
+    // The name is only believed where its own two lengths agree, which is how
+    // a station reached through a smeared pointer is rejected.
+    let name = header_name_checked(&header, kernel)?;
     if session < 256 && name.chars().count() > 1 {
         Some((name, session))
     } else {
@@ -163,6 +184,8 @@ pub fn session_id(station: &Object) -> Option<u64> {
 }
 
 /// Follow the chain of stations from one of them.
+///
+/// The first window station is included.
 pub fn traverse(station: &Object) -> Vec<Object> {
     let mut found = vec![station.clone()];
     let mut seen: Vec<u64> = Vec::new();
@@ -274,18 +297,18 @@ pub fn gui_table(context: &Arc<Context>, kernel: &Module) -> Result<String> {
     }
 
     // Newest first: the first release whose marks are all present is the one.
-    let candidates: &[(&[versions::Check], &str)] = &[
-        (versions::IS_WIN10_19577_OR_LATER, "gui-win10-19577-x64"),
-        (versions::IS_WIN10_19041_OR_LATER, "gui-win10-19041-x64"),
-        (versions::IS_WIN10_18362_OR_LATER, "gui-win10-18362-x64"),
-        (versions::IS_WIN10_17763_OR_LATER, "gui-win10-17763-x64"),
-        (versions::IS_WIN10_17134_OR_LATER, "gui-win10-17134-x64"),
-        (versions::IS_WIN10_16299_OR_LATER, "gui-win10-16299-x64"),
-        (versions::IS_WIN10_15063_OR_LATER, "gui-win10-15063-x64"),
-        (versions::IS_WIN10_10586_OR_LATER, "gui-win10-10586-x64"),
-        (versions::IS_WINDOWS_8_OR_LATER, "gui-win8-x64"),
-        (versions::IS_WINDOWS_7_SP1, "gui-win7sp1-x64"),
-        (versions::IS_WINDOWS_7_SP0, "gui-win7sp0-x64"),
+    let candidates: &[(&versions::Distinguisher, &str)] = &[
+        (&versions::IS_WIN10_19577_OR_LATER, "gui-win10-19577-x64"),
+        (&versions::IS_WIN10_19041_OR_LATER, "gui-win10-19041-x64"),
+        (&versions::IS_WIN10_18362_OR_LATER, "gui-win10-18362-x64"),
+        (&versions::IS_WIN10_17763_OR_LATER, "gui-win10-17763-x64"),
+        (&versions::IS_WIN10_17134_OR_LATER, "gui-win10-17134-x64"),
+        (&versions::IS_WIN10_16299_OR_LATER, "gui-win10-16299-x64"),
+        (&versions::IS_WIN10_15063_OR_LATER, "gui-win10-15063-x64"),
+        (&versions::IS_WIN10_10586_OR_LATER, "gui-win10-10586-x64"),
+        (&versions::IS_WINDOWS_8_OR_LATER, "gui-win8-x64"),
+        (&versions::IS_WINDOWS_7_SP1, "gui-win7sp1-x64"),
+        (&versions::IS_WINDOWS_7_SP0, "gui-win7sp0-x64"),
     ];
 
     let table = candidates
@@ -301,8 +324,7 @@ pub fn gui_table(context: &Arc<Context>, kernel: &Module) -> Result<String> {
     Ok(table.to_string())
 }
 
-/// List the desktops of each window station, and the processes with threads on
-/// them.
+/// Enumerates the Desktop instances of each Window Station
 pub struct Desktops;
 
 impl Plugin for Desktops {
@@ -336,14 +358,29 @@ impl Plugin for Desktops {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let physical = physical_layer(config);
-        let table = gui_table(&context, &kernel)?;
         let mut grid = TreeGrid::new(self.columns());
+        // The reference implementation builds the table while producing rows,
+        // so the header is already out when it finds the image unsupported, and
+        // what follows is an uncaught failure.
+        let table = match gui_table(&context, &kernel) {
+            Ok(table) => table,
+            Err(error) => {
+                eprintln!("NotImplementedError: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
 
+        // Uses `scan_window_stations` to find each window station. For each
+        // found, enumerates its desktops followed by the threads of each
+        // desktop.
         for (station, station_name, session) in
             scan_window_stations(&context, &kernel, &physical)?
         {
+            // for each window station, walk its list of desktops
             for (desktop, desktop_name) in desktops(&station, &kernel) {
-                // A desktop's threads say which processes are drawing on it.
+                // for each desktop, walk its threads, which say which processes
+                // are drawing on it
                 for (process_name, pid) in desktop_threads(&table, &desktop, &kernel) {
                     grid.push(
                         0,
@@ -396,8 +433,7 @@ fn desktop_threads(
     found
 }
 
-/// Scan for the desktops themselves, rather than reaching them through the
-/// stations that own them.
+/// Scans for the Desktop instances of each Window Station
 ///
 /// A desktop the station list no longer reaches is still an allocation in the
 /// pools, so scanning finds desktops a walk cannot.
@@ -434,7 +470,16 @@ impl Plugin for DeskScan {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let physical = physical_layer(config);
-        let table = gui_table(&context, &kernel)?;
+        let mut grid = TreeGrid::new(self.columns());
+        // As above: the failure comes after the header has been written.
+        let table = match gui_table(&context, &kernel) {
+            Ok(table) => table,
+            Err(error) => {
+                eprintln!("NotImplementedError: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
         let sessions = session_map(&context, &kernel, &physical);
 
         // The tag is trusted rather than the kernel's type table, as it is for
@@ -444,7 +489,6 @@ impl Plugin for DeskScan {
             .of_type("Desktop")
             .trusting_the_tag()];
 
-        let mut grid = TreeGrid::new(self.columns());
         for desktop in scan_gui_objects(&context, &kernel, &sessions, &constraints)? {
             let Some(desktop_name) = object_header(&desktop, &kernel)
                 .ok()
@@ -480,7 +524,7 @@ impl Plugin for DeskScan {
     }
 }
 
-/// List the windows of each desktop.
+/// Enumerates the Windows of Desktop instances
 pub struct Windows;
 
 impl Plugin for Windows {
@@ -517,8 +561,21 @@ impl Plugin for Windows {
         let kernel = kernel_module(&context, config)?;
         let physical = physical_layer(config);
         let mut grid = TreeGrid::new(self.columns());
+        // As above: the header is already out when an unsupported image is
+        // found, and the run then aborts.
+        let stations = match scan_window_stations(&context, &kernel, &physical) {
+            Ok(stations) => stations,
+            Err(error) => {
+                eprintln!("NotImplementedError: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
 
-        for (station, station_name, _) in scan_window_stations(&context, &kernel, &physical)? {
+        // Enumerates the desktops of each window station. For each found,
+        // enumerates its windows within the desktop.
+        for (station, station_name, _) in stations {
+            // for each window station, walk its list of desktops
             for (desktop, desktop_name) in desktops(&station, &kernel) {
                 // The desktop's own window is the root of everything drawn on
                 // it. A desktop that cannot name it has nothing to walk.
@@ -532,6 +589,8 @@ impl Plugin for Windows {
                 };
 
                 for window in walk_windows(&top) {
+                    // We need a valid process and session id for the window
+                    // to display it
                     let Some((process_name, pid)) = window_process(&window, &kernel) else {
                         continue;
                     };
@@ -542,7 +601,8 @@ impl Plugin for Windows {
                         .member("lpfnWndProc")
                         .and_then(|procedure| procedure.as_u64())
                         .ok();
-                    // A procedure is either absent or a real address.
+                    // procedures can be empty, but if set, should be a valid
+                    // pointer
                     let procedure = match procedure {
                         None => Value::not_available(),
                         Some(address) if address == 0 || address > 0x1000 => Value::hex(address),
@@ -572,6 +632,9 @@ impl Plugin for Windows {
 }
 
 /// Walk a window and those beside and below it.
+///
+/// Walks adjacent windows first, then walks children windows and recursively
+/// yields them.
 fn walk_windows(window: &Object) -> Vec<Object> {
     /// How many windows a chain may name before it has stopped being one.
     const MAXIMUM: usize = 5000;
@@ -625,6 +688,12 @@ fn window_session(window: &Object) -> Option<u64> {
 }
 
 /// The text a window carries, where it carries any.
+///
+/// Upstream's `LARGE_UNICODE_STRING` is copy/paste from `UNICODE_STRING`,
+/// because "the versioning of modules would get very ugly if we let different
+/// modules share implementations across different data structures". It also
+/// explicitly does not catch read errors there, since otherwise there is no way
+/// to determine anything went wrong.
 fn window_name(window: &Object) -> Option<String> {
     if window.has_member("directName") {
         if let Ok(address) = window

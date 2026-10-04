@@ -1,5 +1,3 @@
-//! List the processes present in a Mac memory image.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -16,10 +14,15 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::list_processes_by;
 
+/// Lists the processes present in a particular mac memory image.
 pub struct PsList;
 
 /// The lists the kernel keeps of its processes, in the order the reference
 /// implementation offers them.
+///
+/// Each names a way of listing all the tasks in the primary layer: the allproc
+/// linked list, the tasks queue, sessions, process groups and the pid hash
+/// table.
 const PSLIST_METHODS: [&str; 5] = [
     "tasks",
     "allproc",
@@ -75,8 +78,9 @@ impl Plugin for PsList {
         let filter = pid_filter(config);
         let mut grid = TreeGrid::new(self.columns());
 
-        // Every list holds the same processes, but a damaged one may hold
-        // more of them than another.
+        // Ensure the method is one of the suitable choices. Every list holds
+        // the same processes, but a damaged one may hold more of them than
+        // another.
         let method = config
             .get_string("pslist_method")
             .unwrap_or_else(|| PSLIST_METHODS[0].to_string());

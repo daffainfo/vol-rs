@@ -1,5 +1,3 @@
-//! List the system service descriptor table.
-//!
 //! The SSDT maps system call numbers to their kernel handlers. Every entry
 //! should point inside the kernel image. One that does not has been hooked.
 //!
@@ -19,6 +17,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::resolver::ModuleCollection;
 
+/// Lists the system call table.
 pub struct Ssdt;
 
 impl Plugin for Ssdt {
@@ -51,8 +50,11 @@ impl Plugin for Ssdt {
         let kernel = kernel_module(&context, config)?;
         let collection = ModuleCollection::build(&context, &kernel)?;
 
-        // The table itself is named by a symbol, as is the count of entries in
-        // it.
+        // this is just one way to enumerate the native (NT) service table.
+        // to do the same thing for the Win32K service table, we would need
+        // Win32K.sys symbol support. We could also find
+        // nt!KeServiceDescriptorTable (NT) and KeServiceDescriptorTableShadow
+        // (NT, Win32K).
         let table = context.symbol_offset(&kernel, "KiServiceTable")?;
         let limit = context
             .object_from_symbol(&kernel, "KiServiceLimit", Some("int"))?
@@ -75,9 +77,10 @@ impl Plugin for Ssdt {
             };
             let word = u32::from_le_bytes(raw.try_into().unwrap());
 
-            // A 64-bit kernel stores a displacement from the table itself,
-            // shifted to leave room for the argument count. A 32-bit one
-            // stores the address outright.
+            // on 32-bit systems the table indexes are 32-bits and contain
+            // pointers (unsigned). on 64-bit systems the indexes are also
+            // 32-bits but they're offsets from the base address of the table
+            // and can be negative, so we need a signed data type.
             let address = if sixty_four_bit {
                 let displacement = (word as i32) >> 4;
                 table.wrapping_add(displacement as i64 as u64)

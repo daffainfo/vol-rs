@@ -1,5 +1,3 @@
-//! Recover the parts of files that are still cached in memory.
-//!
 //! Windows keeps three caches of a file: the pages mapped as data, the pages
 //! mapped as an image, and the views the cache manager holds. Each is walked
 //! separately, and what is still resident is written out.
@@ -8,6 +6,7 @@
 //! the Volatility Software License 1.0.
 
 use std::collections::HashMap;
+use std::io::{Seek, Write};
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -23,6 +22,7 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::poolscanner::{header_cookie, object_type_map};
 use crate::framework::symbols::windows::{list_processes, object_name};
 
+/// Dumps cached file contents from Windows memory samples.
 pub struct DumpFiles;
 
 /// The devices whose files are worth recovering. The object type is also used
@@ -109,6 +109,7 @@ impl Plugin for DumpFiles {
                 .filter_map(|entry| entry.as_int().map(|value| value as u64))
                 .collect()
         };
+        // a list of addresses, where each is paired with True for virtual.
         let virtual_addresses = addresses("virtaddr");
         let physical_addresses = addresses("physaddr");
         let pattern = match config.get_string("filter") {
@@ -138,8 +139,9 @@ impl Plugin for DumpFiles {
         // A file open in several processes is only recovered once.
         let mut dumped: Vec<u64> = Vec::new();
 
-        // Naming addresses asks about those file objects alone, and the
-        // processes are not walked at all.
+        // Now process any offsets explicitly requested by the user. Naming
+        // addresses asks about those file objects alone, and the processes are
+        // not walked at all.
         if !virtual_addresses.is_empty() || !physical_addresses.is_empty() {
             for (address, is_virtual) in virtual_addresses
                 .iter()
@@ -168,8 +170,11 @@ impl Plugin for DumpFiles {
                 continue;
             }
 
-            // The files a process holds open, and then the ones it has mapped:
-            // a mapped image usually has no handle left open on it.
+            // The files a process holds open, and then the file objects
+            // pulled from the VADs. The latter will produce DLLs and EXEs that
+            // are mapped into the process as images, but that the process
+            // doesn't have an explicit handle remaining open to those files on
+            // disk.
             let mut files: Vec<Object> = Vec::new();
             if let Ok(object_table) = process.object.member("ObjectTable") {
                 for handle in handles(&context, &kernel, &object_table) {
@@ -216,15 +221,23 @@ impl Plugin for DumpFiles {
     }
 }
 
-/// Recover each cache of one file.
+/// Given a FILE_OBJECT, dump data to separate files for each of the three file
+/// caches.
+///
+/// # Args
+///
+/// * `context` - the context to operate upon
+/// * `physical` - primary/virtual layer to operate on
+/// * `file` - the FILE_OBJECT
 fn dump_file(
     context: &Arc<Context>,
     kernel: &Module,
     physical: &str,
     file: &Object,
 ) -> Vec<Vec<Value>> {
-    // The object type is shared with pipes and sockets, which have no cached
-    // contents to recover.
+    // Filtering by these types of devices prevents us from processing other
+    // types of devices that use the "File" object type, such as \Device\Tcp
+    // and \Device\NamedPipe.
     let device_type = file
         .member("DeviceObject")
         .and_then(|device| device.dereference())
@@ -252,8 +265,10 @@ fn dump_file(
     };
 
     let mut rows = Vec::new();
-    // The two section caches hold pages of physical memory. The cache
-    // manager's views are pages of the kernel's own space.
+    // Depending on the type of object (DataSection, ImageSection,
+    // SharedCacheMap) we may need to read from the memory layer or the primary
+    // layer. The DataSectionObject and ImageSectionObject caches are handled in
+    // basically the same way: we carve these "pages" from the memory_layer.
     for (member, extension, cache) in [
         ("DataSectionObject", "dat", "DataSectionObject"),
         ("ImageSectionObject", "img", "ImageSectionObject"),
@@ -267,38 +282,40 @@ fn dump_file(
         if !control_area_is_valid(&control_area) {
             continue;
         }
-        let written = control_area_pages(context, kernel, &control_area).and_then(|pages| {
-            write_pages(
-                context,
-                physical,
-                &pages,
-                file,
-                &control_area,
-                cache,
-                extension,
-                &base,
-            )
-        });
+        let (pages, complete) = control_area_pages(context, kernel, &control_area);
+        let written = write_pages(
+            context,
+            physical,
+            &pages,
+            complete,
+            file,
+            &control_area,
+            cache,
+            extension,
+            &base,
+        );
         rows.push(row(file, &control_area, cache, extension, &base, written));
     }
 
+    // The SharedCacheMap is handled differently than the caches above. We
+    // carve these "pages" from the primary_layer.
     if let Ok(cache_map) = pointers
         .member("SharedCacheMap")
         .and_then(|map| map.dereference_as(&kernel.qualified("_SHARED_CACHE_MAP")))
     {
         if cache_map_is_valid(&cache_map) {
-            let written = cache_map_views(context, kernel, &cache_map).and_then(|pages| {
-                write_pages(
-                    context,
-                    &kernel.layer_name,
-                    &pages,
-                    file,
-                    &cache_map,
-                    "SharedCacheMap",
-                    "vacb",
-                    &base,
-                )
-            });
+            let (pages, complete) = cache_map_views(context, kernel, &cache_map);
+            let written = write_pages(
+                context,
+                &kernel.layer_name,
+                &pages,
+                complete,
+                file,
+                &cache_map,
+                "SharedCacheMap",
+                "vacb",
+                &base,
+            );
             rows.push(row(file, &cache_map, "SharedCacheMap", "vacb", &base, written));
         }
     }
@@ -341,12 +358,26 @@ trait Tap: Sized {
 
 impl<T> Tap for T {}
 
-/// Write out what is still resident, returning the name of the file written.
+/// Produce a file from the memory object's available pages.
+///
+/// # Args
+///
+/// * `pages` - for each page: the offset in the specified layer where the page
+///   begins, the offset to write to in the destination file, and the size of
+///   the page
+/// * `file` - the parent _FILE_OBJECT
+/// * `memory_object` - the _CONTROL_AREA or _SHARED_CACHE_MAP
+/// * `layer` - the memory layer to read from
+///
+/// # Returns
+///
+/// The name of the file written.
 #[allow(clippy::too_many_arguments)]
 fn write_pages(
     context: &Arc<Context>,
     layer: &str,
     pages: &[(u64, u64, u64)],
+    complete: bool,
     file: &Object,
     memory_object: &Object,
     cache: &str,
@@ -359,30 +390,42 @@ fn write_pages(
         memory_object.offset()
     );
 
-    let mut contents: Vec<u8> = Vec::new();
+    // Upstream opens the file before it starts looking for pages and commits
+    // it when the handle is dropped, so a dump that gave up part way still
+    // leaves behind what it had managed to write, and one that found nothing
+    // leaves an empty file. The listing still reports it as a failure.
+    let (stored, mut handle) = crate::framework::plugins::open_extracted(&name).ok()?;
+
+    // track number of bytes written so we don't write empty files to disk
     let mut written = 0usize;
+    let mut readable = true;
     for (memory_offset, file_offset, size) in pages {
         let Ok(data) = context
             .layers
             .read(layer, *memory_offset, *size as usize, true)
         else {
             // A page that cannot be read at all abandons the whole file.
-            return None;
+            readable = false;
+            break;
         };
         written += data.len();
-        let end = (*file_offset as usize) + data.len();
-        if contents.len() < end {
-            contents.resize(end, 0);
+        // Each page is written where it belongs in the file rather than after
+        // the one before it, so a file the cache only partly holds keeps its
+        // shape and the gaps cost nothing on disk.
+        if handle.seek(std::io::SeekFrom::Start(*file_offset)).is_err()
+            || handle.write_all(&data).is_err()
+        {
+            readable = false;
+            break;
         }
-        contents[*file_offset as usize..end].copy_from_slice(&data);
-    }
-    if written == 0 {
-        return None;
     }
 
+    if !complete || !readable || written == 0 {
+        return None;
+    }
     // The name reported is the one written, which is not the one asked for
     // when a file of that name was already there.
-    crate::framework::plugins::write_extracted(&name, &contents).ok()
+    Some(stored)
 }
 
 /// Whether a section's control area describes something recoverable.
@@ -427,7 +470,19 @@ fn control_area_pages(
     context: &Arc<Context>,
     kernel: &Module,
     control_area: &Object,
-) -> Option<Vec<(u64, u64, u64)>> {
+) -> (Vec<(u64, u64, u64)>, bool) {
+    let mut pages = Vec::new();
+    let complete = gather_control_area_pages(context, kernel, control_area, &mut pages).is_some();
+    (pages, complete)
+}
+
+/// The walk itself, which keeps the pages it found before it gave up.
+fn gather_control_area_pages(
+    context: &Arc<Context>,
+    kernel: &Module,
+    control_area: &Object,
+    pages: &mut Vec<(u64, u64, u64)>,
+) -> Option<()> {
     let area_size = control_area.size().ok()?;
     let entry_size = context
         .symbol_space
@@ -444,6 +499,20 @@ fn control_area_pages(
         .and_then(|image| image.as_u64())
         .ok()?;
     let sector_size = if image == 1 { 0x200 } else { 0x1000 };
+    let sixty_four_bit = context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|table| table.pointer_size())
+        .unwrap_or(8)
+        == 8;
+    // Address extension changes where a prototype entry keeps its offset.
+    let extended = context
+        .layers
+        .get(control_area.layer_name())
+        .ok()
+        .and_then(|layer| layer.metadata().get("pae").cloned())
+        .map(|value| value == "True" || value == "true")
+        .unwrap_or(false);
 
     let mut subsection = context
         .object(
@@ -453,7 +522,6 @@ fn control_area_pages(
         )
         .ok()?;
 
-    let mut pages = Vec::new();
     loop {
         // A subsection belonging to another area, or one that cannot be read
         // at all, ends the chain.
@@ -467,7 +535,9 @@ fn control_area_pages(
             break;
         }
 
-        let start = subsection
+        // The offset into the file is implied by where each entry sits in the
+        // subsection, and a prototype entry moves it along.
+        let mut start = subsection
             .member("StartingSector")
             .and_then(|sector| sector.as_u64())
             .ok()?
@@ -484,6 +554,7 @@ fn control_area_pages(
         for index in 0..count {
             let at = base + entry_size * index;
             let file_offset = start + index * PAGE_SIZE;
+
             // An entry that cannot be built is skipped. One that can be built
             // but not read abandons the file.
             let Ok(entry) =
@@ -492,36 +563,38 @@ fn control_area_pages(
                 continue;
             };
             let union = entry.member("u").ok()?;
+            // An entry the capture does not hold abandons the whole file:
+            // upstream reads these outside the guard it wraps the walk in, so
+            // the failure escapes rather than skipping the one page.
+            let field = |group: &str, name: &str| -> Option<u64> {
+                union
+                    .member(group)
+                    .and_then(|part| part.member(name))
+                    .and_then(|value| value.as_u64())
+                    .ok()
+            };
 
-            // A page is either mapped, or on its way out and still in memory.
-            let valid = union
-                .member("Hard")
-                .and_then(|hard| hard.member("Valid"))
-                .and_then(|valid| valid.as_u64())
-                .ok()?;
-            if valid == 1 {
-                let frame = union
-                    .member("Hard")
-                    .and_then(|hard| hard.member("PageFrameNumber"))
-                    .and_then(|frame| frame.as_u64())
-                    .ok()?;
-                pages.push((frame << 12, file_offset, PAGE_SIZE));
+            // A page is either mapped, described by the prototype entry the
+            // section itself holds, or on its way out and still in memory.
+            if field("Hard", "Valid")? == 1 {
+                pages.push((field("Hard", "PageFrameNumber")? << 12, file_offset, PAGE_SIZE));
                 continue;
             }
-
-            let transition = union
-                .member("Trans")
-                .and_then(|transition| transition.member("Transition"))
-                .and_then(|transition| transition.as_u64())
-                .ok()?;
-            if transition == 1 {
-                let frame = union
-                    .member("Trans")
-                    .and_then(|transition| transition.member("PageFrameNumber"))
-                    .and_then(|frame| frame.as_u64())
-                    .ok()?;
+            if field("Soft", "Prototype")? == 1 {
+                // A 32-bit entry without address extension holds the next
+                // subsection's own offset, which the entries after it count
+                // from. Nothing is read for the entry itself.
+                if !sixty_four_bit && !extended {
+                    let high = field("Subsect", "SubsectionAddressHigh")?;
+                    let low = field("Subsect", "SubsectionAddressLow")?;
+                    start = (high << 7) | (low << 3);
+                }
+                continue;
+            }
+            if field("Trans", "Transition")? == 1 {
                 // A page on its way out keeps a flag in the top bits of its
                 // frame number.
+                let frame = field("Trans", "PageFrameNumber")?;
                 pages.push(((frame & ((1u64 << 33) - 1)) << 12, file_offset, PAGE_SIZE));
             }
         }
@@ -541,7 +614,7 @@ fn control_area_pages(
             )
             .ok()?;
     }
-    Some(pages)
+    Some(())
 }
 
 /// Whether the cache manager's record of a file is coherent.
@@ -575,7 +648,19 @@ fn cache_map_views(
     context: &Arc<Context>,
     kernel: &Module,
     map: &Object,
-) -> Option<Vec<(u64, u64, u64)>> {
+) -> (Vec<(u64, u64, u64)>, bool) {
+    let mut views = Vec::new();
+    let complete = gather_cache_map_views(context, kernel, map, &mut views).is_some();
+    (views, complete)
+}
+
+/// The walk itself, which keeps the views it found before it gave up.
+fn gather_cache_map_views(
+    context: &Arc<Context>,
+    kernel: &Module,
+    map: &Object,
+    views: &mut Vec<(u64, u64, u64)>,
+) -> Option<()> {
     let section_size = map
         .member("SectionSize")
         .and_then(|size| size.member("QuadPart"))
@@ -584,7 +669,6 @@ fn cache_map_views(
     let full_blocks = section_size / VIEW_SIZE;
     let left_over = section_size % VIEW_SIZE;
 
-    let mut views = Vec::new();
     let save = |view: &Object, views: &mut Vec<(u64, u64, u64)>| {
         let (Ok(address), Ok(offset)) = (
             view.member("BaseAddress")
@@ -608,7 +692,7 @@ fn cache_map_views(
             .and_then(|view| view.dereference())
         {
             if belongs_to(&view, map) {
-                save(&view, &mut views);
+                save(&view, views);
             }
         }
         index += 1;
@@ -620,7 +704,7 @@ fn cache_map_views(
             .and_then(|view| view.dereference())
         {
             if belongs_to(&view, map) {
-                save(&view, &mut views);
+                save(&view, views);
             }
         }
     }
@@ -631,7 +715,7 @@ fn cache_map_views(
         .and_then(|array| array.pointer_value())
         .ok()?;
     if array == 0 {
-        return Some(views);
+        return Some(());
     }
     // The array often begins with the same view the record already holds.
     if let Ok(first) = map
@@ -640,48 +724,90 @@ fn cache_map_views(
         .map(|view| view.offset())
     {
         if first == array {
-            return Some(views);
+            return Some(());
         }
     }
 
-    let view_type = kernel.qualified("_VACB");
-    let read_view = |address: u64| -> Option<Object> {
-        let pointer = context
-            .layers
-            .read(map.layer_name(), address, 8, false)
-            .ok()?;
-        let target = u64::from_le_bytes(pointer.try_into().ok()?)
-            & context.layers.address_mask(map.layer_name());
-        if target == 0 {
-            return None;
-        }
-        context.object(&view_type, map.layer_name(), target).ok()
-    };
+    // The index arrays hold one pointer per view, so their stride follows the
+    // width of a pointer in the kernel this image came from.
+    let stride = context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|table| table.pointer_size())
+        .unwrap_or(8) as u64;
 
     if section_size <= FIRST_LEVEL_SIZE {
         for counter in 0..full_blocks {
-            if let Some(view) = read_view(array + counter * 8) {
+            if let Some(view) = read_view(context, kernel, map, array + counter * stride, stride) {
                 if belongs_to(&view, map) {
-                    save(&view, &mut views);
+                    save(&view, views);
                 }
             }
         }
         if left_over > 0 {
-            if let Some(view) = read_view(array + full_blocks * 8) {
+            if let Some(view) =
+                read_view(context, kernel, map, array + full_blocks * stride, stride)
+            {
                 if belongs_to(&view, map) {
-                    save(&view, &mut views);
+                    save(&view, views);
                 }
             }
         }
-        return Some(views);
+        return Some(());
     }
 
     // A file larger than the first level can describe is held in a tree of
-    // index arrays.
+    // index arrays. The top level is walked here whatever the tree's depth,
+    // and only the levels below it are limited by it, which is how upstream
+    // divides the walk.
     let depth = (section_size as f64).log2().ceil();
     let depth = (((depth - 18.0) / 7.0).ceil()) as u64;
-    walk_index(context, kernel, map, array, 0, depth, &save, &mut views);
-    Some(views)
+    for index in 0..VIEW_ARRAY {
+        let Some(view) = read_view(context, kernel, map, array + index * stride, stride) else {
+            continue;
+        };
+        if belongs_to(&view, map) {
+            save(&view, views);
+        } else {
+            walk_index(
+                context,
+                kernel,
+                map,
+                view.offset(),
+                2,
+                depth,
+                stride,
+                &save,
+                views,
+            );
+        }
+    }
+    Some(())
+}
+
+/// Read one entry of a view index array, as the view it points at.
+fn read_view(
+    context: &Arc<Context>,
+    kernel: &Module,
+    map: &Object,
+    address: u64,
+    stride: u64,
+) -> Option<Object> {
+    let raw = context
+        .layers
+        .read(map.layer_name(), address, stride as usize, false)
+        .ok()?;
+    let target = raw
+        .iter()
+        .rev()
+        .fold(0u64, |value, byte| (value << 8) | *byte as u64)
+        & context.layers.address_mask(map.layer_name());
+    if target == 0 {
+        return None;
+    }
+    context
+        .object(&kernel.qualified("_VACB"), map.layer_name(), target)
+        .ok()
 }
 
 /// Whether a view belongs to the record being read.
@@ -701,32 +827,31 @@ fn walk_index(
     array: u64,
     level: u64,
     limit: u64,
+    stride: u64,
     save: &impl Fn(&Object, &mut Vec<(u64, u64, u64)>),
     views: &mut Vec<(u64, u64, u64)>,
 ) {
     if level > limit {
         return;
     }
-    let view_type = kernel.qualified("_VACB");
     for index in 0..VIEW_ARRAY {
-        let Ok(pointer) = context
-            .layers
-            .read(map.layer_name(), array + index * 8, 8, false)
-        else {
-            continue;
-        };
-        let target = u64::from_le_bytes(pointer.try_into().unwrap())
-            & context.layers.address_mask(map.layer_name());
-        if target == 0 {
-            continue;
-        }
-        let Ok(view) = context.object(&view_type, map.layer_name(), target) else {
+        let Some(view) = read_view(context, kernel, map, array + index * stride, stride) else {
             continue;
         };
         if belongs_to(&view, map) {
             save(&view, views);
         } else {
-            walk_index(context, kernel, map, target, level + 1, limit, save, views);
+            walk_index(
+                context,
+                kernel,
+                map,
+                view.offset(),
+                level + 1,
+                limit,
+                stride,
+                save,
+                views,
+            );
         }
     }
 }

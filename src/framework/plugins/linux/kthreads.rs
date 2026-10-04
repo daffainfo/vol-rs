@@ -1,5 +1,3 @@
-//! List kernel threads and the functions they run.
-//!
 //! A kernel thread's worker function is recorded when the thread is created.
 //! A thread whose function lies in a module rather than the kernel image is
 //! worth attention, since that is where a malicious worker would live.
@@ -19,6 +17,7 @@ use crate::framework::objects::utility::pointer_to_string;
 use crate::framework::symbols::linux::list_tasks;
 use crate::framework::symbols::linux::resolver::ModuleResolver;
 
+/// Enumerates kthread functions
 pub struct Kthreads;
 
 impl Plugin for Kthreads {
@@ -54,6 +53,21 @@ impl Plugin for Kthreads {
         let kthread_type = context.symbol_space.get_type(&kernel.qualified("kthread"))?;
         let mut grid = TreeGrid::new(self.columns());
 
+        // Kernel 5.8 moved the worker function into the kthread structure.
+        // Before that there is nothing to report, and the reference
+        // implementation says so rather than printing an empty listing.
+        if context
+            .symbol_space
+            .find_member(&kthread_type, "threadfn")?
+            .is_none()
+        {
+            grid.mark_failed(crate::error::VolatilityError::Other(
+                "Unsupported kthread implementation. This plugin only works with kernels >= 5.8"
+                    .to_string(),
+            ));
+            return Ok(grid);
+        }
+
         for task in list_tasks(&context, &kernel, true)? {
             // Only kernel threads have a worker function. A userland task runs
             // its own image instead.
@@ -61,9 +75,11 @@ impl Plugin for Kthreads {
                 continue;
             }
 
-            // Kernel 5.17 gave the kthread pointer its own task member. Before
-            // that it shared `set_child_tid`, which a kernel thread never uses
-            // for its documented purpose.
+            // kernels >= 5.17 e32cf5dfbe227b355776948b2c9b5691b84d1cbd gave
+            // the kthread pointer its own task member. For
+            // 5.8 <= kernels < 5.17, threadfn was added to struct kthread in
+            // 52782c92ac85c4e393eb4a903a62e6c24afa633f, and task.set_child_tid
+            // is safe on those versions.
             let base = if task.object.has_member("worker_private") {
                 task.object.member("worker_private")
             } else {
@@ -100,9 +116,9 @@ impl Plugin for Kthreads {
                 continue;
             }
 
-            // `comm` is capped at 15 characters, so prefer the full name the
-            // kthread records separately when the kernel is new enough to have
-            // it.
+            // kernels >= 5.17 in d6986ce24fc00b0638bd29efe8fb7ba7619ed2aa
+            // added full_name to kthread. `comm` is capped at 15 characters, so
+            // prefer the full name where it is there.
             let mut name = task.comm().unwrap_or_default();
             if kthread.has_member("full_name") {
                 if let Ok(full_name) = kthread.member("full_name") {

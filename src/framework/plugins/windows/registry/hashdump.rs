@@ -1,5 +1,3 @@
-//! Recover the password hashes stored in the SAM.
-//!
 //! This needs both hives: the SYSTEM hive holds the boot key, split across four
 //! subkeys' class names, and the SAM hive holds the accounts encrypted under a
 //! key derived from it.
@@ -22,6 +20,7 @@ use crate::framework::symbols::windows::sam::{
     BOOTKEY_SUBKEYS, EMPTY_LM_HASH, EMPTY_NT_HASH, LM_SALT, NT_SALT,
 };
 
+/// Dumps user hashes from memory
 pub struct HashDump;
 
 impl Plugin for HashDump {
@@ -51,6 +50,24 @@ impl Plugin for HashDump {
     }
 
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
+        // A hashed boot key that cannot be rebuilt leaves nothing to report
+        // rather than failing the run, which is what upstream says on the
+        // error stream and then reports an empty listing for.
+        match self.gather(context, config) {
+            Ok(grid) => Ok(grid),
+            Err(_) => {
+                eprintln!(
+                    "WARNING  volatility3.plugins.windows.registry.hashdump: Hbootkey is not \
+                     valid"
+                );
+                Ok(TreeGrid::new(self.columns()))
+            }
+        }
+    }
+}
+
+impl HashDump {
+    fn gather(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let table = kernel.symbol_table_name.clone();
 
@@ -187,8 +204,9 @@ fn read_users(
     let mut accounts = Vec::new();
     for user_key in subkeys(context, hive, table, &users)? {
         let Ok(name) = user_key.name() else { continue };
-        // Each account's key is named by its RID in hexadecimal. The Names
-        // subkey is an index rather than an account.
+        // Each account's key is named by its RID in hexadecimal. Will
+        // sometimes find an extra user with rid = NAMES, which is an index
+        // rather than an account.
         let Ok(rid) = u32::from_str_radix(&name, 16) else {
             continue;
         };
@@ -227,7 +245,14 @@ fn read_username(v_value: &[u8]) -> Option<String> {
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    Some(String::from_utf16_lossy(&units))
+    // temporary fix to prevent UnicodeDecodeError backtraces, however this can
+    // cause truncated user names as a result: a unit that decodes to nothing is
+    // dropped rather than stood in for.
+    Some(
+        char::decode_utf16(units)
+            .filter_map(|unit| unit.ok())
+            .collect(),
+    )
 }
 
 /// Extract and decrypt one account's two hashes.

@@ -1,5 +1,3 @@
-//! List the processes watching filesystem events.
-//!
 //! A process registered with the vfs event system is told about every file
 //! change on the system, which is worth knowing about whether the watcher is
 //! Spotlight or something less welcome.
@@ -15,6 +13,7 @@ use crate::framework::plugins::mac::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Lists processes that are filtering file system events
 pub struct VfsEvents;
 
 /// The event types a watcher can subscribe to, in bit order.
@@ -59,6 +58,9 @@ impl Plugin for VfsEvents {
         ]
     }
 
+    /// Lists the registered VFS event watching processes.
+    ///
+    /// Also lists which event(s) a process is registered for.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
 

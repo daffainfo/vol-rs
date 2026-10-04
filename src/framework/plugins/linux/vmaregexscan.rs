@@ -1,5 +1,3 @@
-//! Search a process's mapped memory for a regular expression.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,12 +11,17 @@ use crate::framework::plugins::{
     pid_filter, pid_matches, OperatingSystem, Plugin, Requirement, RequirementKind,
 };
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::linux::list_tasks;
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Scans all virtual memory areas for tasks using RegEx.
 pub struct VmaRegExScan;
 
-/// How much of a match to show. A longer one is truncated rather than flooding
-/// the output.
+/// How much of a match to show.
+///
+/// Upstream reapplies the regex in order to extract just the match. Where the
+/// match is within the result data it reports the match itself, and where it is
+/// not (because it does not fit within `MAXSIZE_DEFAULT`) it reports what was
+/// read.
 const MATCH_PREVIEW: usize = 128;
 
 impl Plugin for VmaRegExScan {
@@ -79,15 +82,20 @@ impl Plugin for VmaRegExScan {
 
         let mut grid = TreeGrid::new(self.columns());
 
-        for task in list_tasks(&context, &kernel, false)? {
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
             let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
             let comm = task.comm().unwrap_or_default();
 
-            // Restrict the scan to the task's own mappings. Scanning the whole
-            // address space would mostly search unmapped memory.
+            // get process sections for scanning. Scanning the whole address
+            // space would mostly search unmapped memory.
             let mapped = task.vmas().unwrap_or_default();
             let sections: Vec<(u64, u64)> = mapped
                 .areas

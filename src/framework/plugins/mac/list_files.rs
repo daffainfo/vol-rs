@@ -1,5 +1,3 @@
-//! List every file the kernel currently has a vnode for.
-//!
 //! The vnode cache holds an entry per file the system has touched recently, so
 //! this recovers paths that no longer appear in any process's open files.
 //!
@@ -16,8 +14,9 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::objects::utility::pointer_to_string;
 use crate::framework::objects::Object;
-use crate::framework::symbols::mac::{list_mounts, vnode_full_path, walk_tailq};
+use crate::framework::symbols::mac::{list_mounts, vnode_full_path, walk_tailq_links};
 
+/// Lists all open file descriptors for all processes.
 pub struct ListFiles;
 
 impl Plugin for ListFiles {
@@ -49,31 +48,33 @@ impl Plugin for ListFiles {
         let vnode_type = kernel.qualified("vnode");
         let mut found = Vnodes::default();
 
-        // Every mounted filesystem holds several lists of the vnodes belonging
-        // to it, and each of those is a place a file can be found.
+        // iterate each vnode source from each mount: every mounted filesystem
+        // holds several lists of the vnodes belonging to it, and each of those
+        // is a place a file can be found.
         for mount in list_mounts(&context, &kernel)? {
             for list in ["mnt_vnodelist", "mnt_workerqueue", "mnt_newvnodes"] {
                 let Ok(head) = mount.object.member(list) else {
                     continue;
                 };
-                for vnode in walk_tailq(&head, &vnode_type, "v_mntvnodes").unwrap_or_default() {
-                    let address = vnode.offset();
-                    found.walk(address, &vnode);
+                for (link, vnode) in
+                    walk_tailq_links(&head, &vnode_type, "v_mntvnodes").unwrap_or_default()
+                {
+                    found.walk_link(link, vnode.offset(), &vnode);
                 }
             }
-            // The filesystem itself names three vnodes of its own. These are
-            // known by where the filesystem points at them rather than by
-            // where they are, which is how the reference implementation
-            // reports them.
+            // The filesystem itself names three vnodes of its own.
             for member in ["mnt_vnodecovered", "mnt_realrootvp", "mnt_devvp"] {
                 let Ok(pointer) = mount.object.member(member) else {
                     continue;
                 };
-                let address = pointer.offset();
+                let target = pointer.pointer_value().unwrap_or(0);
+                if target == 0 {
+                    continue;
+                }
                 let Ok(vnode) = pointer.dereference() else {
                     continue;
                 };
-                found.walk(address, &vnode);
+                found.walk_link(pointer.offset(), target, &vnode);
             }
         }
 
@@ -106,6 +107,19 @@ struct Vnodes {
 }
 
 impl Vnodes {
+    /// Follow a list of vnodes reached through a link.
+    ///
+    /// Upstream hands the link to the walk rather than the vnode, so the first
+    /// vnode is reported at the link's own address while the rest are reported
+    /// where they sit. A link to a vnode already taken in leads nowhere, and
+    /// that test is made against the vnode rather than the link.
+    fn walk_link(&mut self, link: u64, target: u64, vnode: &Object) {
+        if self.index.contains_key(&target) {
+            return;
+        }
+        self.walk(link, vnode);
+    }
+
     /// Follow a list of vnodes, taking in each one and its parents.
     fn walk(&mut self, address: u64, vnode: &Object) {
         let mut current = vnode.clone();
@@ -115,8 +129,10 @@ impl Vnodes {
                 break;
             }
 
-            // A file is only worth having if the directories above it are
-            // there too, so each parent is taken in as well.
+            // Also traverses the parent chain for the vnode and adds each
+            // one: a file is only worth having if the directories above it are
+            // there too. Root entries do not have parents, and parents of
+            // normal files can be smeared.
             let mut parent = parent_of(&current);
             while let Some(node) = parent {
                 if !self.walk_one(&node) {
@@ -153,7 +169,7 @@ impl Vnodes {
         if self.index.contains_key(&address) {
             return false;
         }
-        // A vnode with no name says nothing about any file.
+        // We can't do anything with a no-name vnode
         let Some(name) = vnode_name(vnode) else {
             return false;
         };
@@ -199,8 +215,11 @@ impl Vnodes {
     }
 }
 
-/// What a vnode is called. The root of a mounted filesystem is named by its
-/// whole path, since it is the point the filesystem hangs from.
+/// What a vnode is called.
+///
+/// Roots of mount points have special name handling: the root of a mounted
+/// filesystem is named by its whole path, since it is the point the filesystem
+/// hangs from.
 fn vnode_name(vnode: &Object) -> Option<String> {
     let flag = vnode
         .member("v_flag")
@@ -217,8 +236,8 @@ fn vnode_name(vnode: &Object) -> Option<String> {
 
 /// The directory a vnode sits in, where it is in memory.
 ///
-/// A file at the root of the tree has none, and a parent that cannot be read
-/// is treated the same way.
+/// Root entries do not have parents, and parents of normal files can be
+/// smeared, which is treated the same way.
 fn parent_of(vnode: &Object) -> Option<Object> {
     let parent = vnode
         .member("v_parent")

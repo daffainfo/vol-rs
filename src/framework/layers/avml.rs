@@ -4,6 +4,11 @@
 //! layer records where every decompressed frame lives so reads can decompress
 //! only the frames they touch.
 //!
+//! Upstream loads libsnappy at runtime, per platform: `libsnappy.so.1` on
+//! Linux, `libsnappy.1.dylib` on macOS, `snappy64`/`snappy32` on Windows, with
+//! a TODO to find a library for Windows if needed. The decompressor is
+//! compiled in here instead, so a run needs nothing installed alongside.
+//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -34,8 +39,13 @@ pub fn check(layers: &LayerContainer, layer: &str) -> Result<()> {
     Ok(())
 }
 
-/// An AVML layer. Segments are non-linear: a compressed frame occupies fewer
-/// bytes in the file than it does in the address space.
+/// A Lime format TranslationLayer.
+///
+/// Lime is generally used to store physical memory images where there are
+/// large holes in the physical layer.
+///
+/// The segments are non-linear: a compressed frame occupies fewer bytes in
+/// the file than it does in the address space.
 pub struct AvmlLayer {
     name: String,
     base_layer: String,

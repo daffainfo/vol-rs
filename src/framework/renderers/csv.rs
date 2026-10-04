@@ -41,7 +41,7 @@ fn escape(field: &str) -> String {
 
 impl Renderer for CsvRenderer {
     fn render(&self, grid: &TreeGrid, output: &mut dyn Write) -> Result<()> {
-        let ignored = self.options.ignored(grid);
+        let ignored = self.options.ignored(grid)?;
         let mut headers: Vec<String> = vec!["TreeDepth".to_string()];
         headers.extend(
             grid.columns()
@@ -76,6 +76,8 @@ impl Renderer for CsvRenderer {
             // A plugin whose failure was reported leaves two blank lines behind
             // it, written where the error was caught rather than by the table.
             crate::framework::renderers::Truncation::Reported => write!(output, "\n\n")?,
+            // Nothing was written at all, not even the header.
+            crate::framework::renderers::Truncation::Discarded => {}
         }
         Ok(())
     }

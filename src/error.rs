@@ -12,11 +12,20 @@ use std::fmt;
 pub enum AddressFault {
     /// A plain invalid address with no further paging information.
     Invalid,
-    /// A paging failure: `invalid_bits` records how many low bits of the
-    /// requested address were still unresolved when translation failed, which
-    /// allows a scan to skip the whole unmapped region in one step.
+    /// Thrown when an address is not valid in the paged space in which it was
+    /// requested. This is only raised from a paged layer: in most circumstances
+    /// [`AddressFault::Invalid`] is the correct one to look for, since that
+    /// catches all invalid mappings including paged ones.
+    ///
+    /// `invalid_bits` records how many low bits of the requested address were
+    /// still unresolved when translation failed, which allows a scan to skip
+    /// the whole unmapped region in one step.
     Paged { invalid_bits: u32, entry: u64 },
-    /// A paged fault where the page has been swapped out to a swap layer.
+    /// Thrown when an address is not valid in the paged layer in which it was
+    /// requested, but expected to be in an associated swap layer.
+    ///
+    /// Includes the swap lookup, as well as the invalid address and the bits of
+    /// the lookup that were invalid.
     Swapped {
         invalid_bits: u32,
         entry: u64,
@@ -26,6 +35,7 @@ pub enum AddressFault {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VolatilityError {
+    /// Thrown when an address is not valid in the layer it was requested.
     #[error("Layer {layer}: invalid address {address:#x}: {message}")]
     InvalidAddress {
         layer: String,
@@ -34,9 +44,11 @@ pub enum VolatilityError {
         fault: AddressFault,
     },
 
+    /// Thrown when an error occurs dealing with memory and layers.
     #[error("Layer {layer}: {message}")]
     Layer { layer: String, message: String },
 
+    /// Thrown when a symbol lookup has failed.
     #[error("Symbol error{}: {message}", .table.as_deref().map(|t| format!(" in table {t}")).unwrap_or_default())]
     Symbol {
         table: Option<String>,
@@ -44,11 +56,17 @@ pub enum VolatilityError {
         message: String,
     },
 
+    /// Thrown when an error occurs dealing with a symbol space.
     #[error("Symbol space error: {0}")]
     SymbolSpace(String),
 
+    /// Allows plugins to indicate that a requirement has not been fulfilled.
     #[error("Unsatisfied requirements: {0:?}")]
     Unsatisfied(Vec<String>),
+
+    /// Options the plugin does not take, named as they were written.
+    #[error("Unrecognised arguments: {0:?}")]
+    Unrecognised(Vec<String>),
 
     #[error("Missing module: {0}")]
     MissingModule(String),
@@ -59,6 +77,7 @@ pub enum VolatilityError {
     #[error("Plugin requirement not met: {0}")]
     PluginRequirement(String),
 
+    /// Allows determining that a required component has an invalid version.
     #[error("Version mismatch: {0}")]
     VersionMismatch(String),
 

@@ -1,5 +1,3 @@
-//! Resolve named symbols, or named addresses, inside a loaded module.
-//!
 //! A module is asked for a symbol in two ways: its own debug database, which
 //! describes far more than it exports, and its export table, which is present
 //! in memory but only names what the module publishes. Both are tried, in that
@@ -22,6 +20,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, Requiremen
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 
+/// Prints symbols in PE files in process and kernel memory
 pub struct PeSymbols;
 
 impl Plugin for PeSymbols {
@@ -143,7 +142,8 @@ fn int_list(config: &Configuration, name: &str) -> Vec<u64> {
         .collect()
 }
 
-/// One mapped region of a process, and the file behind it.
+/// Used to hold information about a range (VAD or kernel module): the start
+/// address, the size and the file path.
 pub type MappedRange = (u64, u64, String);
 
 /// The regions of a process that map a file, with the path each maps.
@@ -232,6 +232,15 @@ impl ModuleSymbols {
 }
 
 /// The symbols describing a module, preferring one already installed.
+///
+/// The PDB name of the kernel file is not consistent for an exe: for example,
+/// an `ntoskrnl.exe` can have an internal PDB name of any of several, so every
+/// possible PDB is tried to ensure the best chance of recovery. For non-kernel
+/// files the exe, sys or dll extension is replaced with pdb, and in testing we
+/// found where some DLLs, such as amsi.dll, have its PDB string as Amsi.dll in
+/// certain Windows versions.
+///
+/// Nothing can be done without the symbols.
 pub fn module_symbols(context: &Arc<Context>, info: &DebugInfo) -> Option<ModuleSymbols> {
     use crate::framework::symbols::intermed::create_table;
     use crate::framework::symbols::windows::pdb;
@@ -292,11 +301,14 @@ pub fn module_debug_info(
     })
 }
 
-/// Where one copy of a module was found: the address space it is mapped in,
-/// where it starts, and how much of it there is.
+/// Collected modules are modules and their symbols found when walking vads or
+/// kernel modules: the process or kernel layer name, the range start and the
+/// range size.
 pub type ModuleInstance = (String, u64, u64);
 
-/// What a caller wants out of a module: names to place, or places to name.
+/// How wanted modules and symbols are specified, such as
+/// `{"ntdll.dll": {addresses: [42, 43, 43]}}` or
+/// `{"ntdll.dll": {names: ["NtCreateThread"]}}`.
 pub enum Wanted {
     Names(Vec<String>),
     Addresses(Vec<u64>),
@@ -319,7 +331,8 @@ pub fn resolve_across_instances(
 /// names one, because it describes far more than the module exports and
 /// because a copy whose export data has been paged out answers wrongly rather
 /// than not at all. Only what the database cannot answer is looked up in the
-/// export tables.
+/// export tables, where for each process layer and VAD a PE is constructed and
+/// its export table examined. That needs a valid PE with an export table.
 pub fn resolve_wanted(
     context: &Arc<Context>,
     instances: &[ModuleInstance],

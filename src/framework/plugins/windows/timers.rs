@@ -1,5 +1,3 @@
-//! List the kernel timers that are currently armed.
-//!
 //! A timer gives code periodic execution without a thread of its own. A timer
 //! whose routine lies outside any loaded module is running code the system has
 //! no record of.
@@ -20,6 +18,7 @@ use crate::framework::plugins::windows::kpcrs::list_kpcrs;
 use crate::framework::symbols::windows::poolscanner::is_windows_8_or_later;
 use crate::framework::symbols::windows::resolver::ModuleCollection;
 
+/// Print kernel timers and associated module DPCs
 pub struct Timers;
 
 /// The kinds of object a timer header may claim to be. Anything else means
@@ -143,7 +142,8 @@ impl Plugin for Timers {
                     )?;
                     continue;
                 }
-                // Several symbols can name the same address.
+                // we might have multiple symbols pointing to the same
+                // location
                 for symbol in symbols {
                     grid.push(
                         0,
@@ -164,10 +164,21 @@ impl Plugin for Timers {
     }
 }
 
-/// Every timer the kernel is holding.
+/// Lists all kernel timers.
 ///
-/// From Windows 7 on there is no single table: each processor keeps its own,
-/// hanging off its control block.
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The kernel module on which to operate
+///
+/// # Returns
+///
+/// The `_KTIMER` entries the kernel is holding.
+///
+/// Starting with Windows 7, there is no more KiTimerTableListHead. The list is
+/// at `_KPCR.PrcbData.TimerTable.TimerEntries`.
+/// See <http://pastebin.com/FiRsGW3f>.
 fn list_timers(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Object>> {
     let mut timers = Vec::new();
     let timer_type = kernel.qualified("_KTIMER");
@@ -206,24 +217,42 @@ fn list_timers(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Object>> {
         return Ok(timers);
     }
 
-    // Older kernels keep one table, named by a symbol.
+    // Older kernels keep one table, named by the KiTimerTableListHead
+    // symbol.
     let table = context.symbol_offset(kernel, "KiTimerTableListHead")?;
-    let entry_type = kernel.qualified("_KTIMER_TABLE_ENTRY");
-    let entry_size = context
+    // The table is read as an array of list heads whatever it really holds,
+    // which is what upstream does, so the stride is a list head's own size.
+    let stride = context
         .symbol_space
-        .get_type(&entry_type)
+        .get_type(&kernel.qualified("_LIST_ENTRY"))
         .and_then(|template| context.symbol_space.size_of(&template))
-        // Before Vista the table is a plain array of list heads.
-        .unwrap_or(16);
-    // The table is 512 entries wide on 64-bit kernels and on Vista, and 256
-    // on the 32-bit kernels that came before it.
-    let count = if entry_size == 16 { 256 } else { 512 };
+        .unwrap_or(8);
+    // On XP x64, Windows 2003 SP1-SP2, and Vista SP0-SP2, KiTimerTableListHead
+    // is an array of 512 _KTIMER_TABLE_ENTRY structs. On XP SP0-SP3 x86 and
+    // Windows 2003 SP0, it is an array of 256 _LIST_ENTRY for _KTIMERs.
+    let sixty_four_bit = context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|held| held.pointer_size())
+        .unwrap_or(8)
+        == 8;
+    let count = if sixty_four_bit
+        || crate::framework::symbols::windows::versions::matches(
+            context,
+            kernel,
+            &crate::framework::symbols::windows::versions::IS_VISTA_OR_LATER,
+        )
+    {
+        512
+    } else {
+        256
+    };
 
     for index in 0..count {
         let Ok(head) = context.object(
             &kernel.qualified("_LIST_ENTRY"),
             &kernel.layer_name,
-            table + index * entry_size,
+            table + index * stride,
         ) else {
             continue;
         };

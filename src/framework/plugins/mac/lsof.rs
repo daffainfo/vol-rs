@@ -1,5 +1,3 @@
-//! List the files each process has open.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -12,6 +10,7 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::mac::list_processes;
 
+/// Lists all open file descriptors for all processes.
 pub struct Lsof;
 
 impl Plugin for Lsof {

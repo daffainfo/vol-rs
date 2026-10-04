@@ -1,5 +1,3 @@
-//! List the mounted filesystems.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -12,6 +10,8 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::mac::list_mounts;
 
+/// A module containing a collection of plugins that produce data typically
+/// found in Mac's mount command
 pub struct Mount;
 
 impl Plugin for Mount {
@@ -39,6 +39,7 @@ impl Plugin for Mount {
         ]
     }
 
+    /// Lists all the mount structures in the primary layer.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let mut grid = TreeGrid::new(self.columns());

@@ -1,5 +1,3 @@
-//! Write a mapped PE image back out as a file.
-//!
 //! A module's headers and sections stay resident while it is loaded, so the
 //! image can be rebuilt into a file and analysed offline, which is the only way
 //! to inspect a module that was never written to disk.
@@ -18,6 +16,8 @@ use crate::framework::plugins::{
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, pe};
 
+/// Allows extracting PE Files from a specific address in a specific address
+/// space
 pub struct PeDump;
 
 impl Plugin for PeDump {
@@ -139,6 +139,10 @@ impl Plugin for PeDump {
 
 /// Rebuild the image at `base` and write it out, naming the file after where
 /// it came from.
+///
+/// # Returns
+///
+/// The filename of the dump file, or `None` in the case of failure.
 fn dump(
     context: &Arc<Context>,
     layer: &str,
@@ -147,6 +151,10 @@ fn dump(
     pid: u64,
 ) -> Option<String> {
     let name = format!("PE.{process_offset:#x}.{pid}.{base:#x}.dmp");
+    // The file is opened before the image is rebuilt and is committed when the
+    // handle is dropped, so an image that cannot be rebuilt still leaves an
+    // empty file behind. That is what the reference implementation leaves.
+    let (_, mut handle) = crate::framework::plugins::open_extracted(&name).ok()?;
     let data = match pe::reconstruct(context, layer, base) {
         Ok(data) => data,
         Err(error) => {
@@ -154,8 +162,8 @@ fn dump(
             return None;
         }
     };
+    std::io::Write::write_all(&mut handle, &data).ok()?;
     // The name reported is the one asked for, since it is reported as the file
     // is opened rather than after it is written.
-    crate::framework::plugins::write_extracted(&name, &data).ok()?;
     Some(name)
 }

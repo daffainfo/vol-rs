@@ -1,5 +1,3 @@
-//! Extract loaded kernel modules from memory.
-//!
 //! A module's code stays resident while it is loaded, so it can be written back
 //! out and examined offline, which is the only way to inspect a module that was
 //! never present on disk.
@@ -19,6 +17,7 @@ use crate::framework::plugins::write_extracted;
 use crate::framework::symbols::linux::module_elf::extract_module;
 use crate::framework::symbols::linux::KernelModule;
 
+/// Recreates an ELF file from a specific address in the kernel
 pub struct ModuleExtract;
 
 impl Plugin for ModuleExtract {

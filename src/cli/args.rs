@@ -56,6 +56,10 @@ pub struct Arguments {
     pub image: Option<String>,
     pub plugin: Option<String>,
     pub plugin_args: Vec<(String, String)>,
+    /// The words that formed each of those options, kept so that an option the
+    /// plugin does not take can be complained about in the words it was
+    /// written in.
+    pub plugin_tokens: Vec<(String, Vec<String>)>,
     /// Directories to search for symbol files, in the order given.
     pub symbol_paths: Vec<PathBuf>,
     /// Directories to search for plugins, which this port has no use for but
@@ -99,6 +103,7 @@ impl Default for Arguments {
             image: None,
             plugin: None,
             plugin_args: Vec::new(),
+            plugin_tokens: Vec::new(),
             symbol_paths: Vec::new(),
             plugin_dirs: Vec::new(),
             format: OutputFormat::Quick,
@@ -317,21 +322,28 @@ pub fn parse_with(argv: &[String], is_plugin: impl Fn(&str) -> bool) -> Result<A
             // no value becomes "true".
             if let Some((key, value)) = name.split_once('=') {
                 args.plugin_args.push((key.to_string(), value.to_string()));
+                args.plugin_tokens
+                    .push((key.to_string(), vec![argument.clone()]));
                 index += 1;
             } else if index + 1 < argv.len() && !argv[index + 1].starts_with("--") {
                 // An option may be given several values, as `--pid 4 8 12`.
                 // Each becomes its own entry and the requirement's kind
                 // decides whether repetition is meaningful.
+                let mut tokens = vec![argument.clone(), argv[index + 1].clone()];
                 args.plugin_args
                     .push((name.to_string(), argv[index + 1].clone()));
                 index += 2;
                 while index < argv.len() && !argv[index].starts_with('-') {
                     args.plugin_args
                         .push((name.to_string(), argv[index].clone()));
+                    tokens.push(argv[index].clone());
                     index += 1;
                 }
+                args.plugin_tokens.push((name.to_string(), tokens));
             } else {
                 args.plugin_args.push((name.to_string(), "true".to_string()));
+                args.plugin_tokens
+                    .push((name.to_string(), vec![argument.clone()]));
                 index += 1;
             }
         } else if argument.starts_with('-') {
@@ -394,6 +406,7 @@ pub fn build_plugin_config(
 ) -> Result<Vec<(String, ConfigValue)>> {
     let requirements = plugin.requirements();
     let mut resolved: Vec<(String, ConfigValue)> = Vec::new();
+    let mut unrecognised: Vec<String> = Vec::new();
 
     for (name, value) in raw {
         // Some options are named with dashes and some with underscores, and a
@@ -404,15 +417,13 @@ pub fn build_plugin_config(
             .find(|requirement| requirement.name.replace('-', "_") == normalised);
 
         let Some(requirement) = requirement else {
-            return Err(VolatilityError::Other(format!(
-                "Plugin '{}' does not accept option '--{name}'. Accepted: {}",
-                plugin.name(),
-                requirements
-                    .iter()
-                    .map(|r| format!("--{}", r.name))
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            )));
+            // Upstream parses the plugin's own options with a subparser, so one
+            // it does not know falls through to the main parser and is
+            // complained about there, along with any words that followed it.
+            if !unrecognised.contains(name) {
+                unrecognised.push(name.clone());
+            }
+            continue;
         };
 
         // Stored under the name the plugin declared, whichever spelling the
@@ -430,6 +441,12 @@ pub fn build_plugin_config(
             Some((_, existing)) => *existing = parsed,
             None => resolved.push((normalised, parsed)),
         }
+    }
+
+    // An option the plugin does not take is reported before anything else,
+    // which is the order the reference implementation's parser works in.
+    if !unrecognised.is_empty() {
+        return Err(VolatilityError::Unrecognised(unrecognised));
     }
 
     // Apply defaults, and report anything mandatory that is still missing.
@@ -554,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_plugin_options_are_rejected_with_a_hint() {
+    fn unknown_plugin_options_are_reported_as_unrecognised() {
         struct Dummy;
         impl Plugin for Dummy {
             fn name(&self) -> &'static str {
@@ -578,9 +595,14 @@ mod tests {
             }
         }
 
+        // Upstream's own parser does not know the option either, so it
+        // complains about the words rather than listing what it would accept.
         let error = build_plugin_config(&Dummy, &[("nope".to_string(), "1".to_string())])
             .unwrap_err();
-        assert!(error.to_string().contains("--pid"));
+        match error {
+            VolatilityError::Unrecognised(names) => assert_eq!(names, vec!["nope".to_string()]),
+            other => panic!("expected an unrecognised option, got {other}"),
+        }
 
         // Dashes in option names map onto underscores in requirement names.
         let ok = build_plugin_config(&Dummy, &[("pid".to_string(), "4,8".to_string())]).unwrap();

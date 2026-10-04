@@ -93,14 +93,14 @@ pub fn run(
 
     // Try each operating system in turn. The first that recognises the image
     // wins. A failure here is informational, not fatal.
-    // A crash dump states its own page directory base, so hand that to the
-    // Windows detector instead of making it scan for one.
-    if let Some(dtb) = stack.directory_table_base {
-        context.config.set(
-            "automagic.declared_dtb",
-            crate::framework::context::ConfigValue::Int(dtb as i64),
-        );
-    }
+    //
+    // A crash dump states its own page directory base in its header, but the
+    // reference implementation does not read it: it searches for the
+    // self-referential page table like it does for any other image, and the
+    // base it settles on is usually a different one that maps the same
+    // memory. Taking the header's value would report a different base, so it
+    // is left alone.
+    let _ = stack.directory_table_base;
 
     // An image that has been identified before says so, and its own detector
     // goes first. The others are only tried if it no longer recognises it.

@@ -204,7 +204,12 @@ pub struct ModuleCollection {
 }
 
 impl ModuleCollection {
-    /// Build the collection from the kernel's loaded module list.
+    /// Builds a collection of modules.
+    ///
+    /// # Returns
+    ///
+    /// A Module collection of available modules based on the kernel's loaded
+    /// module list.
     pub fn build(context: &Arc<Context>, kernel: &Module) -> Result<Self> {
         let head = context.object_from_symbol(kernel, "PsLoadedModuleList", Some("_LIST_ENTRY"))?;
         let entries = walk_list(
@@ -219,7 +224,7 @@ impl ModuleCollection {
         let mut taken: Vec<String> = vec!["kernel".to_string()];
         let mut modules = Vec::new();
         for entry in entries {
-            // A module with no readable name is of no use for attribution.
+            // there's no use for a module with no name?
             let Ok(full_name) = entry
                 .member("BaseDllName")
                 .and_then(|name| unicode_string(&name))

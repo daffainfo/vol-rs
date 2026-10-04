@@ -1,5 +1,3 @@
-//! List the kernel modules loaded on the system.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -14,6 +12,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, Requiremen
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, poolscanner};
 
+/// Lists the loaded kernel modules.
 pub struct Modules;
 
 impl Plugin for Modules {
@@ -43,7 +42,7 @@ impl Plugin for Modules {
     }
 }
 
-/// Scan the pools for module entries the kernel may no longer list.
+/// Scans for modules present in a particular windows memory image.
 pub struct ModScan;
 
 impl Plugin for ModScan {
@@ -103,10 +102,24 @@ fn module_columns() -> Vec<Column> {
     ]
 }
 
-/// The kernel's own module entries, in the order it links them.
+/// Lists all the modules in the primary layer.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The module for the kernel
+///
+/// # Returns
+///
+/// A list of Modules as retrieved from PsLoadedModuleList, in the order the
+/// kernel links them.
 pub fn list_modules(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Object>> {
     // PsLoadedModuleList links the kernel's own module entries, using the
-    // same structure as a process's module list.
+    // same structure as a process's module list. Upstream prefers
+    // `_KLDR_DATA_TABLE_ENTRY` where it is available (starting with windows 10)
+    // and falls back to `_LDR_DATA_TABLE_ENTRY`. The two agree on every member
+    // this listing reads, so the one every release describes is used.
     let head = context.object_from_symbol(kernel, "PsLoadedModuleList", Some("_LIST_ENTRY"))?;
     walk_list(
         &head,
@@ -209,10 +222,21 @@ fn dump_module(
     }
 }
 
-/// One virtual layer per session, in the order the sessions were first seen.
+/// Build a cache of possible virtual layers, in priority starting with the
+/// primary/kernel layer. Then keep one layer per session by cycling through the
+/// process list.
 ///
-/// Several plugins have to read memory that only exists inside a session, and
-/// any process of that session will do to reach it.
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The module for the kernel
+///
+/// # Returns
+///
+/// The names of the unique memory layers that map sessions. Several plugins
+/// have to read memory that only exists inside a session, and any process of
+/// that session will do to reach it.
 pub fn session_layers(
     context: &Arc<Context>,
     kernel: &Module,
@@ -225,7 +249,7 @@ pub fn session_layers(
         let Ok(layer) = process.address_space(physical) else {
             continue;
         };
-        // Not every process belongs to a session.
+        // not all processes have a valid session pointer.
         let Ok(session) = process
             .object
             .member("Session")
@@ -233,27 +257,52 @@ pub fn session_layers(
         else {
             continue;
         };
-        let Ok(space) = context.object(
-            &kernel.qualified("_MM_SESSION_SPACE"),
-            &kernel.layer_name,
-            session,
-        ) else {
-            continue;
+        // create the session space object in the process' own layer.
+        let id = match context
+            .object(
+                &kernel.qualified("_MM_SESSION_SPACE"),
+                &kernel.layer_name,
+                session,
+            )
+            .and_then(|space| space.member("SessionId"))
+            .and_then(|id| id.as_u64())
+        {
+            Ok(id) => Some(id),
+            Err(_) => {
+                // In Windows 11 24H2, the _MM_SESSION_SPACE type was replaced
+                // with _PSP_SESSION_SPACE, and the kernel PDB doesn't contain
+                // information about its members (otherwise, we would just fall
+                // back to the new type). However, it appears to be, for our
+                // purposes, functionally identical to the _MM_SESSION_SPACE.
+                // Because _MM_SESSION_SPACE stores its session ID at offset 8
+                // as an unsigned long, we create an unsigned long at that
+                // offset and use that instead.
+                context
+                    .object(
+                        &kernel.qualified("unsigned long"),
+                        &kernel.layer_name,
+                        session.wrapping_add(8),
+                    )
+                    .and_then(|id| id.as_u64())
+                    .ok()
+            }
         };
-        let Ok(id) = space.member("SessionId").and_then(|id| id.as_u64()) else {
-            continue;
-        };
+        let Some(id) = id else { continue };
         if seen.contains(&id) {
             continue;
         }
+        // save the layer if we haven't seen the session yet
         seen.push(id);
         found.push((id, layer));
     }
     found
 }
 
-/// Where kernel space begins, which is what tells a real pointer from a
-/// smeared one.
+/// Returns the starting address of the kernel address space.
+///
+/// This method allows plugins that analyze kernel data structures to quickly
+/// detect smeared or otherwise invalid data as many pointers must point into
+/// the kernel or access during runtime would crash the system.
 pub fn kernel_space_start(context: &Arc<Context>, kernel: &Module) -> u64 {
     let sixty_four_bit = context
         .symbol_space
@@ -266,8 +315,8 @@ pub fn kernel_space_start(context: &Arc<Context>, kernel: &Module) -> u64 {
     } else {
         ("unsigned long", 0x8000_0000)
     };
-    // The kernel states where its own space starts. The architectural value
-    // stands in when that word cannot be read.
+    // The kernel states where its own space starts. The default is used
+    // if/when MmSystemRangeStart is paged out.
     let mask = context.layers.address_mask(&kernel.layer_name);
     context
         .object_from_symbol(kernel, "MmSystemRangeStart", Some(type_name))

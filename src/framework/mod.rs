@@ -6,6 +6,7 @@
 pub mod automagic;
 pub mod cache;
 pub mod context;
+pub mod disassembly;
 pub mod layers;
 pub mod objects;
 pub mod pyset;

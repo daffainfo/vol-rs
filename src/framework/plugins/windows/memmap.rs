@@ -1,5 +1,3 @@
-//! Report how a process's virtual address space maps onto physical memory.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -14,6 +12,7 @@ use crate::framework::plugins::{
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 
+/// Prints the memory map
 pub struct MemMap;
 
 impl Plugin for MemMap {
@@ -89,13 +88,16 @@ impl Plugin for MemMap {
 
             // The extracted file holds the mapped regions end to end, in the
             // order they are reported, so a row's offset says where in the
-            // file its region landed.
+            // file its region landed. The file isn't actually created if it is
+            // not needed.
             let pid = process.pid().unwrap_or(0);
             let file_name = format!("pid.{pid}.dmp");
             // The rows name the file as it was asked for, while what is
             // written keeps clear of a file of that name already there.
             let mut sink = if dump {
-                std::fs::File::create(crate::framework::plugins::free_extracted_name(&file_name))
+                crate::framework::plugins::create_output_file(
+                    &crate::framework::plugins::free_extracted_name(&file_name),
+                )
                     .ok()
                     .map(std::io::BufWriter::new)
             } else {

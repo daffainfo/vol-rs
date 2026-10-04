@@ -872,11 +872,15 @@ impl KernelModule {
     }
 
     /// The taint flags the module set on the kernel, rendered as letters.
-    /// The letters the kernel would print for this module's taints.
+    ///
+    /// Tainted kernel and modules parsing capabilities. Relevant Linux kernel
+    /// functions: `module_flags_taint` for modules, `print_tainted` for the
+    /// kernel.
     ///
     /// A kernel from 4.10 carries the table of flags itself, and it says both
-    /// which letter marks a flag and which marks its absence. Older ones are
-    /// read from the fixed table below.
+    /// which letter marks a flag and which marks its absence. Older ones rely
+    /// on statically defined taints mappings in the framework, read from the
+    /// fixed table below.
     pub fn taints(&self, context: &Arc<Context>, kernel: &Module) -> Result<String> {
         let taints = self.object.member("taints")?.as_u64()?;
         Ok(taint_letters(context, kernel, taints, true))
@@ -946,6 +950,11 @@ pub fn walk_hlist(
 /// internal node has its low bits tagged, which is what distinguishes a branch
 /// from a stored value.
 pub fn xarray_entries(context: &Arc<Context>, kernel: &Module, array: &Object) -> Result<Vec<u64>> {
+    // Which of the two structures the kernel stores identifiers in is settled
+    // by the page cache's own member, and holds for every tree in the kernel.
+    if !uses_xarray(context, kernel) {
+        return radix_tree_entries(context, kernel, array);
+    }
     /// The low bits a slot uses to mark what it holds.
     const TAG_MASK: u64 = 3;
     const TAG_INTERNAL: u64 = 2;
@@ -1001,6 +1010,220 @@ pub fn xarray_entries(context: &Arc<Context>, kernel: &Module, array: &Object) -
         &mut results,
     )?;
     Ok(results)
+}
+
+/// Whether this kernel keeps identifier trees as XArrays.
+///
+/// Kernel 4.17 renamed the page cache's tree and 4.20 turned it into an
+/// XArray, keeping the old type name for a while, so the member's type and the
+/// presence of the XArray's own head are what distinguish them.
+fn uses_xarray(context: &Arc<Context>, kernel: &Module) -> bool {
+    let Ok(space) = context
+        .symbol_space
+        .get_type(&kernel.qualified("address_space"))
+    else {
+        return true;
+    };
+    let Ok(Some((_, pages))) = context.symbol_space.find_member(&space, "i_pages") else {
+        return false;
+    };
+    if pages.type_name().ends_with("xarray") {
+        return true;
+    }
+    pages.type_name().ends_with("radix_tree_root")
+        && context
+            .symbol_space
+            .get_type(&kernel.qualified("radix_tree_root"))
+            .ok()
+            .and_then(|root| {
+                context
+                    .symbol_space
+                    .find_member(&root, "xa_head")
+                    .ok()
+                    .map(|found| found.is_some())
+            })
+            .unwrap_or(false)
+}
+
+/// Every entry a radix tree holds, as the addresses its leaves point at.
+///
+/// The tree the kernel used before the XArray. A node's depth is recorded
+/// differently in each era of the kernel, and the root's own tagged pointer
+/// says whether it points at a node or straight at the single entry.
+fn radix_tree_entries(context: &Arc<Context>, kernel: &Module, root: &Object) -> Result<Vec<u64>> {
+    const ENTRY_MASK: u64 = 3;
+    const EXCEPTIONAL: u64 = 2;
+
+    let node_type = context
+        .symbol_space
+        .get_type(&kernel.qualified("radix_tree_node"))?;
+    let (slots_offset, slots_template) = context
+        .symbol_space
+        .find_member(&node_type, "slots")?
+        .ok_or_else(|| VolatilityError::Other("radix_tree_node has no slots".to_string()))?;
+    let chunk_size = context
+        .object_from_template(slots_template, &kernel.layer_name, 0)
+        .count()
+        .unwrap_or(64);
+    let chunk_shift = chunk_size.trailing_zeros() as u64;
+    let pointer_size = context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|table| table.pointer_size() as u64)
+        .unwrap_or(8);
+
+    // Kernel 4.20 removed the exceptional entry and gave its bit to the flag
+    // that marks a pointer to a node.
+    let has_root_type = context
+        .symbol_space
+        .has_type(&kernel.qualified("radix_tree_root"));
+    let internal: u64 = if has_root_type { 1 } else { 2 };
+
+    let height_bound = context
+        .object_from_symbol(kernel, "height_to_maxindex", None)
+        .or_else(|_| context.object_from_symbol(kernel, "height_to_maxnodes", None))
+        .ok()
+        .and_then(|array| array.count().ok());
+
+    let node_height = |pointer: u64| -> Option<u64> {
+        let node = context.object_from_template(node_type.clone(), &kernel.layer_name, pointer);
+        let height = if node.has_member("shift") {
+            // 4.7 <= kernels < 4.20
+            node.member("shift").and_then(|v| v.as_u64()).ok()? / chunk_shift + 1
+        } else if node.has_member("path") {
+            // 3.15 <= kernels < 4.7
+            let path_bits = pointer_size * 8;
+            let max_path = (path_bits + chunk_shift - 1) / chunk_shift;
+            let mask = (1u64 << (max_path + 1)) - 1;
+            node.member("path").and_then(|v| v.as_u64()).ok()? & mask
+        } else {
+            // kernels < 3.15
+            node.member("height").and_then(|v| v.as_u64()).ok()?
+        };
+        // A height past the end of the kernel's own table means the tree is
+        // corrupt, and the walk stops rather than following it.
+        if let Some(bound) = height_bound {
+            if height >= bound {
+                log::error!(
+                    "Radix Tree node {pointer:#x} height {height} exceeds max height of {bound}"
+                );
+                return None;
+            }
+        }
+        Some(height)
+    };
+
+    let mut height = if context
+        .symbol_space
+        .get_type(&kernel.qualified("radix_tree_root"))
+        .ok()
+        .and_then(|template| {
+            context
+                .symbol_space
+                .find_member(&template, "height")
+                .ok()
+                .map(|found| found.is_some())
+        })
+        .unwrap_or(false)
+    {
+        // kernels < 4.7 record the height in the root
+        root.member("height").and_then(|v| v.as_u64()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let head = root
+        .member("rnode")
+        .and_then(|node| node.pointer_value())
+        .unwrap_or(0);
+    if head == 0 || !context.layers.is_valid(&kernel.layer_name, head & !ENTRY_MASK, 1) {
+        return Ok(Vec::new());
+    }
+
+    let is_internal = head & internal != 0;
+    let pointer = if is_internal { head & !ENTRY_MASK } else { head };
+    if is_internal {
+        match node_height(pointer) {
+            Some(found) => height = found,
+            None => return Ok(Vec::new()),
+        }
+    }
+
+    let valid = |entry: u64| !(has_root_type && entry & ENTRY_MASK == EXCEPTIONAL);
+
+    let mut results = Vec::new();
+    if height == 0 {
+        if valid(pointer) {
+            results.push(pointer);
+        }
+        return Ok(results);
+    }
+    walk_radix_node(
+        context,
+        kernel,
+        slots_offset,
+        chunk_size,
+        pointer_size,
+        internal,
+        &valid,
+        pointer,
+        height,
+        &mut results,
+    );
+    Ok(results)
+}
+
+/// One level of a radix tree, descending until the leaves.
+#[allow(clippy::too_many_arguments)]
+fn walk_radix_node(
+    context: &Arc<Context>,
+    kernel: &Module,
+    slots_offset: u64,
+    chunk_size: u64,
+    pointer_size: u64,
+    internal: u64,
+    valid: &dyn Fn(u64) -> bool,
+    node_pointer: u64,
+    height: u64,
+    results: &mut Vec<u64>,
+) {
+    for index in 0..chunk_size {
+        let Ok(raw) = context.layers.read(
+            &kernel.layer_name,
+            node_pointer + slots_offset + index * pointer_size,
+            pointer_size as usize,
+            false,
+        ) else {
+            continue;
+        };
+        let slot = read_address(&raw);
+        if slot == 0 {
+            continue;
+        }
+        let entry = if slot & internal != 0 {
+            slot & !internal
+        } else {
+            slot
+        };
+        if height <= 1 {
+            if valid(entry) {
+                results.push(entry);
+            }
+        } else {
+            walk_radix_node(
+                context,
+                kernel,
+                slots_offset,
+                chunk_size,
+                pointer_size,
+                internal,
+                valid,
+                entry,
+                height - 1,
+                results,
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1187,12 +1410,12 @@ pub fn module_allocation_range(context: &Arc<Context>, kernel: &Module) -> Resul
     };
     let low = from_tree("addr_min").or_else(|_| {
         context
-            .object_from_symbol(kernel, "module_addr_min", Some("unsigned long"))
+            .object_from_symbol(kernel, "module_addr_min", None)
             .and_then(|value| value.as_u64())
     });
     let high = from_tree("addr_max").or_else(|_| {
         context
-            .object_from_symbol(kernel, "module_addr_max", Some("unsigned long"))
+            .object_from_symbol(kernel, "module_addr_max", None)
             .and_then(|value| value.as_u64())
     });
     match (low, high) {
@@ -1310,6 +1533,16 @@ impl Vma {
         let Some(file) = self.file() else {
             return InodeLookup::Unreadable;
         };
+        let context = self.object.context().clone();
+        let Ok(table) = vma_table(&self.object) else {
+            return InodeLookup::Unreadable;
+        };
+        let Ok(template) = context
+            .symbol_space
+            .get_type(&crate::framework::symbols::join_name(&table, "inode"))
+        else {
+            return InodeLookup::Unreadable;
+        };
 
         // Reads the numbers the kernel keeps consistent for a live inode.
         let looks_live = |inode: &Object| -> Option<bool> {
@@ -1323,26 +1556,28 @@ impl Vma {
                 .ok()?;
             Some(number > 0 && count >= 0)
         };
-        let resolved = |address: u64| -> Option<Object> {
-            let inode = file
-                .member("f_inode")
-                .ok()?
-                .dereference()
-                .ok()?
-                .at_offset(address);
+        // An inode of its own at the address a pointer holds. The pointer
+        // names the layer its own pointers refer to, which is where the inode
+        // is read from.
+        let at = |address: u64| -> Option<Object> {
+            if address == 0 {
+                return None;
+            }
+            let inode = context
+                .object_from_template(template.clone(), file.native_layer_name(), address)
+                .with_native_layer(file.native_layer_name());
             inode.is_readable().then_some(inode)
         };
 
-        // The cached inode pointer, where the kernel is new enough to have one.
-        let mut candidate = None;
-        if file.has_member("f_inode") {
-            let Ok(address) = file.member("f_inode").and_then(|p| p.pointer_value()) else {
-                return InodeLookup::Unreadable;
-            };
-            if address != 0 {
-                candidate = resolved(address);
-            }
-        }
+        // The cached inode pointer, where the kernel is new enough to have
+        // one. Kernels before 3.9 reach it through the directory entry.
+        let mut candidate = match file.member("f_inode") {
+            Ok(field) => match field.pointer_value() {
+                Ok(address) => at(address),
+                Err(_) => return InodeLookup::Unreadable,
+            },
+            Err(_) => None,
+        };
 
         let usable = match &candidate {
             Some(inode) => match looks_live(inode) {
@@ -1354,28 +1589,26 @@ impl Vma {
         };
 
         if !usable {
-            // Fall back to the dentry's inode.
-            let Ok(dentry_address) = file
-                .member("f_path")
-                .and_then(|path| path.member("dentry"))
-                .and_then(|d| d.pointer_value())
-            else {
-                return InodeLookup::Unreadable;
-            };
             let Ok(dentry) = file
                 .member("f_path")
                 .and_then(|path| path.member("dentry"))
-                .and_then(|d| d.dereference())
             else {
                 return InodeLookup::Unreadable;
             };
-            if dentry_address == 0 || !dentry.is_readable() {
+            let Ok(dentry_address) = dentry.pointer_value() else {
+                return InodeLookup::Unreadable;
+            };
+            if dentry_address == 0
+                || !context
+                    .layers
+                    .is_valid(file.native_layer_name(), dentry_address, 1)
+            {
                 return InodeLookup::Missing;
             }
             let Ok(address) = dentry.member("d_inode").and_then(|i| i.pointer_value()) else {
                 return InodeLookup::Unreadable;
             };
-            candidate = (address != 0).then(|| resolved(address)).flatten();
+            candidate = at(address);
         }
 
         match candidate {
@@ -1611,15 +1844,27 @@ pub fn path_for_file_of_kind(task: &Task, file: &Object, files_only: bool) -> Op
     dentry.member("d_parent").ok()?.pointer_value().ok()?;
 
     let vfsmount = path.member("mnt").ok()?.dereference().ok()?;
-    let inode = file.member("f_inode").ok().and_then(|i| i.dereference().ok());
 
-    resolve_path(task, dentry, vfsmount, inode)
+    resolve_path(task, dentry, vfsmount)
 }
 
 /// Every mount point on the system, paired with the task that reaches it.
 ///
 /// Mounts live per namespace, so each namespace is visited once through
 /// whichever task belongs to it, and a mount reached twice is reported once.
+/// The type a mount list holds.
+///
+/// Kernel 3.3 split the per-mount bookkeeping out of `vfsmount` into a `mount`
+/// of its own, and the list runs through whichever of the two the kernel has.
+pub fn mount_type(context: &Arc<Context>, kernel: &Module) -> String {
+    let mount = kernel.qualified("mount");
+    if context.symbol_space.has_type(&mount) {
+        mount
+    } else {
+        kernel.qualified("vfsmount")
+    }
+}
+
 pub fn mount_points(context: &Arc<Context>, kernel: &Module) -> Result<Vec<(Task, Object)>> {
     let mut results = Vec::new();
     let mut seen_namespaces = std::collections::HashSet::new();
@@ -1643,7 +1888,9 @@ pub fn mount_points(context: &Arc<Context>, kernel: &Module) -> Result<Vec<(Task
         let mounts = if namespace.has_member("list") {
             namespace
                 .member("list")
-                .and_then(|head| walk_list(&head, &kernel.qualified("mount"), "mnt_list", true))
+                .and_then(|head| {
+                    walk_list(&head, &mount_type(context, kernel), "mnt_list", true)
+                })
                 .unwrap_or_default()
         } else if namespace.has_member("mounts") {
             namespace
@@ -1692,21 +1939,44 @@ pub fn task_root_readable(task: &Task) -> bool {
 ///
 /// Shared by files and by mount points, which differ only in which dentry and
 /// which mount they start from.
-pub fn resolve_path(
-    task: &Task,
-    mut dentry: Object,
-    mut vfsmount: Object,
-    inode: Option<Object>,
-) -> Option<String> {
+pub fn resolve_path(task: &Task, mut dentry: Object, mut vfsmount: Object) -> Option<String> {
     let fs = task.object.member("fs").ok()?.dereference().ok()?;
     let root = fs.member("root").ok()?;
     let root_dentry = root.member("dentry").ok()?.pointer_value().ok()?;
     let root_mount = root.member("mnt").ok()?.pointer_value().ok()?;
+    // Every path is relative to the task's root, so without a readable root
+    // there is no path to give.
+    if root_dentry == 0
+        || root_mount == 0
+        || !root
+            .member("dentry")
+            .and_then(|pointer| pointer.dereference())
+            .map(|dentry| dentry.is_readable())
+            .unwrap_or(false)
+        || !root
+            .member("mnt")
+            .and_then(|pointer| pointer.dereference())
+            .map(|mount| mount.is_readable())
+            .unwrap_or(false)
+    {
+        return Some(String::new());
+    }
+
+    // The inode is the one behind the dentry the walk starts from, read before
+    // the walk moves on, because it is what says whether the name still exists.
+    let inode = dentry
+        .member("d_inode")
+        .and_then(|pointer| pointer.dereference())
+        .ok()
+        .filter(|inode| inode.is_readable());
 
     let mut components: Vec<String> = Vec::new();
     let mut smeared = false;
 
     for _ in 0..256 {
+        if dentry.offset() == 0 || !dentry.is_readable() {
+            break;
+        }
         if dentry.offset() == root_dentry && vfsmount.offset() == root_mount {
             break;
         }
@@ -1727,25 +1997,41 @@ pub fn resolve_path(
             if dentry.offset() != mount_root {
                 break;
             }
-            let Some(mount) = containing_mount(&vfsmount) else {
-                break;
+            // Before kernel 3.3 the parent links sit on the vfsmount itself.
+            // Later kernels moved them to the mount that contains it.
+            let old_layout = vfsmount.has_member("mnt_parent");
+            let holder = if old_layout {
+                vfsmount.clone()
+            } else {
+                match containing_mount(&vfsmount) {
+                    Some(mount) => mount,
+                    None => break,
+                }
             };
-            let parent_mount = mount
+            let parent = holder
                 .member("mnt_parent")
                 .and_then(|value| value.pointer_value())
                 .unwrap_or(0);
             // A mount that is its own parent is a global root.
-            if parent_mount == 0 || parent_mount == mount.offset() {
+            if parent == 0 || parent == holder.offset() {
                 break;
             }
-            let Ok(mountpoint) = mount
+            let Ok(mountpoint) = holder
                 .member("mnt_mountpoint")
                 .and_then(|value| value.dereference())
             else {
                 break;
             };
             dentry = mountpoint;
-            vfsmount = mount.at_offset(parent_mount).member("mnt").ok()?;
+            vfsmount = if old_layout {
+                // The parent is a vfsmount outright.
+                vfsmount.at_offset(parent)
+            } else {
+                match holder.at_offset(parent).member("mnt") {
+                    Ok(mount) => mount,
+                    Err(_) => break,
+                }
+            };
             continue;
         }
 
@@ -1774,12 +2060,49 @@ pub fn resolve_path(
         return Some(format!("{SMEAR_MARKER} {path}"));
     }
     if let Some(inode) = inode {
-        if inode.is_readable() && inode.member("i_nlink").and_then(|n| n.as_u64()).unwrap_or(1) == 0
-        {
+        let number = inode.member("i_ino").and_then(|n| n.as_u64()).unwrap_or(0);
+        let references = inode
+            .member("i_count")
+            .and_then(|count| count.member("counter"))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(-1);
+        let links = inode
+            .member("i_nlink")
+            .and_then(|links| links.as_u64())
+            .unwrap_or(1);
+        if number > 0 && references >= 0 && links == 0 {
             return Some(format!(" {path} {DELETED_MARKER}"));
         }
     }
     Some(path)
+}
+
+/// Where a mount point's path resolution starts.
+///
+/// A mount point is named from the parent mount it is attached to. Kernels from
+/// 3.3 reach that through the `mount` that embeds the `vfsmount`, so the walk
+/// can start at the mount's own root and step out on its first turn. Before
+/// that the one structure carried both, and the walk starts at the mount point
+/// in the parent outright.
+pub fn mount_path_start(mount: &Object) -> Option<(Object, Object)> {
+    if mount.has_member("mnt") {
+        let vfsmount = mount.member("mnt").ok()?;
+        let dentry = vfsmount.member("mnt_root").ok()?.dereference().ok()?;
+        Some((dentry, vfsmount))
+    } else {
+        let dentry = mount.member("mnt_mountpoint").ok()?.dereference().ok()?;
+        let parent = mount.member("mnt_parent").ok()?;
+        if parent.pointer_value().ok()? == 0 {
+            return None;
+        }
+        Some((dentry, parent.dereference().ok()?))
+    }
+}
+
+/// A mount point's path as seen from a task's root.
+pub fn path_for_mount(task: &Task, mount: &Object) -> Option<String> {
+    let (dentry, vfsmount) = mount_path_start(mount)?;
+    resolve_path(task, dentry, vfsmount)
 }
 
 /// The name a pseudo-file is listed under.
@@ -2140,14 +2463,14 @@ impl Task {
         read_string_block(&self.object, start, end)
     }
 
-    /// The task's environment variables, as `KEY=VALUE` strings.
-    /// The task's environment block, split on its NUL separators.
+    /// Yields environment variables for a given task.
     ///
     /// The block lives in the task's own address space and is read whole: a
     /// partial read would silently truncate the listing, so a block that is not
     /// fully mapped yields nothing at all.
     pub fn environment(&self) -> Result<Vec<String>> {
-        // A block bigger than this means the pointers were misread.
+        // Maximum allowable size for the environment variables area. Tasks
+        // exceeding this size will be skipped.
         const MAX_ENVIRONMENT: u64 = 8192;
 
         let Some(mm) = self.mm()? else {
@@ -2162,17 +2485,22 @@ impl Task {
             return Ok(Vec::new());
         }
 
+        // Get process layer to read envars from
         let Some(layer) = self.process_layer()? else {
             return Ok(Vec::new());
         };
         let context = self.object.context();
+        // Ensure the entire buffer is readable to prevent relying on exception handling
         if !context.layers.is_valid(&layer, start, size) {
+            // Not mapped / swapped out
             return Ok(Vec::new());
         }
 
+        // Read the full task environment variable buffer.
         let data = context.layers.read(&layer, start, size as usize, false)?;
-        // Only the trailing terminators are dropped. An empty entry in the
-        // middle is a real, if odd, part of the block.
+        // Parse envar data, envars are null terminated, keys and values are
+        // separated by '='. Only the trailing terminators are dropped. An empty
+        // entry in the middle is a real, if odd, part of the block.
         let trimmed = data.iter().rposition(|byte| *byte != 0).map_or(&data[..0], |last| &data[..=last]);
 
         Ok(trimmed
@@ -2242,6 +2570,41 @@ impl OpenFile {
     }
 }
 
+/// A mode rendered the way `ls -l` shows it.
+///
+/// This follows Python's `stat.filemode`, which looks the leading character up
+/// by the mode's type nibble, so a mode whose nibble names no file type comes
+/// out with a question mark rather than a dash.
+pub fn filemode(mode: u64) -> String {
+    const TYPES: [u8; 16] = *b"?pc?d?b?-?l?s???";
+    let mut text = String::with_capacity(10);
+    text.push(TYPES[((mode >> 12) & 0xF) as usize] as char);
+    for (read, write, execute, set, present, absent) in [
+        (0o400, 0o200, 0o100, 0o4000, 's', 'S'),
+        (0o040, 0o020, 0o010, 0o2000, 's', 'S'),
+        (0o004, 0o002, 0o001, 0o1000, 't', 'T'),
+    ] {
+        text.push(if mode & read != 0 { 'r' } else { '-' });
+        text.push(if mode & write != 0 { 'w' } else { '-' });
+        text.push(match (mode & set != 0, mode & execute != 0) {
+            (true, true) => present,
+            (true, false) => absent,
+            (false, true) => 'x',
+            (false, false) => '-',
+        });
+    }
+    text
+}
+
+/// A little-endian address of whatever width was read.
+fn read_address(data: &[u8]) -> u64 {
+    let mut value = 0u64;
+    for (index, byte) in data.iter().take(8).enumerate() {
+        value |= (*byte as u64) << (index * 8);
+    }
+    value
+}
+
 impl Task {
     /// The task's open file descriptors.
     ///
@@ -2255,29 +2618,44 @@ impl Task {
         }
         let files = files.dereference()?;
 
-        // `fdt` points at the current table. `fdtab` is the embedded fallback
-        // used before the table has been expanded.
-        let table = files
-            .member("fdt")
-            .and_then(|fdt| fdt.dereference())
-            .or_else(|_| files.member("fdtab"))?;
+        // `fdt` points at the current table from kernel 2.6.14 on. Before that
+        // the descriptor array and its length sat in `files_struct` itself.
+        let table = if files.has_member("fdt") {
+            files.member("fdt").and_then(|fdt| fdt.dereference())?
+        } else {
+            files.clone()
+        };
+
+        let array = table.member("fd")?.pointer_value()?;
+        // A null first descriptor is how the reference implementation decides
+        // the table is not worth reading, and it then reports nothing for the
+        // whole task rather than skipping the one descriptor.
+        let table_name = vma_table(&self.object)?;
+        let context = self.object.context().clone();
+        let pointer_size = context
+            .symbol_space
+            .table(&table_name)
+            .map(|table| table.pointer_size() as u64)
+            .unwrap_or(8);
+        let first = context
+            .layers
+            .read(self.object.layer_name(), array, pointer_size as usize, false)
+            .ok()
+            .map(|data| read_address(&data))
+            .unwrap_or(0);
+        if first == 0 {
+            return Ok(Vec::new());
+        }
 
         let max = table.member("max_fds")?.as_u64()?;
         // A table larger than this means the structure was misread.
-        if max == 0 || max > 0x100000 {
+        if max > 500000 {
             return Ok(Vec::new());
         }
 
-        let array = table.member("fd")?.pointer_value()?;
-        if array == 0 {
-            return Ok(Vec::new());
-        }
-
-        let context = self.object.context().clone();
-        let file_template = context.symbol_space.get_type(
-            &crate::framework::symbols::join_name(vma_table(&self.object)?.as_str(), "file"),
-        )?;
-        let pointer_size = 8u64;
+        let file_template = context
+            .symbol_space
+            .get_type(&crate::framework::symbols::join_name(&table_name, "file"))?;
 
         let mut results = Vec::new();
         for descriptor in 0..max {
@@ -2289,7 +2667,7 @@ impl Task {
             ) else {
                 continue;
             };
-            let address = u64::from_le_bytes(data.try_into().unwrap());
+            let address = read_address(&data);
             if address == 0 {
                 continue;
             }
@@ -2316,28 +2694,40 @@ impl Task {
         // The effective credentials are what a task acts with. `real_cred` is
         // what it may return to, and is the set upstream reports.
         let cred = self.object.member("real_cred")?.dereference()?;
-        let read = |name: &str| -> u64 {
-            cred.member(name)
-                .and_then(|set| {
-                    // Kernel 6.3 replaced the array of 32-bit words with a
-                    // single 64-bit `val`. Older kernels keep two words, whose
-                    // second holds the high bits.
-                    if let Ok(value) = set.member("val").and_then(|value| value.as_u64()) {
-                        return Ok(value);
-                    }
-                    let words = set.member("cap")?;
+        let read = |name: &str| -> Result<u64> {
+            let set = cred.member(name)?;
+            // Kernel 6.3 replaced the array of 32-bit words with a single
+            // 64-bit `val` and renamed the structure to `kernel_cap_t`. A
+            // table that already calls it that while still holding the words
+            // is one the reference implementation refuses to read at all,
+            // because it looks for the new member and nothing else.
+            if set.type_name().ends_with("kernel_cap_t") {
+                return set
+                    .member("val")
+                    .and_then(|value| value.as_u64())
+                    .map_err(|_| unsupported_capabilities());
+            }
+            let words = set.member("cap").map_err(|_| unsupported_capabilities())?;
+            match words.count() {
+                Ok(1) => words.index(0)?.as_u64(),
+                Ok(2) => {
                     let low = words.index(0)?.as_u64()?;
-                    let high = words.index(1).and_then(|word| word.as_u64()).unwrap_or(0);
+                    let high = words.index(1)?.as_u64()?;
                     Ok(low | (high << 32))
-                })
-                .unwrap_or(0)
+                }
+                Ok(_) => Err(unsupported_capabilities()),
+                // Not an array at all, which is how a kernel before 2.6.25
+                // holds it.
+                Err(_) => words.as_u64(),
+            }
         };
         Ok((
-            read("cap_inheritable"),
-            read("cap_permitted"),
-            read("cap_effective"),
-            read("cap_bset"),
-            read("cap_ambient"),
+            read("cap_inheritable")?,
+            read("cap_permitted")?,
+            read("cap_effective")?,
+            read("cap_bset")?,
+            // Ambient capabilities were added in kernels 4.3.6
+            read("cap_ambient").unwrap_or(0),
         ))
     }
 }
@@ -2494,7 +2884,7 @@ pub struct NetDevice {
 }
 
 impl NetDevice {
-    /// The interface name, a fixed-size character array.
+    /// Return the network device name, a fixed-size character array.
     pub fn name(&self) -> Result<String> {
         self.object.member("name")?.as_string()
     }
@@ -2504,7 +2894,7 @@ impl NetDevice {
         self.object.member("ifindex")?.as_i64()
     }
 
-    /// The hardware address, formatted the way `ip` shows it.
+    /// Get the MAC address of this network interface.
     pub fn mac_address(&self) -> Option<String> {
         // The address length varies by link type. Ethernet is six bytes.
         let length = self
@@ -2566,12 +2956,12 @@ impl NetDevice {
         .to_string()
     }
 
-    /// The interface flags, rendered as their names.
-    /// The interface flags as userspace sees them, named and sorted.
+    /// Return the net_device flags as a list of strings.
     ///
-    /// This follows the kernel's `dev_get_flags`: the flags describing link
-    /// state are not kept in `flags` at all but derived from `state`, so they
-    /// are cleared and then recomputed.
+    /// This is the combination of flags exported through kernel APIs to
+    /// userspace, based on `dev_get_flags()`: the flags describing link state
+    /// are not kept in `flags` at all but derived from `state`, so they are
+    /// cleared and then recomputed.
     pub fn flag_names(&self) -> Vec<String> {
         let Ok(table) = vma_table(&self.object) else {
             return Vec::new();
@@ -2584,10 +2974,28 @@ impl NetDevice {
                 .ok()
                 .and_then(|template| template.as_enum().cloned())
         };
-        let Some(device_flags) = enumeration("net_device_flags") else {
-            return Vec::new();
+        // kernels >= 3.15 give the flags an enumeration of their own. For
+        // kernels < 3.15 they were plain macros, so the names come from a
+        // table.
+        let device_flags = enumeration("net_device_flags");
+        let flag_table: Vec<(String, u64)> = match &device_flags {
+            Some(flags) => flags
+                .choices
+                .iter()
+                .map(|(name, value)| (name.clone(), *value as u64))
+                .collect(),
+            None => NET_DEVICE_FLAGS
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), *value))
+                .collect(),
         };
-        let choice = |name: &str| device_flags.choices.get(name).copied().unwrap_or(0) as u64;
+        let choice = |name: &str| {
+            flag_table
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| *value)
+                .unwrap_or(0)
+        };
 
         let clear_flags = choice("IFF_PROMISC")
             | choice("IFF_ALLMULTI")
@@ -2618,6 +3026,11 @@ impl NetDevice {
                 .is_some_and(|bit| state & (1 << bit) != 0)
         };
 
+        // Test if the network device has been brought up, based on
+        // `netif_running()`. It should be safe:
+        // `netdev_state_t::__LINK_STATE_START` has been available at least from
+        // kernels 2.6.30. The three checks below follow `netif_oper_up()`,
+        // `netif_carrier_ok()` and `netif_dormant()` in turn.
         if is_set("__LINK_STATE_START") {
             if matches!(self.state().as_str(), "UP" | "UNKNOWN") {
                 flags |= choice("IFF_RUNNING");
@@ -2630,10 +3043,9 @@ impl NetDevice {
             }
         }
 
-        let mut names: Vec<String> = device_flags
-            .choices
+        let mut names: Vec<String> = flag_table
             .iter()
-            .filter(|(_, value)| **value != 0 && flags & (**value as u64) == **value as u64)
+            .filter(|(_, value)| flags & *value != 0)
             .map(|(name, _)| name.clone())
             .collect();
         // Sorted so the output does not depend on the enumeration's order.
@@ -2641,7 +3053,6 @@ impl NetDevice {
         names
     }
 
-    /// The IPv4 addresses configured on the interface, with prefix lengths.
     /// The IPv4 addresses configured on the interface.
     ///
     /// Each entry is `(address, prefix length, scope)`.
@@ -2837,32 +3248,96 @@ pub fn list_net_devices(
 /// timekeeper cannot be read, which leaves callers to report the time as
 /// unavailable rather than as 1970.
 pub fn boot_time_timespec(context: &Arc<Context>, kernel: &Module) -> Option<(i64, i64)> {
-    // Kernels from 3.17 wrap the timekeeper in `tk_core`. The symbol carries
-    // its own type, so no type name is supplied here.
-    let timekeeper = context
+    // Kernels from 3.17 wrap the timekeeper in `tk_core`, and the difference
+    // between its two offsets is the boot instant. The symbol carries its own
+    // type, so no type name is supplied here.
+    if let Ok(timekeeper) = context
         .object_from_symbol(kernel, "tk_core", None)
+        .and_then(|core| core.member("timekeeper"))
+    {
+        let read_ktime = |name: &str| -> Option<i64> {
+            let field = timekeeper.member(name).ok()?;
+            // Kernels before 4.10 wrap ktime_t in a union with a `tv64`.
+            field
+                .member("tv64")
+                .and_then(|inner| inner.as_i64())
+                .or_else(|_| field.as_i64())
+                .ok()
+        };
+        let offs_real = read_ktime("offs_real")?;
+        let offs_boot = read_ktime("offs_boot").unwrap_or(0);
+        return Some(ns_to_timespec64(offs_real - offs_boot));
+    }
+
+    // 3.4 <= kernels < 3.17 keep a `timekeeper` of their own, which records how
+    // far wall time sits from monotonic time. That is the boot instant negated,
+    // once the time spent suspended is added back.
+    let has_wall_to_monotonic = context
+        .symbol_space
+        .get_type(&kernel.qualified("timekeeper"))
         .ok()
-        .and_then(|core| core.member("timekeeper").ok())
-        .or_else(|| context.object_from_symbol(kernel, "timekeeper", None).ok())?;
+        .and_then(|template| {
+            context
+                .symbol_space
+                .find_member(&template, "wall_to_monotonic")
+                .ok()
+                .map(|found| found.is_some())
+        })
+        .unwrap_or(false);
+    if has_wall_to_monotonic {
+        if let Ok(timekeeper) = context.object_from_symbol(kernel, "timekeeper", None) {
+            let wall = read_timespec(&timekeeper.member("wall_to_monotonic").ok()?)?;
+            let slept = timekeeper
+                .member("total_sleep_time")
+                .ok()
+                .and_then(|value| read_timespec(&value))
+                .unwrap_or((0, 0));
+            return Some(negate_timespec(add_timespec(wall, slept)));
+        }
+    }
 
-    let read_ktime = |name: &str| -> Option<i64> {
-        let field = timekeeper.member(name).ok()?;
-        // Older kernels wrap ktime_t in a union with a `tv64` member.
-        field
-            .member("tv64")
-            .and_then(|inner| inner.as_i64())
-            .or_else(|_| field.as_i64())
-            .ok()
+    // Kernels before 3.4 keep the same figure in a symbol of its own.
+    let wall = read_timespec(&context.object_from_symbol(kernel, "wall_to_monotonic", None).ok()?)?;
+    let slept = match context.object_from_symbol(kernel, "total_sleep_time", None) {
+        // 2.6.32 and later record it as a timespec; before that as whole
+        // seconds.
+        Ok(value) => match read_timespec(&value) {
+            Some(timespec) => timespec,
+            None => (value.as_i64().unwrap_or(0), 0),
+        },
+        Err(_) => (0, 0),
     };
+    Some(negate_timespec(add_timespec(wall, slept)))
+}
 
-    let offs_real = read_ktime("offs_real")?;
-    let offs_boot = read_ktime("offs_boot").unwrap_or(0);
-    let (seconds, nanoseconds) = ns_to_timespec64(offs_real - offs_boot);
+/// A kernel `timespec`, where the object is one.
+fn read_timespec(value: &Object) -> Option<(i64, i64)> {
+    let seconds = value.member("tv_sec").ok()?.as_i64().ok()?;
+    let nanoseconds = value.member("tv_nsec").ok()?.as_i64().ok()?;
+    Some((seconds, nanoseconds))
+}
 
-    // A boot time outside the plausible range means the structure was misread.
-    (1_000_000_000..=4_000_000_000)
-        .contains(&seconds)
-        .then_some((seconds, nanoseconds))
+/// Two timespecs added, with the nanoseconds carried into the seconds.
+fn add_timespec(left: (i64, i64), right: (i64, i64)) -> (i64, i64) {
+    normalize_timespec((left.0 + right.0, left.1 + right.1))
+}
+
+/// A timespec negated, then normalised the way the kernel normalises one.
+fn negate_timespec(value: (i64, i64)) -> (i64, i64) {
+    normalize_timespec((-value.0, -value.1))
+}
+
+/// Carry a timespec's nanoseconds into its seconds, as the kernel does.
+fn normalize_timespec(mut value: (i64, i64)) -> (i64, i64) {
+    while value.1 >= 1_000_000_000 {
+        value.1 -= 1_000_000_000;
+        value.0 += 1;
+    }
+    while value.1 < 0 {
+        value.1 += 1_000_000_000;
+        value.0 -= 1;
+    }
+    value
 }
 
 /// The whole-second part of the boot time, as task timestamps are built on.
@@ -2890,6 +3365,35 @@ pub fn masked_address(address: u64, pointer_size: usize) -> u64 {
         address
     }
 }
+
+/// The failure the reference implementation reports for a capability set it
+/// does not know how to read.
+pub fn unsupported_capabilities() -> VolatilityError {
+    VolatilityError::Other("Unsupported kernel capabilities implementation".to_string())
+}
+
+/// The interface flags a kernel before 3.15 names only with macros.
+const NET_DEVICE_FLAGS: [(&str, u64); 19] = [
+    ("IFF_UP", 0x1),
+    ("IFF_BROADCAST", 0x2),
+    ("IFF_DEBUG", 0x4),
+    ("IFF_LOOPBACK", 0x8),
+    ("IFF_POINTOPOINT", 0x10),
+    ("IFF_NOTRAILERS", 0x20),
+    ("IFF_RUNNING", 0x40),
+    ("IFF_NOARP", 0x80),
+    ("IFF_PROMISC", 0x100),
+    ("IFF_ALLMULTI", 0x200),
+    ("IFF_MASTER", 0x400),
+    ("IFF_SLAVE", 0x800),
+    ("IFF_MULTICAST", 0x1000),
+    ("IFF_PORTSEL", 0x2000),
+    ("IFF_AUTOMEDIA", 0x4000),
+    ("IFF_DYNAMIC", 0x8000),
+    ("IFF_LOWER_UP", 0x10000),
+    ("IFF_DORMANT", 0x20000),
+    ("IFF_ECHO", 0x40000),
+];
 
 /// The letters standing for a set of taint flags.
 ///
@@ -2982,4 +3486,31 @@ fn describe_taint(letter: char) -> Option<&'static str> {
         .iter()
         .find(|(_, candidate, _, _)| *candidate == letter)
         .map(|(_, _, _, description)| *description)
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::filemode;
+
+    /// The strings Python's `stat.filemode` produces for the same modes.
+    #[test]
+    fn modes_render_the_way_the_reference_implementation_renders_them() {
+        for (mode, expected) in [
+            (0o600, "?rw-------"),
+            (0o021664, "crw-rw-r-T"),
+            (0o100644, "-rw-r--r--"),
+            (0o040755, "drwxr-xr-x"),
+            (0o010600, "prw-------"),
+            (0o120777, "lrwxrwxrwx"),
+            (0o140777, "srwxrwxrwx"),
+            (0o060660, "brw-rw----"),
+            (0o4755, "?rwsr-xr-x"),
+            (0o2755, "?rwxr-sr-x"),
+            (0o1777, "?rwxrwxrwt"),
+            (0, "?---------"),
+            (0o170000, "?---------"),
+        ] {
+            assert_eq!(filemode(mode), expected, "mode {mode:o}");
+        }
+    }
 }

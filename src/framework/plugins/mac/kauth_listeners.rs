@@ -1,5 +1,3 @@
-//! List the listeners registered on each kauth scope.
-//!
 //! Where `kauth_scopes` reports the scopes, this reports the individual
 //! listeners inside them, each one an extension that sees every authorisation
 //! decision in its scope.
@@ -17,6 +15,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::{walk_tailq, ExtensionResolver};
 
+/// Lists kauth listeners and their status
 pub struct KauthListeners;
 
 impl Plugin for KauthListeners {
@@ -46,6 +45,7 @@ impl Plugin for KauthListeners {
         ]
     }
 
+    /// Enumerates the listeners for each kauth scope.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let resolver = ExtensionResolver::new(&context, &kernel).ok();

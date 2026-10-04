@@ -16,7 +16,7 @@ Rust 1.85 or newer, then:
 cargo build --release
 ```
 
-The binary lands at `target/release/vol-rs`. Nothing optional is needed. Symbol decompression, RC4, DES, AES, YARA matching, x86 disassembly, PNG writing and tar archives are all built in, where the Python version reaches for `pycryptodomex`, `yara-python`, `capstone` and `pillow`.
+The binary lands at `target/release/vol-rs`. Nothing optional is needed. Symbol decompression, RC4, DES, AES, YARA matching, PNG writing and tar archives are all built in, where the Python version reaches for `pycryptodomex`, `yara-python` and `pillow`. Instructions are decoded by capstone 5.0.6, the same library the Python version uses for the same columns, compiled in rather than installed alongside.
 
 ## Using it
 
@@ -40,55 +40,71 @@ Both sides were run against the same captures and diffed, header framing and tra
 
 | Check | Result |
 |---|---|
-| Windows plugins with no arguments | 99 of 100 identical |
-| Linux plugins with no arguments | 56 of 57 identical |
-| Runs that take arguments | 43 of 43 identical |
-| Files written by extracting plugins | 1,747 compared, every file both tools wrote is equal |
+| Windows plugins with no arguments, Windows 10 19041 crash dump | 112 of 114 identical |
+| Windows plugins with no arguments, Windows XP raw capture | 113 of 114 identical |
+| Linux plugins with no arguments, Linux 3.2 raw capture | 60 of 60 identical |
+| Files written by extracting plugins | 24,441 compared across the three captures, every one equal |
 | Plugin help pages | 197 of 197 identical |
+| Renderers | `csv`, `json`, `jsonl`, `quick` and `pretty` compared on several plugins, all identical |
 
-The eight files that did not compare equal are the two cases listed under Known differences below. Seven are partial files the Python version leaves on disk after reporting that it could not dump them, which this port does not create, and one is a tarball whose contents match but whose timestamps record when each run happened.
+Two plugins account for every row that is not identical. `isfinfo` without `--live` lists the Python version's own identifier database rather than the image, in that database's own order, where this port lists the symbol directories, so neither answer is derivable from the other. `windows.memmap.Memmap` on the Windows 10 capture is killed by the out of memory killer part way through, and where it stops depends on the free memory at the time, so two Python runs do not agree with each other either. This port finishes all 9,014,410 lines of it, and every line the Python version wrote first is reproduced exactly. On the Windows XP capture both finish and the output matches.
 
-Windows symbols are built from the database Microsoft publishes for the kernel in the image. For the capture used here that description matches the one the Python version builds from the same database exactly, across all 16 base types, 293 enumerations, 1,653 structures and 40,007 symbols.
+Instructions are decoded by the same library the Python version uses, compiled in at version 5.0.6, which is the version the reference was pinned to for these comparisons. Version 5.0.7 decodes one more instruction form, which changes how about two percent of `windows.mbrscan`'s lines are spelled on the Windows 10 capture and nothing else.
 
-The two plugins missing from those counts are the ones the Python version cannot finish on the test machine. `windows.memmap.Memmap` is killed by the out of memory killer after 7.8 million lines, and `linux.pscallstack.PsCallStack` is killed before it ends. In both cases every line the Python version managed to write first is reproduced exactly.
+Windows symbols for the captures used here come from the symbol packs the Volatility Foundation publishes, read by both tools. For an earlier Windows 10 19045 capture whose kernel no pack described, the description this port builds from the database Microsoft publishes matched the one the Python version builds from the same database exactly, across all 16 base types, 293 enumerations, 1,653 structures and 40,007 symbols.
 
-Across every plugin that runs with no arguments, the Windows sweep takes 273 seconds here against 5723 seconds, and the Linux sweep 68 seconds against 3130 seconds.
+Across every plugin that runs with no arguments, the Windows 10 sweep takes 233 seconds here against 6113 seconds, the Windows XP sweep 48 seconds against 1674 seconds, and the Linux sweep 36 seconds against 1896 seconds.
 
 ## Speed
 
 The ten widest gaps on each capture, out of every plugin that runs with no arguments:
 
-### Windows
+### Windows 10 19041 crash dump
 
 | Plugin | Rust | Python | Faster |
 |---|---:|---:|---:|
-| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.47 s | 281.6 s | x599 |
-| `windows.suspicious_threads.SuspiciousThreads` | 0.50 s | 259.1 s | x518 |
-| `windows.malware.hollowprocesses.HollowProcesses` | 0.52 s | 257.9 s | x496 |
-| `windows.suspended_threads.SuspendedThreads` | 0.090 s | 42.0 s | x467 |
-| `windows.malware.malfind.Malfind` | 0.52 s | 236.5 s | x455 |
-| `windows.hollowprocesses.HollowProcesses` | 0.59 s | 263.0 s | x446 |
-| `windows.debugregisters.DebugRegisters` | 0.090 s | 37.0 s | x411 |
-| `windows.malfind.Malfind` | 0.65 s | 239.7 s | x369 |
-| `windows.vadinfo.VadInfo` | 0.99 s | 329.7 s | x333 |
-| `windows.verinfo.VerInfo` | 0.99 s | 150.7 s | x152 |
+| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.574 s | 346 s | x603 |
+| `windows.suspicious_threads.SuspiciousThreads` | 0.725 s | 343 s | x473 |
+| `windows.malware.malfind.Malfind` | 0.687 s | 313 s | x456 |
+| `windows.malware.hollowprocesses.HollowProcesses` | 0.555 s | 240 s | x432 |
+| `windows.malfind.Malfind` | 0.792 s | 320 s | x404 |
+| `windows.hollowprocesses.HollowProcesses` | 0.615 s | 244 s | x396 |
+| `windows.vadinfo.VadInfo` | 1.11 s | 412 s | x371 |
+| `yarascan.YaraScan` | 0.035 s | 11.7 s | x336 |
+| `configwriter.ConfigWriter` | 0.055 s | 14.5 s | x265 |
+| `windows.registry.hivelist.HiveList` | 0.036 s | 7.54 s | x211 |
 
-### Linux
+### Windows XP raw capture
 
 | Plugin | Rust | Python | Faster |
 |---|---:|---:|---:|
-| `linux.library_list.LibraryList` | 1.99 s | 788.7 s | x396 |
-| `linux.kallsyms.Kallsyms` | 2.41 s | 161.6 s | x67 |
-| `linux.netfilter.Netfilter` | 0.89 s | 56.3 s | x63 |
-| `linux.lsof.Lsof` | 0.89 s | 55.6 s | x62 |
-| `linux.sockstat.Sockstat` | 1.60 s | 97.2 s | x61 |
-| `linux.check_idt.Check_idt` | 0.82 s | 49.7 s | x61 |
-| `linux.malware.netfilter.Netfilter` | 1.07 s | 62.0 s | x58 |
-| `linux.pagecache.Files` | 1.67 s | 93.4 s | x56 |
-| `linux.kthreads.Kthreads` | 0.87 s | 47.2 s | x54 |
-| `linux.proc.Maps` | 2.53 s | 135.4 s | x54 |
+| `windows.suspicious_threads.SuspiciousThreads` | 0.148 s | 34.5 s | x233 |
+| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.152 s | 33.2 s | x218 |
+| `windows.hollowprocesses.HollowProcesses` | 0.142 s | 28.1 s | x197 |
+| `windows.malware.hollowprocesses.HollowProcesses` | 0.192 s | 31.0 s | x161 |
+| `windows.mftscan.MFTScan` | 0.322 s | 48.2 s | x150 |
+| `windows.etwpatch.EtwPatch` | 0.103 s | 15.2 s | x147 |
+| `windows.malware.malfind.Malfind` | 0.203 s | 28.2 s | x139 |
+| `windows.mftscan.ADS` | 0.189 s | 25.0 s | x132 |
+| `windows.malfind.Malfind` | 0.201 s | 26.3 s | x131 |
+| `windows.vadinfo.VadInfo` | 0.294 s | 38.5 s | x131 |
 
-[BENCHMARKS.md](BENCHMARKS.md) has the rest: every plugin on both captures, the runs that take arguments, and the machine the numbers were measured on.
+### Linux 3.2 raw capture
+
+| Plugin | Rust | Python | Faster |
+|---|---:|---:|---:|
+| `linux.library_list.LibraryList` | 0.657 s | 917 s | x1396 |
+| `linux.pscallstack.PsCallStack` | 0.314 s | 98.8 s | x315 |
+| `linux.lsmod.Lsmod` | 0.076 s | 9.58 s | x127 |
+| `linux.check_idt.Check_idt` | 0.132 s | 15.1 s | x114 |
+| `linux.malware.tty_check.Tty_Check` | 0.132 s | 15.0 s | x114 |
+| `linux.malware.check_idt.Check_idt` | 0.136 s | 15.2 s | x112 |
+| `linux.malware.check_modules.Check_modules` | 0.055 s | 5.74 s | x104 |
+| `linux.kallsyms.Kallsyms` | 0.291 s | 28.9 s | x99 |
+| `linux.keyboard_notifiers.Keyboard_notifiers` | 0.110 s | 10.8 s | x98 |
+| `linux.boottime.Boottime` | 0.060 s | 5.48 s | x92 |
+
+[BENCHMARKS.md](BENCHMARKS.md) has the rest: every plugin on all three captures and the machine the numbers were measured on.
 
 ## Known differences
 
@@ -98,17 +114,15 @@ A handful of things cannot match, and each is deliberate:
 * `--save-config` and `timeliner --record-config` record every setting that describes the image, but not the Python version's checks that an imported component is new enough, because this port has no such checks to record.
 * `linux.mountinfo --mount-format` joins a Python set, so its column order changes between two Python runs. This port lists the mount options first and the filesystem options after, in the order the kernel holds them.
 * `frameworkinfo` and `isfinfo` describe the tool rather than the image, so they report this port's own layers, plugins and symbol files.
-* `windows.dumpfiles` does not leave behind the partial files the Python version creates before it discovers it cannot read them. The tables agree, the directories differ by those files.
 * The line in `--help` naming the cache directory names this port's own cache.
 
 ## To do
 
 Everything below is ported and builds, but has not been run against real evidence yet:
 
-- [ ] Test the 23 macOS plugins against a real Mac capture. All 23 were read line by line against the Python source, and every type, member and symbol they touch was checked against the 129 published Darwin symbol files covering 10.10 to 10.15, so the version fallbacks are known to be complete. What is left is a real Mac image to run them on.
-- [ ] Test 32 bit images. All the verification so far used 64 bit captures, so the Intel32 and PAE paging paths have only unit test coverage.
-- [ ] Test the other image formats. Only VMware and LiME captures have been used, so the crash dump, AVML, QEMU, ELF core and Xen layers are still unproven on real files.
-- [ ] Test more kernel versions. One Windows 10 19045 and one Linux 6.8 capture is a narrow base, and plugins that read version specific structures are where a port is most likely to drift.
+- [ ] Test the 23 macOS plugins against a real Mac capture. All 23 were read line by line against the Python source, and every type, member and symbol they touch was checked against the 129 published Darwin symbol files covering 10.6 to 10.15, so the version fallbacks are known to be complete. What is left is a real Mac image to run them on.
+- [ ] Test the remaining image formats. Raw, VMware, LiME and Windows crash dump captures have all been used, so the AVML, QEMU, ELF core and Xen layers are the ones still unproven on real files.
+- [ ] Test more kernel versions. Windows XP, Windows 10 19041 and 19045, Linux 3.2 and Linux 6.8 is still a narrow base, and plugins that read version specific structures are where a port is most likely to drift.
 - [ ] Add the arrow and parquet renderers. They are accepted on the command line and refused, which is what the Python version does when its table library is missing.
 
 ## Credit

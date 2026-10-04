@@ -1,5 +1,3 @@
-//! Report the configuration a run resolved to.
-//!
 //! Everything a run worked out for itself (which layers were stacked, where the
 //! kernel is, which page table its address space was built on) is written out
 //! in the form that would rebuild it, so an image identified once can be opened
@@ -15,6 +13,8 @@ use crate::framework::context::{ConfigValue, Configuration, Context};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Runs the automagics and both prints and outputs configuration in the output
+/// directory.
 pub struct ConfigWriter;
 
 impl Plugin for ConfigWriter {
@@ -136,7 +136,10 @@ pub fn describe_layer(
     {
         entries.push((
             format!("{prefix}.location"),
-            json_string(&format!("file://{}", file.location().display())),
+            json_string(&format!(
+                "file://{}",
+                crate::framework::symbols::intermed::absolute(file.location()).display()
+            )),
         ));
         entries.push((
             format!("{prefix}.class"),

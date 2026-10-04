@@ -1,5 +1,3 @@
-//! List drivers the kernel has unloaded.
-//!
 //! Windows keeps a small ring of recently unloaded drivers for crash analysis.
 //! A driver that ran and then unloaded leaves no other trace, so this is often
 //! the only record that it was ever present.
@@ -17,6 +15,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::conversion::wintime_value;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Lists the unloaded kernel modules.
 pub struct UnloadedModules;
 
 impl Plugin for UnloadedModules {
@@ -74,9 +73,9 @@ impl Plugin for UnloadedModules {
             .unwrap_or(8)
             == 8;
 
-        // The kernel records how many slots of the ring it has used. A count
-        // beyond any plausible number means the field was smeared, and the
-        // whole ring is read instead.
+        // The kernel records how many slots of the ring it has used. Bring
+        // down to default when smear is present: some samples had this
+        // completely broken.
         let counter_type = if sixty_four_bit {
             "unsigned long long"
         } else {
@@ -102,8 +101,9 @@ impl Plugin for UnloadedModules {
             return Ok(grid);
         }
 
-        // The entry type is not in the kernel's own symbols. It ships as its
-        // own small file, which refers back to the kernel's types.
+        // Creates a symbol table for the unloaded modules. The entry type is
+        // not in the kernel's own symbols: it ships as its own small file,
+        // which refers back to the kernel's types.
         let table = if sixty_four_bit {
             "unloadedmodules-x64"
         } else {
@@ -134,8 +134,12 @@ impl Plugin for UnloadedModules {
             };
             let (start, end) = (start & mask, end & mask);
 
-            // A real entry names a page-aligned range inside kernel space and
-            // carries a time. Anything else is an unused or smeared slot.
+            // Mass testing led to dozens of samples backtracing on this
+            // plugin when accessing members of modules coming out of this
+            // list. Given how often temporary drivers load and unload on
+            // Win10+, the chance for smear is very high, so a real entry has
+            // to name a page-aligned range inside kernel space and carry a
+            // time. Anything else is an unused or smeared slot.
             if time <= 1024
                 || start <= kernel_space_start
                 || start & 0xFFF != 0

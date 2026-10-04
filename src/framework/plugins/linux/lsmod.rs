@@ -1,5 +1,3 @@
-//! List the kernel modules loaded on a Linux system.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -12,6 +10,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, Requiremen
 use crate::framework::renderers::{Column, TreeGrid};
 use crate::framework::symbols::linux::list_modules;
 
+/// Lists loaded kernel modules.
 pub struct Lsmod;
 
 impl Plugin for Lsmod {

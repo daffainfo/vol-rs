@@ -1,4 +1,18 @@
-//! Finding the Windows kernel, and the symbol file that describes it.
+//! Windows symbol loader based on PDB signatures.
+//!
+//! Looks for all Intel translation layers and scans each of them for a pdb
+//! signature. When found, a search for a corresponding Intermediate Format data
+//! file is carried out and if found an appropriate symbol space is
+//! automatically loaded.
+//!
+//! Once a specific kernel PDB signature has been found, a virtual address for
+//! the loaded kernel is determined by one of two methods. The first method
+//! assumes a specific mapping from the kernel's physical address to its virtual
+//! address (typically the kernel is loaded at its physical location plus a
+//! specific offset). The second method searches for a particular structure that
+//! lists the kernel module's virtual address, its size (not checked) and the
+//! module's name. This value is then used if one was not found using the
+//! previous method.
 //!
 //! A Windows kernel carries a record naming the PDB file it was built with: the
 //! bytes `RSDS`, a GUID, an age, and a file name. Finding that record identifies
@@ -177,6 +191,37 @@ fn decode_record(data: &[u8], offset: u64) -> Option<KernelCandidate> {
     })
 }
 
+/// Every kernel debug record a layer holds, in address order.
+///
+/// Unlike [`pdbname_scan`] this does not look for the image each record belongs
+/// to: a listing of the records themselves does not need it.
+pub fn pdb_records(context: &Arc<Context>, layer_name: &str) -> Result<Vec<KernelCandidate>> {
+    let layer = context.layers.get(layer_name)?;
+    let names = KERNEL_MODULE_NAMES
+        .iter()
+        .map(|name| format!("{name}\\.pdb"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let scanner = RegExScanner::new(&format!("(?s-u)RSDS.{{20}}({names})\x00"))?;
+
+    let mut hits: Vec<u64> = Vec::new();
+    scan_layer(layer.as_ref(), &context.layers, &scanner, None, |offset| {
+        hits.push(offset)
+    })?;
+    hits.sort_unstable();
+
+    let mut found = Vec::new();
+    for hit in hits {
+        let Ok(data) = layer.read(&context.layers, hit, 64, true) else {
+            continue;
+        };
+        if let Some(candidate) = decode_record(&data, hit) {
+            found.push(candidate);
+        }
+    }
+    Ok(found)
+}
+
 /// Find the debug record naming one of `names` inside a range of a layer.
 ///
 /// A module names the database describing it in a record somewhere inside its
@@ -219,9 +264,9 @@ pub fn scan_for_record(
 
 /// Find the kernel and where it is loaded.
 ///
-/// The methods are tried in the order the reference implementation uses, which
-/// runs from the cheapest and most reliable to a full scan of the address
-/// space.
+/// Returns the offset where a valid kernel has been found. The methods are
+/// tried in the order the reference implementation uses, which runs from the
+/// cheapest and most reliable to a full scan of the address space.
 pub fn find_kernel(
     context: &Arc<Context>,
     virtual_layer: &str,
@@ -416,6 +461,7 @@ fn method_offset(
     None
 }
 
+/// The kernel address held just after the `KDBG` marker.
 fn method_kdbg_offset(
     context: &Arc<Context>,
     virtual_layer: &str,
@@ -424,6 +470,8 @@ fn method_kdbg_offset(
     method_offset(context, virtual_layer, physical_layer, b"KDBG", 8)
 }
 
+/// The kernel address held in the structure that lists the kernel module's
+/// virtual address, its size and the module's name.
 fn method_module_offset(
     context: &Arc<Context>,
     virtual_layer: &str,

@@ -1,4 +1,5 @@
-//! Attributing a kernel address to the module that owns it.
+//! Kernel modules related utilities: attributing a kernel address to the
+//! module that owns it.
 //!
 //! The `check_*` plugins all work the same way: read a table of function
 //! pointers the kernel dispatches through, and report which module each entry
@@ -14,7 +15,10 @@ use crate::error::Result;
 use crate::framework::context::{Context, Module};
 use crate::framework::symbols::linux::list_modules;
 
-/// One loaded module's address range.
+/// Used to track the name and boundary of a kernel module.
+///
+/// The starting and end addresses are masked once when the range is built, so
+/// that a lookup does not have to mask them on every call.
 #[derive(Debug, Clone)]
 pub struct ModuleRange {
     pub name: String,
@@ -29,6 +33,12 @@ impl ModuleRange {
 }
 
 /// An index of loaded modules plus the kernel's own symbols.
+///
+/// Built by running the module gathering techniques and aggregating the
+/// results, which is designed not to operate any inter-plugin results triage:
+/// the main kernel list, the sysfs `/sys/modules` objects, a memory scan, and
+/// the kernel itself so that plugins can determine when function pointers
+/// reference the kernel.
 pub struct ModuleResolver {
     modules: Vec<ModuleRange>,
     /// The kernel image itself, spanning `_text` to `_etext`.
@@ -148,6 +158,11 @@ impl ModuleResolver {
     }
 
     /// Where the kernel image starts, if its bounds were found.
+    ///
+    /// The boundaries of the module allocation area come from `mod_tree` on
+    /// kernels >= 5.19 (58d208de3e8d87dbe196caf0b57cc58c7a3836ca) and from
+    /// `module_addr_min` for 2.6.27 <= kernel < 5.19
+    /// (3a642e99babe0617febb6f402e1e063479f489db).
     pub fn kernel_base(&self) -> Option<u64> {
         self.kernel_range.as_ref().map(|range| range.base)
     }
@@ -156,7 +171,13 @@ impl ModuleResolver {
         &self.modules
     }
 
-    /// The module owning `address`, if a loaded one does.
+    /// Determine if a target address lies in a module memory space.
+    ///
+    /// Returns the module where the provided address lies: the first memory
+    /// module in which the address fits.
+    ///
+    /// Kernel documentation: the `within_module` and `within_module_mem_type`
+    /// functions.
     pub fn module_for(&self, address: u64) -> Option<&ModuleRange> {
         let index = self.modules.partition_point(|module| module.base <= address);
         if index == 0 {
@@ -166,11 +187,12 @@ impl ModuleResolver {
         candidate.contains(address).then_some(candidate)
     }
 
-    /// The kernel symbol whose range contains `address`.
+    /// Searches between the start and end address of the kernel module using
+    /// the target address, returning the symbol name of the address provided.
     ///
     /// Unlike an exact lookup this answers "which function is this inside",
-    /// which is what a stack walk needs: a return address points into the middle
-    /// of a function, not at its entry.
+    /// which is what a stack walk needs: a return address points into the
+    /// middle of a function, not at its entry.
     pub fn symbol_containing(&self, address: u64) -> Option<String> {
         let relative = (address.wrapping_sub(self.shift)) & self.mask;
         let index = self.sorted.partition_point(|(start, _)| *start <= relative);

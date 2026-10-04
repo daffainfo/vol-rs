@@ -77,7 +77,7 @@ impl RegistryHive {
         let inner = hive.member("Hive").unwrap_or_else(|_| hive.clone());
 
         // A hive says so in its header. Anything else is not one, however it
-        // came to be on the list.
+        // came to be on the list. TODO: Check the checksum.
         let signature = inner
             .member("Signature")
             .and_then(|value| value.as_u64())
@@ -89,41 +89,49 @@ impl RegistryHive {
             ));
         }
 
-        let storage = inner.member("Storage")?;
+        // Each store's length bounds the cell indices it holds. A hive whose
+        // storage cannot be read is given the widest bound instead of being
+        // rejected, which is what the reference implementation does.
+        let lengths = inner.member("Storage").and_then(|storage| {
+            let stable = storage
+                .index(STORAGE_STABLE)
+                .and_then(|area| area.member("Length"))
+                .and_then(|length| length.as_u64())?;
+            let volatile = storage
+                .index(STORAGE_VOLATILE)
+                .and_then(|area| area.member("Length"))
+                .and_then(|length| length.as_u64())?;
+            Ok((stable, volatile))
+        });
+        let (maximum_stable, maximum_volatile) =
+            lengths.unwrap_or((0x7FFF_FFFF, 0x7FFF_FFFF));
 
-        let maximum_stable = storage
-            .index(STORAGE_STABLE)
-            .and_then(|area| area.member("Length"))
-            .and_then(|length| length.as_u64())
-            .unwrap_or(0);
-        let maximum_volatile = storage
-            .index(STORAGE_VOLATILE)
-            .and_then(|area| area.member("Length"))
-            .and_then(|length| length.as_u64())
-            .unwrap_or(0);
-
-        if maximum_stable == 0 && maximum_volatile == 0 {
-            return Err(VolatilityError::layer(
-                &name,
-                "Hive has no storage; it is probably not a valid _CMHIVE",
-            ));
-        }
-
-        // The base block holds the root cell index. A hive whose base block is
-        // paged out can still be walked if the root is recoverable elsewhere,
-        // so a failure here is not fatal.
+        // The base block holds the root cell index, but only where the block
+        // really is one. A hive whose header is paged out, or holds something
+        // else, starts at the index every hive file starts at.
         let root_cell = inner
             .member("BaseBlock")
             .and_then(|block| block.dereference())
-            .and_then(|block| block.member("RootCell"))
-            .and_then(|cell| cell.as_u64())
+            .ok()
+            .filter(|block| {
+                block
+                    .member("Signature")
+                    .and_then(|signature| signature.bytes())
+                    .map(|bytes| bytes.starts_with(b"regf"))
+                    .unwrap_or(false)
+            })
+            .and_then(|block| block.member("RootCell").ok())
+            .and_then(|cell| cell.as_u64().ok())
             .unwrap_or(0x20);
 
         let hive_name = read_hive_name(&hive);
 
-        // Windows 10 gave the registry a process of its own, and most hives
-        // are mapped there rather than in kernel space, so their bins are read
-        // through its page tables.
+        // Win10 17063 introduced the Registry process to map most hives. Check
+        // if it exists and use it as the base layer, since most hives are
+        // mapped there rather than in kernel space and their bins are read
+        // through its page tables. Upstream duplicates the active process walk
+        // here rather than pulling in the pslist plugin, since that causes
+        // problems.
         let base_layer = registry_process_layer(&context, &hive).unwrap_or(base_layer);
 
         Ok(Self {
@@ -149,14 +157,41 @@ impl RegistryHive {
     }
 
     /// The cell index of the hive's root key.
+    /// Returns the offset for the root cell in this hive.
     pub fn root_cell_offset(&self) -> u64 {
         self.root_cell
     }
 
-    /// The last cell index the hive's stable store holds, which is what says
-    /// whether a listed subkey belongs to this hive at all.
+    /// The highest cell index the layer admits, which is what says whether a
+    /// listed subkey belongs to this hive at all.
+    ///
+    /// The top bit marks the volatile store, so this bound is above every
+    /// index the stable store can hold. The reference implementation computes
+    /// it the same way, and so rejects a subkey only where the index is wider
+    /// than 31 bits.
     pub fn maximum_index(&self) -> u64 {
+        0x8000_0000 | self.maximum_volatile
+    }
+
+    /// How much of the stable store the hive actually has, which is how much
+    /// of it there is to write out.
+    pub fn stable_length(&self) -> u64 {
         self.maximum_stable
+    }
+
+    /// The layer the hive's blocks are read from.
+    pub fn base_layer(&self) -> &str {
+        &self.base_layer
+    }
+
+    /// Where the hive's own file header sits in the base layer.
+    pub fn base_block(&self) -> Option<u64> {
+        let inner = self.hive.member("Hive").unwrap_or_else(|_| self.hive.clone());
+        inner
+            .member("BaseBlock")
+            .and_then(|block| block.pointer_value())
+            .ok()
+            .filter(|address| *address != 0)
     }
 
     fn maximum_for(&self, volatile: bool) -> u64 {
@@ -169,6 +204,7 @@ impl RegistryHive {
 
     /// Translate a cell index into an address in the base layer.
     fn translate(&self, offset: u64) -> Result<u64> {
+        // Ignore the volatile bit when determining maxaddr validity.
         let volatile = mask_bits(offset, 31, 31) >> 31 != 0;
         let index = offset & 0x7FFF_FFFF;
 
@@ -242,6 +278,7 @@ fn read_hive_name(hive: &Object) -> Option<String> {
 }
 
 impl DataLayer for RegistryHive {
+    /// Return a mask that allows for the volatile bit to be set.
     fn address_mask(&self) -> u64 {
         // A cell index is a full 32-bit value whose top bit says which store
         // it belongs to. Narrowing it to the size of the hive would strip that
@@ -266,9 +303,10 @@ impl DataLayer for RegistryHive {
     }
 
     fn maximum_address(&self) -> u64 {
-        self.maximum_stable
+        self.maximum_index()
     }
 
+    /// Whether the range reads. This is passed to the lower layers for now.
     fn is_valid(&self, layers: &LayerContainer, offset: u64, length: u64) -> bool {
         match self.mapping(layers, offset, length, false) {
             Ok(entries) => entries
@@ -282,6 +320,11 @@ impl DataLayer for RegistryHive {
         vec![self.base_layer.clone()]
     }
 
+    /// Returns the translated offset without checking bounds within the HBIN.
+    ///
+    /// The check runs into issues when pages are swapped on large HBINs, and
+    /// did not seem to find any errors on single page HBINs while dramatically
+    /// slowing performance.
     fn mapping(
         &self,
         _layers: &LayerContainer,

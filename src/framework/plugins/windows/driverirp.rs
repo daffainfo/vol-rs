@@ -1,5 +1,3 @@
-//! Report each driver's IRP dispatch routines.
-//!
 //! A driver publishes a table of handlers, one per I/O request type. A rootkit
 //! that hooks a driver replaces entries in this table, so a handler pointing
 //! outside the owning driver's own image is worth attention.
@@ -18,6 +16,7 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::resolver::ModuleCollection;
 use crate::framework::symbols::windows::{kernel_space_start, object_name};
 
+/// List IRPs for drivers in a particular windows memory image.
 pub struct DriverIrp;
 
 /// The IRP major function codes, in table order.
@@ -83,7 +82,8 @@ impl Plugin for DriverIrp {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         // Attributing each handler to its owning module is what makes a hooked
-        // driver visible, so the index is built once for the whole run.
+        // driver visible, so the index is built once for the whole run. A
+        // handler below the start of kernel space is smear.
         let collection = ModuleCollection::build(&context, &kernel)?;
         let kernel_start = kernel_space_start(&context, &kernel);
 

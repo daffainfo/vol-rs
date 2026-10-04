@@ -1,5 +1,3 @@
-//! Windows plugins.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -203,6 +201,37 @@ pub fn process_offset(
         .unwrap_or(virtual_offset)
 }
 
+/// Calculate the physical offset from the virtual offset of a process.
+///
+/// # Args
+///
+/// * `context` - The context containing layers and modules information.
+/// * `kernel` - The module whose layer contains the process memory.
+/// * `process` - The process object for which to calculate the physical offset.
+///
+/// # Returns
+///
+/// The physical offset of the process. Upstream maps the offset through the
+/// kernel's layer whatever layer the process was found in, so a process the
+/// pool scan found in physical memory faults here rather than translating.
+pub fn physical_offset_from_virtual(
+    context: &std::sync::Arc<Context>,
+    kernel: &Module,
+    process: &crate::framework::symbols::windows::Process,
+) -> crate::error::Result<u64> {
+    let layer = context.layers.get(&kernel.layer_name)?;
+    let mapping = layer.mapping(&context.layers, process.object.offset(), 0, false)?;
+    mapping
+        .first()
+        .map(|entry| entry.mapped_offset)
+        .ok_or_else(|| {
+            crate::error::VolatilityError::layer(
+                &kernel.layer_name,
+                "The process offset maps nowhere",
+            )
+        })
+}
+
 /// Load a symbol table beside the kernel's, and register a module for it.
 ///
 /// The GUI subsystem's structures live in `win32k`, whose symbols are a
@@ -253,14 +282,22 @@ pub fn selected_processes(
 ) -> crate::error::Result<Vec<crate::framework::symbols::windows::Process>> {
     let filter = crate::framework::plugins::pid_filter(config);
     match config.get_int("offset").filter(|offset| *offset != 0) {
+        // Filter based on the physical offset of the process.
         Some(offset) => {
             let offset = offset as u64;
-            Ok(
+            let mut selected = Vec::new();
+            for process in
                 crate::framework::plugins::windows::psscan::scan_processes(context, kernel)?
-                    .into_iter()
-                    .filter(|process| process_offset(context, process, true) == offset)
-                    .collect(),
-            )
+            {
+                // Upstream compares the physical address each scanned process
+                // translates to, through the kernel's own layer, and guards
+                // none of it. Where the scan works in physical memory that
+                // translation faults on the first process.
+                if physical_offset_from_virtual(context, kernel, &process)? == offset {
+                    selected.push(process);
+                }
+            }
+            Ok(selected)
         }
         None => Ok(
             crate::framework::symbols::windows::list_processes(context, kernel)?

@@ -1,5 +1,17 @@
 //! The tree grid: the single output format every plugin produces.
 //!
+//! The structure of a TreeGrid is designed to maintain the structure of the
+//! tree in a single object. For this reason each node does not hold its
+//! children, they are managed by the top level object. This leaves the nodes as
+//! simple data carriers and prevents them being used to manipulate the tree as
+//! a whole. This is a data structure, and is not expected to be modified much
+//! once created.
+//!
+//! Carrying the children under the parent makes recursion easier, but then
+//! every node is its own little tree and must have all the supporting tree
+//! functions. It also allows for a node to be present in several different
+//! trees, and to create cycles.
+//!
 //! A plugin yields rows, each at some depth in a tree, with one value per
 //! declared column. Renderers then turn that into text, CSV, JSON or anything
 //! else without needing to know what the plugin was doing.
@@ -96,7 +108,7 @@ fn layer_dump(bytes: &[u8], missing: &[usize], width: usize) -> String {
     output
 }
 
-/// Why a cell has no value.
+/// Represents values which are not present for some reason.
 ///
 /// Distinguishing these matters: "we could not read the memory" is a different
 /// statement from "this field does not apply to this row", and analysts read
@@ -164,15 +176,20 @@ pub enum Value {
     WideText(Vec<u8>),
     /// A run of wide strings, one per line.
     MultiString(Vec<u8>),
-    /// Bytes shown as plain space-separated hex, which is what a disassembly
-    /// column falls back to when no instruction decoder is available.
+    /// Bytes shown as plain space-separated hex.
     HexPairs(Vec<u8>),
+    /// Bytes a plugin asked to be shown as a dump even though the column holds
+    /// text, which upstream expresses as `MultiTypeData(show_hex=True)`. It
+    /// reads the same as a hex dump but is written as quoted text in JSON.
+    MultiTypeHex(Vec<u8>),
     /// A point in time, held as a UTC timestamp.
     DateTime(chrono::DateTime<chrono::Utc>),
     /// A timestamp with no timezone attached, which upstream builds only in
     /// `mac.pslist` and renders without a zone name.
     NaiveDateTime(chrono::NaiveDateTime),
-    /// A raw byte block to be disassembled by the renderer.
+    /// A raw byte block the renderer disassembles. The architecture names the
+    /// decoder to use, and a name that is not one of the four upstream knows
+    /// leaves the column empty, which is what an unset architecture does there.
     Disassembly {
         data: Vec<u8>,
         offset: u64,
@@ -218,6 +235,12 @@ impl Value {
     pub fn is_absent(&self) -> bool {
         matches!(self, Value::Absent(_))
     }
+
+    /// Whether the value is specifically the one saying the field does not
+    /// apply, which some tests distinguish from the other absent kinds.
+    pub fn is_not_applicable(&self) -> bool {
+        matches!(self, Value::Absent(AbsentValue::NotApplicable))
+    }
 }
 
 impl fmt::Display for Value {
@@ -247,7 +270,9 @@ impl fmt::Display for Value {
                     write!(f, "{}", hex_dump(bytes, 16))
                 }
             }
-            Value::HexDump(bytes) => write!(f, "{}", hex_dump(bytes, 16)),
+            Value::HexDump(bytes) | Value::MultiTypeHex(bytes) => {
+                write!(f, "{}", hex_dump(bytes, 16))
+            }
             Value::LayerDump { bytes, missing } => {
                 write!(f, "{}", layer_dump(bytes, missing, 16))
             }
@@ -288,8 +313,16 @@ impl fmt::Display for Value {
                 // space where the zone name would be.
                 write!(f, "{} ", when.format("%Y-%m-%d %H:%M:%S%.6f"))
             }
-            Value::Disassembly { data, offset, .. } => {
-                write!(f, "{} bytes at {offset:#x}", data.len())
+            Value::Disassembly {
+                data,
+                offset,
+                architecture,
+            } => {
+                write!(
+                    f,
+                    "{}",
+                    crate::framework::disassembly::text(data, *offset, architecture)
+                )
             }
         }
     }
@@ -312,6 +345,10 @@ fn write_number(
 
 /// The type a column holds, declared up front so renderers can align and
 /// serialise sensibly.
+///
+/// The four byte-carrying types read the same in a table but not in JSON,
+/// where upstream writes each one through a renderer of its own, so they are
+/// told apart here as upstream tells them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Bool,
@@ -319,7 +356,14 @@ pub enum ColumnType {
     UInt,
     Float,
     Str,
+    /// Bytes with no further intent.
     Bytes,
+    /// Bytes shown as a dump with their text alongside.
+    HexBytes,
+    /// Bytes that are meant to be text but may not be.
+    MultiTypeData,
+    /// Bytes read from a layer, with the gaps in it marked.
+    LayerData,
     DateTime,
     Disassembly,
 }
@@ -358,12 +402,27 @@ impl Column {
         Self::new(name, ColumnType::Bytes)
     }
 
+    pub fn hex_bytes(name: impl Into<String>) -> Self {
+        Self::new(name, ColumnType::HexBytes)
+    }
+
+    pub fn multi_type_data(name: impl Into<String>) -> Self {
+        Self::new(name, ColumnType::MultiTypeData)
+    }
+
+    pub fn layer_data(name: impl Into<String>) -> Self {
+        Self::new(name, ColumnType::LayerData)
+    }
+
     pub fn datetime(name: impl Into<String>) -> Self {
         Self::new(name, ColumnType::DateTime)
     }
 }
 
-/// One row: how deep it sits in the tree, and its cells.
+/// Class representing a particular node in a tree grid.
+///
+/// A node carries how deep it sits in the tree and its cells, and nothing
+/// else.
 #[derive(Debug, Clone)]
 pub struct Row {
     /// Zero for a top-level row. Each increment nests it under the previous row
@@ -383,13 +442,25 @@ impl Row {
     }
 }
 
-/// A plugin's complete output.
+/// Class providing the interface for a TreeGrid (which contains TreeNodes)
+///
+/// The structure of a TreeGrid is designed to maintain the structure of the
+/// tree in a single object. For this reason each TreeNode does not hold its
+/// children, they are managed by the top level object. This leaves the Nodes
+/// as simple data carriers and prevents them being used to manipulate the
+/// tree as a whole. This is a data structure, and is not expected to be
+/// modified much once created.
 #[derive(Debug, Clone)]
 pub struct TreeGrid {
     columns: Vec<Column>,
     rows: Vec<Row>,
     /// How row production ended, when it ended early.
     truncation: Truncation,
+    /// What stopped it, where the reason was an error worth reporting.
+    failure: Option<crate::error::VolatilityError>,
+    /// Whether the run ended in a way that leaves a non-zero exit status
+    /// without a report of its own, as an uncaught failure does upstream.
+    aborted: bool,
 }
 
 /// How a listing ended.
@@ -407,6 +478,9 @@ pub enum Truncation {
     /// The error was caught and reported: the last row is left unterminated and
     /// a blank line follows on standard output.
     Reported,
+    /// The plugin gave up before it had anything to render, so not even the
+    /// header is written.
+    Discarded,
 }
 
 impl TreeGrid {
@@ -415,6 +489,8 @@ impl TreeGrid {
             columns,
             rows: Vec::new(),
             truncation: Truncation::None,
+            failure: None,
+            aborted: false,
         }
     }
 
@@ -426,6 +502,38 @@ impl TreeGrid {
     /// Record that row production stopped on a reported error.
     pub fn mark_truncated_reported(&mut self) {
         self.truncation = Truncation::Reported;
+    }
+
+    /// Record that row production stopped on this error, which is described
+    /// once the rows produced so far have been written.
+    pub fn mark_failed(&mut self, error: crate::error::VolatilityError) {
+        self.truncation = Truncation::Reported;
+        self.failure = Some(error);
+    }
+
+    /// The error that stopped row production, where one was recorded.
+    pub fn failure(&self) -> Option<&crate::error::VolatilityError> {
+        self.failure.as_ref()
+    }
+
+    /// Record that the run died part-way through without a report of its own,
+    /// which is what an uncaught failure upstream looks like: the output stops
+    /// where it stopped and the exit status says it failed.
+    pub fn mark_aborted(&mut self) {
+        self.truncation = Truncation::Abrupt;
+        self.aborted = true;
+    }
+
+    /// Whether the run ended that way.
+    pub fn aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// Record that the plugin gave up with nothing to show, which upstream
+    /// leaves as an empty listing with no header at all and a failing status.
+    pub fn mark_discarded(&mut self) {
+        self.truncation = Truncation::Discarded;
+        self.aborted = true;
     }
 
     pub fn truncation(&self) -> Truncation {

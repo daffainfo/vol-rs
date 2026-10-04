@@ -1,5 +1,3 @@
-//! Scan each task's mapped memory with YARA rules.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -11,11 +9,10 @@ use crate::framework::plugins::common::yarascan::{requirements as yara_requireme
 use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::linux::list_tasks;
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Scans all virtual memory areas for tasks using yara.
 pub struct VmaYaraScan;
-
-/// Scan in blocks rather than reading a whole mapping at once.
 
 impl Plugin for VmaYaraScan {
     fn name(&self) -> &'static str {
@@ -45,31 +42,50 @@ impl Plugin for VmaYaraScan {
             Column::int("PID"),
             Column::string("Rule"),
             Column::string("Component"),
-            Column::bytes("Value"),
+            Column::layer_data("Value"),
         ]
     }
 
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
-        let rules = Rules::from_config(config)?;
         let filter = pid_filter(config);
         let mut grid = TreeGrid::new(self.columns());
 
-        for task in list_tasks(&context, &kernel, false)? {
-            let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
+        // The reference implementation reads the rules only once it has begun
+        // producing rows, so the header is already out when it finds none, and
+        // what follows is an uncaught failure rather than a reported one.
+        let rules = match Rules::from_config(config) {
+            Ok(rules) => rules,
+            Err(error) => {
+                eprintln!("ERROR    volatility3.plugins.yarascan: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
             }
-            // A task with no address space of its own is a kernel thread and
-            // has nothing mapped to search.
+        };
+
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
+            let Ok(pid) = task.pid() else { continue };
+            // attempt to create a process layer for each task and skip those
+            // that cannot (e.g. kernel threads)
             let Ok(Some(layer)) = task.process_layer() else {
                 continue;
             };
 
             let mapped = task.vmas().unwrap_or_default();
 
-            // Each area is read whole and scanned in one piece, so a match is
-            // never split by where the reading happened to stop.
+            // Creates a map of start/end addresses for each virtual memory
+            // area in the task. Upstream scans the VMA data in one contiguous
+            // block rather than in fixed-size pieces, so each area is read
+            // whole here too and a match is never split by where the reading
+            // happened to stop.
             let mut regions: Vec<(u64, u64)> = Vec::new();
             for vma in &mapped.areas {
                 let (Ok(start), Ok(end)) = (vma.start(), vma.end()) else {
@@ -128,4 +144,5 @@ impl Plugin for VmaYaraScan {
 }
 
 /// A region larger than this is data rather than anything worth searching.
+/// 1 GB.
 const SANITY_LIMIT: u64 = 1024 * 1024 * 1024;

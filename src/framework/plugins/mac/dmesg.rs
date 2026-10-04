@@ -1,4 +1,9 @@
-//! Recover the kernel message buffer.
+//! Online documentation:
+//!   - <https://github.com/apple-open-source/macos/blob/master/xnu/bsd/sys/msgbuf.h>
+//!   - <https://github.com/apple-open-source/macos/blob/ea4cd5a06831aca49e33df829d2976d6de5316ec/xnu/bsd/kern/subr_log.c#L751>
+//!
+//! Volatility 2 plugin:
+//!   - <https://github.com/volatilityfoundation/volatility/blob/master/volatility/plugins/mac/dmesg.py>
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -12,9 +17,8 @@ use crate::framework::plugins::mac::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Prints the kernel log buffer.
 pub struct Dmesg;
-
-/// The buffer is a few hundred kilobytes at most. A larger size means the
 
 impl Plugin for Dmesg {
     fn name(&self) -> &'static str {
@@ -41,17 +45,24 @@ impl Plugin for Dmesg {
         let kernel = kernel_module(&context, config)?;
 
         // The buffer is described by a small header holding its address, its
-        // size, and how far the kernel has written into it.
+        // max size, and the write index of the msg_bufc circular buffer.
         let buffer = context
             .object_from_symbol(&kernel, "msgbufp", None)?
             .dereference()?;
 
+        // The buffer is a few hundred kilobytes at most. A larger size means
+        // the header was misread, but upstream reads whatever it says and so
+        // does this, so the two agree on a smeared header as well as a sound
+        // one.
         let size = buffer.member("msg_size")?.as_u64()?;
         let mut written = buffer.member("msg_bufx")?.as_u64()?;
         let text = pointer_to_string(&buffer.member("msg_bufc")?, size as usize)?;
 
-        // The buffer is written in a circle, so once it has filled up the
-        // oldest message is the one at the write position.
+        // msg_bufc is circular, meaning that if its size exceeds msg_size,
+        // msg_bufx will point to the beginning of the buffer and start
+        // overwriting. Avoid OOB reads. We directly take into account the case
+        // where the write buffer did a loop, as older messages will start at
+        // the msg_bufx offset (not overwritten yet).
         if written > size {
             written = 0;
         }

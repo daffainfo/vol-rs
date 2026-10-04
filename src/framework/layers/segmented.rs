@@ -17,7 +17,10 @@ use crate::framework::layers::{DataLayer, LayerContainer, MappingEntry};
 /// `offset`, stored at `mapped_offset` in the base layer.
 ///
 /// `mapped_length` differs from `length` only for non-linear layers, where the
-/// stored bytes are compressed or otherwise encoded.
+/// stored bytes are compressed or otherwise encoded. A non-linear layer also
+/// decides whether larger segments are in use and the offsets within them
+/// should be tracked linearly, which is what a layer that does no decoding
+/// wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
     pub offset: u64,
@@ -46,7 +49,14 @@ impl Segment {
     }
 }
 
-/// A layer defined by a sorted segment table over a single base layer.
+/// A class to handle a single run-based layer-to-layer mapping.
+///
+/// In the documentation "mapped address" or "mapped offset" refers to an
+/// offset once it has been mapped to the underlying layer. A mapping searches
+/// for the appropriate segment containing the current offset, and where that
+/// segment starts before it, brings the lower edge up to the right place.
+///
+/// The table is sorted by offset, so a lookup can binary search it.
 pub struct SegmentedLayer {
     /// The class the reference implementation would build for this format.
     kind: &'static str,
@@ -131,8 +141,9 @@ impl SegmentedLayer {
 
     /// The segment covering `address`, if any.
     fn find_segment(&self, address: u64) -> Option<&Segment> {
-        // partition_point gives the first segment starting after `address`, so
-        // the candidate is the one immediately before it.
+        // Find the rightmost value less than or equal to the address:
+        // partition_point gives the first segment starting after it, so the
+        // candidate is the one immediately before that.
         let index = self.segments.partition_point(|s| s.offset <= address);
         if index == 0 {
             return None;

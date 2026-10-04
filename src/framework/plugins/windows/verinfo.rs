@@ -1,5 +1,3 @@
-//! Report the version stamped into each loaded module.
-//!
 //! A module whose version does not match what Windows shipped, or which has no
 //! version at all, is worth a second look.
 //!
@@ -18,6 +16,7 @@ use crate::framework::plugins::windows::dlllist::load_order_modules;
 use crate::framework::symbols::windows::list_processes;
 use crate::framework::symbols::windows::pe;
 
+/// Lists version information from PE files.
 pub struct VerInfo;
 
 /// How much of each image to search for the version structure. It lives in the
@@ -70,10 +69,10 @@ impl Plugin for VerInfo {
         let filter = pid_filter(config);
         let mut grid = TreeGrid::new(self.columns());
 
-        // The kernel's own modules come first. They belong to no process.
-        // Each is read through a session's address space, and the sessions are
-        // taken one at a time and never revisited, so only the first few
-        // modules are ever looked up at all.
+        // The kernel's own modules come first: the pid and process are not
+        // applicable for kernel modules. Each is read through a session layer,
+        // and the sessions are taken one at a time and never revisited, so only
+        // the first few modules are ever looked up at all.
         let mut sessions = crate::framework::plugins::windows::modules::session_layers(
             &context, &kernel, &physical,
         )
@@ -205,7 +204,7 @@ impl Plugin for VerInfo {
     }
 }
 
-/// The four parts of an image's product version, as cells.
+/// Get File and Product version information from PE files, as cells.
 ///
 /// The version lives in a resource of its own, so the image's headers are read
 /// first to find where its resources are, and only that part of it is read.
@@ -238,7 +237,7 @@ fn version_cells(
 }
 
 /// The product version an image records.
-fn image_version(
+pub fn image_version(
     context: &Arc<Context>,
     layer: &str,
     base: u64,
@@ -254,12 +253,23 @@ fn image_version(
     let headers = context.layers.read(layer, base, 0x1000, true).ok()?;
     let (resources, length) = pe::resource_directory(&headers)?;
 
+    // The resources are part of the image, so a directory claiming to run
+    // past the end of it is a smeared header rather than a directory. Reading
+    // what it asks for would mean allocating whatever number it holds.
+    let room = size.max(0x1000).min(MAXIMUM_IMAGE);
+    if resources as usize >= room {
+        return None;
+    }
+    let length = (length as usize).min(room - resources as usize);
+
     let region = context
         .layers
-        .read(layer, base + resources as u64, length as usize, true)
+        .read(layer, base + resources as u64, length, true)
         .ok()?;
-    // An image often carries the version in several languages. The first that
-    // can be read is the one reported.
+    // An image often carries the version in several languages, and each is
+    // parsed in turn with the last that could be read winning, which is the
+    // order the parser upstream relies on settles on.
+    let mut result = None;
     for (address, blob_length) in pe::resource_data(&region, pe::RT_VERSION) {
         // The block is named by an address relative to the image, which is
         // usually inside the resources that were just read.
@@ -268,26 +278,33 @@ fn image_version(
             Some(start) if start + blob_length as usize <= region.len() => {
                 region[start..start + blob_length as usize].to_vec()
             }
-            _ => match context
-                .layers
-                .read(layer, base + address as u64, blob_length as usize, true)
-            {
-                Ok(blob) => blob,
-                Err(_) => continue,
-            },
+            _ => {
+                // The same bound applies to a block named from outside the
+                // resources that were read.
+                let blob_length = (blob_length as usize).min(room);
+                match context
+                    .layers
+                    .read(layer, base + address as u64, blob_length, true)
+                {
+                    Ok(blob) => blob,
+                    Err(_) => continue,
+                }
+            }
         };
         if let Some(version) = pe::version_info(&blob) {
-            return Some(version);
+            result = Some(version);
         }
     }
-    None
+    result
 }
 
-/// The next session layer that can reach an address.
+/// Given a base address and a list of layer names, find a layer that can access
+/// the specified address.
 ///
-/// The sessions are consumed as they are examined: one that has already been
-/// looked at is not looked at again, which is why a listing resolves only its
-/// first few modules.
+/// Returns the layer name, or `None` if no layers that contain the base address
+/// can be found. The sessions are consumed as they are examined: one that has
+/// already been looked at is not looked at again, which is why a listing
+/// resolves only its first few modules.
 fn find_session_layer(
     context: &Arc<Context>,
     sessions: &mut std::vec::IntoIter<(u64, String)>,
@@ -301,11 +318,9 @@ fn find_session_layer(
     None
 }
 
-/// Find a module's version by searching the image for its version resource.
-///
-/// The resource records the file's original name, so the name is looked for
-/// and the fixed version block just before it is read.
-fn search_version_info(
+/// Searches for an original filename, then tracks back to find the
+/// VS_VERSION_INFO and read the fixed version information structure.
+pub fn search_version_info(
     context: &Arc<Context>,
     layer: &str,
     file_name: &str,

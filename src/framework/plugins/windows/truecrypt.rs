@@ -1,5 +1,3 @@
-//! Search memory for TrueCrypt passphrases.
-//!
 //! TrueCrypt keeps the passphrase in a structure that records its own length
 //! ahead of the characters. That length/content pairing is distinctive enough
 //! to find by scanning, since a plausible length followed by exactly that many
@@ -18,8 +16,11 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::pe;
 
+/// TrueCrypt Cached Passphrase Finder
 pub struct Passphrase;
 
+/// TrueCrypt maximum password length is 64
+/// (see TrueCrypt/Common/Password.h).
 const MAX_LENGTH: u32 = 64;
 
 impl Plugin for Passphrase {
@@ -52,8 +53,9 @@ impl Plugin for Passphrase {
         let minimum = config.get_int("min-length").unwrap_or(5) as u32;
         let mut grid = TreeGrid::new(self.columns());
 
-        // Cached passphrases live in the driver's own data section, so there
-        // is nothing to look at unless the driver is loaded.
+        // Scans the TrueCrypt kernel module for cached passphrases. They live
+        // in the driver's own data section, so there is nothing to look at
+        // unless the driver is loaded.
         let Some(base) = truecrypt_base(&context, &kernel) else {
             return Ok(grid);
         };
@@ -78,8 +80,10 @@ impl Plugin for Passphrase {
             return Ok(grid);
         };
 
-        // Each candidate is a length followed by that many characters, then a
-        // terminator and the padding that keeps the structure aligned.
+        // Looking at `Length` in TrueCrypt/Common/Password.h::Password
+        // struct: each candidate is a length followed by that many characters,
+        // then a terminator and the padding that keeps the structure
+        // aligned.
         let mut position = 0usize;
         while position + 4 <= data.len() {
             let length = i32::from_le_bytes(data[position..position + 4].try_into().unwrap());
@@ -93,12 +97,14 @@ impl Plugin for Passphrase {
             let Some(text) = data.get(text_at..text_at + length) else {
                 continue;
             };
-            // The passphrase is printable throughout.
+            // TrueCrypt/Common/Password.c permits chars in the range
+            // [0x20, 0x7F).
             if !text.iter().all(|byte| (0x20..0x7F).contains(byte)) {
                 continue;
             }
-            // Three zero bytes follow the terminator, keeping the structure
-            // aligned. Anything else means this is not one.
+            // TrueCrypt/Common/Password.h::Password struct is padded with
+            // 3 zero bytes to keep 64-byte alignment. Anything else means this
+            // is not one.
             let Some(padding) = data.get(text_at + length + 1..text_at + length + 4) else {
                 continue;
             };

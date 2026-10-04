@@ -1,5 +1,3 @@
-//! Show Mac processes as a tree.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -15,6 +13,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::mac::{list_processes, Proc};
 
+/// Plugin for listing processes in a tree based on their parent process ID.
 pub struct PsTree;
 
 impl Plugin for PsTree {
@@ -53,9 +52,9 @@ impl Plugin for PsTree {
 
         }
 
-        // How deep each process sits, counted by walking up to a parent that
-        // is missing, absent or the process itself. Walking it also records
-        // each process against its parent.
+        // Finds how deep each pid is in the processes list, by walking up to a
+        // parent that is missing, absent or the process itself, and builds the
+        // child/level maps on the way.
         let mut levels: Vec<(u64, usize)> = Vec::new();
         let mut children: HashMap<u64, PythonSet> = HashMap::new();
         let total = processes.len();

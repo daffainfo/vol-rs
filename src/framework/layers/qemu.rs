@@ -1,8 +1,25 @@
-//! QEMU suspend-to-disk (`QEVM`) layer.
+//! A Qemu suspend-to-disk translation layer.
 //!
 //! A QEMU savevm stream is a sequence of sections. The `ram` section carries
 //! guest memory as a list of pages, each prefixed by an address word whose low
 //! bits are flags. Pages may be stored verbatim, or as a single repeated byte.
+//!
+//! See <https://qemu.readthedocs.io/en/latest/devel/memory.html> for more info.
+//! At least the following values could occur for devices using > 3-4 GB RAM:
+//!
+//! | Architecture                   | Reference Code                 | Hole Start | Hole End    |
+//! |--------------------------------|--------------------------------|------------|-------------|
+//! | PC i440FX + PIIX "New Default" | qemu/hw/i386/pc_piix.c:98      | 0xc0000000 | 0x100000000 |
+//! | PC i440FX + PIIX "Old Default" | qemu/hw/i386/pc_piix.c:98      | 0xe0000000 | 0x100000000 |
+//! | PC Q35 + ICH9                  | qemu/hw/i386/pc_q35.c:141      | 0x80000000 | 0x100000000 |
+//! | MicroVM                        | qemu/hw/i386/microvm.c:291     | 0xc0000000 | 0x100000000 |
+//! | Xen                            | qemu/hw/i386/xen/xen-hvm.c:248 | 0xf0000000 | 0x100000000 |
+//!
+//! For now, we assume that the parameter max-ram-below-4g is not set, since
+//! this parameter influences the size and location of the memory gap.
+//! Deviating hole sizes could eventually be detected for Linux by e.g.
+//! scanning for dmesg entries with a regex like
+//! `\[mem (0x[0-9a-f]{4,10})-0x[0-9a-f]{4,10}\] available for PCI devices`.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -52,7 +69,7 @@ struct Page {
     source: PageSource,
 }
 
-/// A QEMU suspend-to-disk layer over the savevm file.
+/// A Qemu suspend-to-disk translation layer.
 pub struct QemuLayer {
     name: String,
     base_layer: String,
@@ -211,6 +228,7 @@ impl QemuLayer {
     }
 
     /// Consume the pages of a RAM section until the end-of-stream flag.
+    /// Recovers the new index and any sections of memory from a ram section.
     fn read_ram_section(
         reader: &mut Reader<'_>,
         pages: &mut Vec<Page>,
@@ -221,6 +239,8 @@ impl QemuLayer {
             if reader.at_end() {
                 return Ok(());
             }
+            // Flags are stored in the n least significant bits, where n equals
+            // the bit-length of pagesize.
             let addr = reader.u64()?;
             let flags = addr & (PAGE_SIZE - 1);
             let address = addr & !(PAGE_SIZE - 1);

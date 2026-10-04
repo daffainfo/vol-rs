@@ -1,8 +1,12 @@
 //! Identifying a Mac image.
 //!
-//! Mac kernels are recognised the same way as Linux ones, by a version banner
-//! that also identifies the exact build, but the banner text and the symbol
+//! Mac symbol loader based on uname signature strings: Mac kernels are
+//! recognised the same way as Linux ones, by a version banner that also
+//! identifies the exact build, but the banner text and the symbol
 //! sub-directory differ.
+//!
+//! Bails out by default unless it can stack properly, and never stacks on top
+//! of an intel layer.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -58,7 +62,8 @@ pub fn detect(
         context.add_symbol_table(table);
 
         // The Mac kernel's page tables are reached through the IdlePML4, whose
-        // symbol address is a physical one already.
+        // symbol address is a physical one already, so no conversion from a
+        // virtual mac address is needed and ASLR is not accounted for here.
         let qualified = crate::framework::symbols::join_name(&table_name, "IdlePML4");
         let Ok(symbol) = context.symbol_space.get_symbol(&qualified) else {
             log::debug!("Symbol file has no IdlePML4; cannot locate page tables");

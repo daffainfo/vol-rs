@@ -1,5 +1,3 @@
-//! List the sockets each task holds open.
-//!
 //! Sockets are reached through the file-descriptor table, so every connection
 //! is reported alongside the process and thread that owns it.
 //!
@@ -22,9 +20,14 @@ use crate::framework::symbols::linux::{
     task_root_readable, Task,
 };
 
+/// Lists all network connections for all processes.
 pub struct Sockstat;
 
 /// Socket family names, indexed by the kernel's AF_ constants.
+///
+/// Even if the sock family is not supported, or the required types are not
+/// present in the symbols, we can still show some general information about
+/// the socket that may be helpful.
 const FAMILIES: &[&str] = &[
     "AF_UNSPEC", "AF_UNIX", "AF_INET", "AF_AX25", "AF_IPX", "AF_APPLETALK",
     "AF_NETROM", "AF_BRIDGE", "AF_ATMPVC", "AF_X25", "AF_INET6", "AF_ROSE",
@@ -221,7 +224,7 @@ impl Plugin for Sockstat {
                 let Some(socket) = socket_of(&inode, &kernel) else {
                     continue;
                 };
-                let Some(details) = describe(&context, &kernel, &socket) else {
+                let Some(details) = describe(&context, &kernel, &socket, namespace) else {
                     continue;
                 };
 
@@ -381,6 +384,7 @@ pub fn describe(
     context: &Arc<Context>,
     kernel: &crate::framework::context::Module,
     socket: &Object,
+    namespace: Option<u64>,
 ) -> Option<SocketDetails> {
     let common = socket.member("__sk_common").ok()?;
     let family_index = common.member("skc_family").ok()?.as_u64().ok()?;
@@ -467,16 +471,23 @@ pub fn describe(
         }
         "AF_INET" | "AF_INET6" => {
             details.protocol = inet_protocol(socket, family_index);
-            details.source_address = inet_address(&common, family_index, true);
+            details.source_address = inet_address(context, &child, &common, family_index, true);
             details.source_port = child
-                .member("inet_sport")
+                .member("sport")
+                .or_else(|_| child.member("inet_sport"))
                 .and_then(|port| port.as_u64())
                 .ok()
                 .map(|port| (port as u16).to_be().to_string());
-            details.destination_address = inet_address(&common, family_index, false);
+            details.destination_address = inet_address(context, &child, &common, family_index, false);
+            // Kernel 3.x packed the two ports together; which member a kernel
+            // has says where the other end's port is kept.
             details.destination_port = common
-                .member("skc_dport")
-                .and_then(|port| port.as_u64())
+                .member("skc_portpair")
+                .and_then(|pair| pair.as_u64())
+                .map(|value| value & 0xFFFF)
+                .or_else(|_| child.member("dport").and_then(|port| port.as_u64()))
+                .or_else(|_| child.member("inet_dport").and_then(|port| port.as_u64()))
+                .or_else(|_| common.member("skc_dport").and_then(|port| port.as_u64()))
                 .ok()
                 .map(|port| (port as u16).to_be().to_string());
             // Only a stream socket has a connection state.
@@ -553,11 +564,11 @@ pub fn describe(
                 .and_then(|value| value.as_i64())
                 .unwrap_or(0);
             // A socket bound to no interface sees them all.
-            details.source_address = Some(if index > 0 {
-                device_name(context, kernel, index).unwrap_or_default()
+            details.source_address = if index > 0 {
+                device_name(context, kernel, index, namespace)
             } else {
-                "ANY".to_string()
-            });
+                Some("ANY".to_string())
+            };
             details.state = Some(generic_state(socket)?);
         }
         "AF_BLUETOOTH" => {
@@ -701,11 +712,59 @@ fn inet_protocol(socket: &Object, family: u64) -> Option<String> {
 }
 
 /// The address on one end of an internet socket.
-fn inet_address(common: &Object, family: u64, source: bool) -> Option<String> {
+///
+/// Where the address is kept moved twice. A v4 address was a member of the
+/// socket itself before kernel 2.6.33 named it `inet_` and 3.x moved it into
+/// the common part; a v6 address lives in the protocol-specific information
+/// until kernel 3.13 moved it into the common part too.
+fn inet_address(
+    context: &Arc<Context>,
+    child: &Object,
+    common: &Object,
+    family: u64,
+    source: bool,
+) -> Option<String> {
     if family == 2 {
-        let member = if source { "skc_rcv_saddr" } else { "skc_daddr" };
-        let raw = common.member(member).ok()?.as_u64().ok()? as u32;
+        let raw = if source {
+            child
+                .member("rcv_saddr")
+                .or_else(|_| child.member("inet_rcv_saddr"))
+                .or_else(|_| common.member("skc_rcv_saddr"))
+                .ok()?
+                .as_u64()
+                .ok()? as u32
+        } else {
+            // A zero address here is treated as absent, so the next place it
+            // might be kept is tried.
+            let numbered = |name: &str| {
+                child
+                    .member(name)
+                    .ok()
+                    .and_then(|value| value.as_u64().ok())
+                    .filter(|value| *value != 0)
+            };
+            numbered("daddr")
+                .or_else(|| numbered("inet_daddr"))
+                .or_else(|| common.member("skc_daddr").ok()?.as_u64().ok())? as u32
+        };
         return Some(convert_ipv4(raw));
+    }
+
+    let member = if source { "saddr" } else { "daddr" };
+    if let Ok(address) = child
+        .member("pinet6")
+        .and_then(|pinet6| pinet6.dereference())
+        .and_then(|pinet6| pinet6.member(member))
+    {
+        // The reference implementation reads the bytes from the layer the
+        // socket itself was built on, which for a socket found by scanning
+        // physical memory is not the layer the pointer refers to. The read
+        // then fails and the address is reported as unavailable.
+        return context
+            .layers
+            .read(child.layer_name(), address.offset(), 16, false)
+            .ok()
+            .map(|bytes| convert_ipv6(&bytes));
     }
     let member = if source { "skc_v6_rcv_saddr" } else { "skc_v6_daddr" };
     let bytes = common.member(member).ok()?.bytes().ok()?;
@@ -772,8 +831,16 @@ fn device_name(
     context: &Arc<Context>,
     kernel: &crate::framework::context::Module,
     index: i64,
+    namespace_id: Option<u64>,
 ) -> Option<String> {
+    // The interfaces considered are only those of the owning task's network
+    // namespace, so a kernel that has nothing to name a namespace by has no
+    // interfaces to report either.
+    let wanted = namespace_id?;
     for namespace in list_net_namespaces(context, kernel).ok()? {
+        if net_namespace_id(&namespace) != Some(wanted) {
+            continue;
+        }
         for device in list_net_devices(kernel, &namespace).unwrap_or_default() {
             if device.index().ok() == Some(index) {
                 return device.name().ok();
@@ -781,6 +848,21 @@ fn device_name(
         }
     }
     None
+}
+
+/// A network namespace's own inode number, which is what names it.
+///
+/// Kernel 3.8 gave namespaces an inode, moving it into `ns` in 3.19.
+fn net_namespace_id(namespace: &Object) -> Option<u64> {
+    if namespace.has_member("proc_inum") {
+        return namespace.member("proc_inum").and_then(|id| id.as_u64()).ok();
+    }
+    namespace
+        .member("ns")
+        .ok()
+        .filter(|ns| ns.has_member("inum"))
+        .and_then(|ns| ns.member("inum").ok())
+        .and_then(|inum| inum.as_u64().ok())
 }
 
 /// A description of the filter attached to a socket.

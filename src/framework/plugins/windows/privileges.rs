@@ -1,5 +1,3 @@
-//! Report the privileges held by each process's token.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,6 +11,7 @@ use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 use crate::framework::symbols::windows::sid_data::privilege;
 
+/// Lists process token privileges
 pub struct Privileges;
 
 impl Plugin for Privileges {
@@ -56,12 +55,13 @@ impl Plugin for Privileges {
             let name = process.image_file_name().unwrap_or_default();
 
             for (luid, present, enabled, default) in process.privileges().unwrap_or_default() {
-                // A bit position the system gives no name to is not a
-                // privilege, whatever the token says about it.
+                // Skip privileges whose bit positions cannot be translated to
+                // a privilege name.
                 let Some((privilege_name, description)) = privilege(luid) else {
                     continue;
                 };
 
+                // Set the attributes
                 let mut attributes = Vec::new();
                 if present {
                     attributes.push("Present");

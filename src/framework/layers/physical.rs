@@ -13,8 +13,10 @@ use memmap2::Mmap;
 use crate::error::{Result, VolatilityError};
 use crate::framework::layers::{DataLayer, LayerContainer};
 
-/// A layer backed by bytes held in memory. Useful for tests and for wrapping
-/// small extracted regions.
+/// A DataLayer class backed by a buffer in memory, designed for testing and
+/// swift data access.
+///
+/// There are no real requirements beyond the buffer itself.
 pub struct BufferLayer {
     name: String,
     buffer: Vec<u8>,
@@ -93,7 +95,14 @@ impl DataLayer for BufferLayer {
     }
 }
 
-/// A layer backed by a file, memory-mapped for fast random access.
+/// a DataLayer backed by a file on the filesystem.
+///
+/// The file is memory mapped, so a read anywhere in it costs the same. The file
+/// is opened on construction so that a file which cannot be opened fails there
+/// rather than at the first read.
+///
+/// FIXME: a write mode would need the mapping opened for writing too.
+/// TODO: implement locking for multi-threading.
 pub struct FileLayer {
     name: String,
     location: PathBuf,

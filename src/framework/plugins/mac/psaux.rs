@@ -1,5 +1,3 @@
-//! Report each process's command line arguments.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,6 +11,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::mac::list_processes;
 
+/// Recovers program command line arguments.
 pub struct PsAux;
 
 impl Plugin for PsAux {
@@ -74,8 +73,8 @@ impl Plugin for PsAux {
                 continue;
             }
 
-            // One more than the count, because the first two entries are
-            // usually the same string twice.
+            // Add one because the first two are usually duplicates, and
+            // refuse an implausible count as smear protection.
             let mut remaining = count + 1;
             if remaining > 1024 {
                 continue;
@@ -135,6 +134,10 @@ impl Plugin for PsAux {
 
 /// The length of `str(bytes)` in Python, which is the representation: a `b`,
 /// the quotes around it, and any escapes inside.
+///
+/// Upstream uses this while dealing with the stupid alignment (leading nulls)
+/// and arg duplication, and also checks for initial duplicates since OS X is
+/// painful.
 ///
 /// One plugin upstream advances through the argument block by this length
 /// rather than by the argument's own, so reproducing its output means

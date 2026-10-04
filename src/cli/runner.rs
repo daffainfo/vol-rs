@@ -74,6 +74,10 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     }
 
     if arguments.plugin.is_none() && !arguments.list_plugins {
+        // Upstream announces itself as soon as the arguments have parsed and
+        // only then complains that no plugin was named, so the announcement
+        // comes out ahead of the complaint.
+        announce(&arguments);
         // The same complaint the reference implementation makes, with the same
         // usage block above it.
         eprint!("{}", crate::cli::help::framework_usage_block());
@@ -123,10 +127,53 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     }
 
     // Plugin options first, so a failure here is reported before the expensive
-    // work of stacking and scanning an image.
-    for (name, value) in args::build_plugin_config(plugin.as_ref(), &arguments.plugin_args)? {
+    // work of stacking and scanning an image. argparse refuses a missing
+    // required option before anything else happens, the announcement included,
+    // and names all of them in one complaint under the plugin's own usage.
+    let settings = match args::build_plugin_config(plugin.as_ref(), &arguments.plugin_args) {
+        Ok(settings) => settings,
+        Err(VolatilityError::Unrecognised(names)) => {
+            // Upstream's main parser is the one that complains, so the
+            // framework's own usage block is the one shown, and the words are
+            // the ones the command line carried.
+            let mut words: Vec<String> = Vec::new();
+            for name in &names {
+                if let Some((_, tokens)) = arguments
+                    .plugin_tokens
+                    .iter()
+                    .find(|(option, _)| option == name)
+                {
+                    words.extend(tokens.iter().cloned());
+                } else {
+                    words.push(format!("--{name}"));
+                }
+            }
+            eprint!("{}", crate::cli::help::framework_usage_block());
+            eprintln!("vol: error: unrecognized arguments: {}", words.join(" "));
+            return Ok(2);
+        }
+        Err(VolatilityError::Unsatisfied(missing)) => {
+            let named: Vec<String> = missing
+                .iter()
+                .map(|name| format!("--{}", name.replace('_', "-")))
+                .collect();
+            eprint!("{}", crate::cli::help::plugin_usage_block(plugin.as_ref()));
+            eprintln!(
+                "vol {}: error: the following arguments are required: {}",
+                plugin.name(),
+                named.join(", ")
+            );
+            return Ok(2);
+        }
+        Err(error) => return Err(error),
+    };
+    for (name, value) in settings {
         config.set(name, value);
     }
+
+    // Upstream announces itself once the arguments are settled and before
+    // anything is opened.
+    announce(&arguments);
 
     // Settings given directly on the command line, as `path=value`.
     for extension in &arguments.extend {
@@ -182,31 +229,40 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     }
 
     if let Some(image) = &image {
-        if !image.is_file() {
-            return Err(VolatilityError::Io(format!(
-                "Image file '{}' does not exist",
-                image.display()
-            )));
+        if !image.exists() {
+            // The reference implementation turns the name into a URL first, so
+            // the path it names back is the absolute one.
+            let full = std::fs::canonicalize(image)
+                .unwrap_or_else(|_| {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(image))
+                        .unwrap_or_else(|_| image.clone())
+                });
+            eprint!("{}", crate::cli::help::framework_usage_block());
+            eprintln!("vol: error: File does not exist: {}", full.display());
+            return Ok(2);
         }
 
-        // Identifying the operating system means scanning the whole image, and
-        // a plugin that needs no kernel symbols gains nothing from it. Skipping
-        // it there avoids two full passes over a multi-gigabyte capture.
-        let needs_kernel = plugin.needs_kernel() || plugin.requirements().iter().any(|requirement| {
-            matches!(
-                requirement.kind,
-                crate::framework::plugins::RequirementKind::Kernel
-            ) || (matches!(
-                requirement.kind,
-                crate::framework::plugins::RequirementKind::TranslationLayer
-            ) && requirement.architectures.is_some())
-        });
+        // Whether the plugin can run at all without the kernel's symbols. One
+        // that names a layer for a particular architecture needs the kernel's
+        // address space to have been built, and so needs them too.
+        let needs_kernel = plugin.needs_kernel()
+            || plugin.requirements().iter().any(|requirement| {
+                matches!(
+                    requirement.kind,
+                    crate::framework::plugins::RequirementKind::Kernel
+                ) || (matches!(
+                    requirement.kind,
+                    crate::framework::plugins::RequirementKind::TranslationLayer
+                ) && requirement.architectures.is_some())
+            });
 
-        let result = if needs_kernel {
-            automagic::run(&context, image, &finder)?
-        } else {
-            automagic::stack_only(&context, image)?
-        };
+        // The whole chain runs whatever the plugin asked for. A plugin that
+        // names a layer without saying which architecture it wants is still
+        // given the topmost one that was built, so a plugin reading physical
+        // memory only by convention still sees the kernel's address space,
+        // and skipping the search here would hand it the file instead.
+        let result = automagic::run(&context, image, &finder)?;
         for note in &result.notes {
             log::info!("{note}");
         }
@@ -262,28 +318,45 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
                 result.operating_system.as_str()
             )));
         }
+        // A plugin that names the architectures its layer may have cannot run
+        // on an image of another one, and the requirement is reported as unmet
+        // rather than the plugin failing part-way.
+        if let Some(layer) = &result.kernel_layer {
+            let architecture = context
+                .layers
+                .get(layer)
+                .ok()
+                .and_then(|handle| handle.metadata().get("architecture").cloned());
+            let mismatched = plugin.requirements().iter().any(|requirement| {
+                matches!(
+                    requirement.kind,
+                    crate::framework::plugins::RequirementKind::Kernel
+                        | crate::framework::plugins::RequirementKind::TranslationLayer
+                ) && match (requirement.architectures, &architecture) {
+                    (Some(wanted), Some(found)) => !wanted.contains(&found.as_str()),
+                    _ => false,
+                }
+            });
+            if mismatched {
+                return Err(report_unsatisfied(&plugin, false));
+            }
+        }
+
         // Only a plugin that asked for the kernel is blocked by its absence.
         // One that reads raw memory runs regardless.
         if needs_kernel && required != OperatingSystem::Any && result.kernel_module.is_none() {
-            // Without symbols the plugin cannot run at all, and the failure it
-            // would otherwise report, an unsatisfied `--kernel` argument, says
-            // nothing about what is actually missing.
-            return Err(VolatilityError::Other(format!(
-                "No symbols were found for this image, so '{}' cannot run.\n\
-                 Put a symbol pack for the kernel in {}, pass --symbol-dirs, or set {}.\n\
-                 Searched:\n  {}",
-                plugin.name(),
-                crate::framework::symbols::intermed::data_directory()
-                    .map(|data| data.join("symbols").display().to_string())
-                    .unwrap_or_else(|| "the symbols directory".to_string()),
-                crate::framework::symbols::intermed::SYMBOL_PATH_VARIABLE,
+            // Where the symbols were looked for is useful and upstream does
+            // not say it, so it goes in the log rather than in the report.
+            log::info!(
+                "No symbols were found for this image. Searched: {}",
                 finder
                     .base_paths()
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
-                    .join("\n  "),
-            )));
+                    .join(", ")
+            );
+            return Err(report_unsatisfied(&plugin, false));
         }
     } else if plugin.requirements().iter().any(|requirement| {
         matches!(
@@ -292,32 +365,9 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
                 | crate::framework::plugins::RequirementKind::TranslationLayer
         )
     }) {
-        return Err(VolatilityError::Other(format!(
-            "Plugin '{}' needs an image; supply one with --file",
-            plugin.name()
-        )));
-    }
-
-    // A missing required option is reported before anything reaches standard
-    // output, so a failed invocation writes no partial table.
-    for requirement in plugin.requirements() {
-        if !requirement.optional && config.get(&requirement.name).is_none() {
-            return Err(VolatilityError::Other(format!(
-                "the following arguments are required: --{}",
-                requirement.name
-            )));
-        }
-    }
-
-    // Upstream announces itself before the table. Matching that keeps piped
-    // output identical. A machine-readable format keeps its stream clean, so
-    // the announcement goes to the error stream instead.
-    let (major, minor, patch) = crate::interface_version();
-    let banner = format!("Volatility 3 Framework {major}.{minor}.{patch}");
-    if arguments.format.structured() {
-        eprintln!("{banner}");
-    } else {
-        println!("{banner}");
+        // Nothing was opened, so nothing the plugin asked of an image can be
+        // met. A plugin that asked for nothing runs regardless.
+        return Err(report_unsatisfied(&plugin, true));
     }
 
     // These two formats are the reference implementation's optional ones, which
@@ -348,7 +398,15 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
             .map_err(|error| VolatilityError::Io(format!("{error}")))?;
     }
 
-    let grid = plugin.run(context, &config)?;
+    // A failure from here on is a failure of the analysis rather than of the
+    // arguments, and is described in full before the run gives up.
+    let grid = match plugin.run(context, &config) {
+        Ok(grid) => grid,
+        Err(error) => {
+            report_exception(&error);
+            return Ok(1);
+        }
+    };
 
     // Which rows and columns to show is settled once the grid's columns are
     // known, since a filter may name a column.
@@ -381,8 +439,30 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    renderer.render(&grid, &mut handle)?;
+    if let Err(error) = renderer.render(&grid, &mut handle) {
+        let _ = handle.flush();
+        drop(handle);
+        report_exception(&error);
+        return Ok(1);
+    }
     handle.flush()?;
+    drop(handle);
+
+    // A run that died part-way has already written everything it is going to
+    // write, and says so only through its exit status.
+    if grid.aborted() {
+        return Ok(1);
+    }
+
+    // A listing that stopped on an error has already written the blank line
+    // that follows it, and the failure itself is described afterwards.
+    if grid.truncation() == crate::framework::renderers::Truncation::Reported {
+        match grid.failure() {
+            Some(error) => describe_exception(error),
+            None => describe_exception(&VolatilityError::Other(String::new())),
+        }
+        return Ok(1);
+    }
 
     Ok(0)
 }
@@ -539,5 +619,230 @@ fn list_plugins(registry: &PluginRegistry, filter: Option<&str>) {
             plugin.description(),
             width = width
         );
+    }
+}
+
+/// Report that a plugin's requirements could not be satisfied, the way the
+/// reference implementation reports it.
+///
+/// The requirements are named by their path within the configuration, and each
+/// kind that failed adds a block saying what to check. The announcement and
+/// the blocks go to standard output, so a run that fails this way looks the
+/// same whichever stream is being read.
+fn report_unsatisfied(
+    plugin: &Arc<dyn crate::framework::plugins::Plugin>,
+    missing_location: bool,
+) -> VolatilityError {
+    use crate::framework::plugins::RequirementKind;
+
+    // The configuration path a plugin's own settings live under is named for
+    // the class, which is the last part of the plugin's name.
+    let class = plugin.name().rsplit('.').next().unwrap_or(plugin.name());
+    let base = format!("plugins.{class}");
+
+    let mut paths: Vec<(String, String)> = Vec::new();
+    let mut translation_failed = false;
+    let mut symbols_failed = false;
+    for requirement in plugin.requirements() {
+        match requirement.kind {
+            // A module requirement is two requirements underneath: the layer
+            // the module sits in and the symbols describing it. Neither
+            // carries a description of its own.
+            RequirementKind::Kernel => {
+                paths.push((format!("{base}.{}.layer_name", requirement.name), String::new()));
+                paths.push((
+                    format!("{base}.{}.symbol_table_name", requirement.name),
+                    String::new(),
+                ));
+                translation_failed = true;
+                symbols_failed = true;
+            }
+            RequirementKind::TranslationLayer => {
+                paths.push((
+                    format!("{base}.{}", requirement.name),
+                    requirement.description.clone(),
+                ));
+                translation_failed = true;
+            }
+            _ => {}
+        }
+    }
+
+    // The reference implementation starts the report with a blank line.
+    let mut text = String::from("\n");
+    for (path, description) in &paths {
+        text.push_str(&format!("Unsatisfied requirement {path}: {description}\n"));
+    }
+    if translation_failed {
+        text.push_str(
+            "\nA translation layer requirement was not fulfilled.  Please verify that:\n\
+             \tA file was provided to create this layer (by -f, --single-location or by config)\n\
+             \tThe file exists and is readable\n\
+             \tThe file is a valid memory image and was acquired cleanly\n",
+        );
+    }
+    if symbols_failed {
+        text.push_str(
+            "\nA symbol table requirement was not fulfilled.  Please verify that:\n\
+             \tThe associated translation layer requirement was fulfilled\n\
+             \tYou have the correct symbol file for the requirement\n\
+             \tThe symbol file is under the correct directory or zip file\n\
+             \tThe symbol file is named appropriately or contains the correct banner\n\n",
+        );
+    }
+    // This goes to standard output whatever the renderer, which is where the
+    // reference implementation prints it.
+    print!("{text}");
+
+    // Without an image there was nothing for the stacking step to work on, and
+    // the reference implementation says so before listing what went unmet.
+    if missing_location {
+        eprintln!(
+            "WARNING  volatility3.framework.plugins: Automagic exception occurred: \
+             ValueError: Unable to run LayerStacker, single_location parameter not provided"
+        );
+    }
+    VolatilityError::Unsatisfied(paths.into_iter().map(|(path, _)| path).collect())
+}
+
+/// Report a failure the way the reference implementation reports one.
+///
+/// It names the kind of problem, gives what detail the failure carries, lists
+/// what usually causes it, and says that nothing more will follow. The two
+/// blank lines on standard output come first, so a half written table is
+/// separated from the report that explains why it stopped.
+pub fn report_exception(error: &VolatilityError) {
+    print!("\n\n");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    describe_exception(error);
+}
+
+/// The description of a failure, written where the blank lines that precede it
+/// have already gone out: a listing that stopped part-way has written them as
+/// part of its own output.
+pub fn describe_exception(error: &VolatilityError) {
+    const BUG: &str = "Please re-run with -vvv and file a bug with the output at \
+                       https://github.com/volatilityfoundation/volatility3/issues";
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    let (general, detail, causes): (String, String, Vec<String>) = match error {
+        VolatilityError::InvalidAddress {
+            layer,
+            address,
+            message,
+            fault,
+        } => {
+            let general = "Volatility was unable to read a requested page:".to_string();
+            match fault {
+                crate::error::AddressFault::Swapped { .. } => (
+                    general,
+                    format!("Swap error {address:#x} in layer {layer} ({message})"),
+                    vec![
+                        "No suitable swap file having been provided (locate and provide the correct swap file)".to_string(),
+                        "An intentionally invalid page (operating system protection)".to_string(),
+                    ],
+                ),
+                crate::error::AddressFault::Paged { .. } => (
+                    general,
+                    format!("Page error {address:#x} in layer {layer} ({message})"),
+                    vec![
+                        "Memory smear during acquisition (try re-acquiring if possible)".to_string(),
+                        "An intentionally invalid page lookup (operating system protection)".to_string(),
+                        "A bug in the plugin/volatility3 (re-run with -vvv and file a bug)".to_string(),
+                    ],
+                ),
+                crate::error::AddressFault::Invalid => (
+                    general,
+                    format!("{address:#x} in layer {layer} ({message})"),
+                    vec![
+                        "The base memory file being incomplete (try re-acquiring if possible)".to_string(),
+                        "Memory smear during acquisition (try re-acquiring if possible)".to_string(),
+                        "An intentionally invalid page lookup (operating system protection)".to_string(),
+                        "A bug in the plugin/volatility3 (re-run with -vvv and file a bug)".to_string(),
+                    ],
+                ),
+            }
+        }
+        VolatilityError::Symbol {
+            table,
+            name,
+            message,
+        } => (
+            "Volatility experienced a symbol-related issue:".to_string(),
+            format!(
+                "{}!{}: {message}",
+                table.clone().unwrap_or_default(),
+                name.clone().unwrap_or_default()
+            ),
+            vec![
+                "An invalid symbol table".to_string(),
+                "A plugin requesting a bad symbol".to_string(),
+                "A plugin requesting a symbol from the wrong table".to_string(),
+            ],
+        ),
+        VolatilityError::SymbolSpace(message) => (
+            "Volatility experienced an issue related to a symbol table:".to_string(),
+            message.clone(),
+            vec![
+                "An invalid symbol table".to_string(),
+                "A plugin requesting a bad symbol".to_string(),
+                "A plugin requesting a symbol from the wrong table".to_string(),
+            ],
+        ),
+        VolatilityError::Layer { layer, message } => (
+            format!("Volatility experienced a layer-related issue: {layer}"),
+            message.clone(),
+            vec![format!("A faulty layer implementation. {BUG}")],
+        ),
+        VolatilityError::MissingModule(module) => (
+            format!("Volatility could not import a necessary module: {module}"),
+            format!("{error}"),
+            vec![
+                "A required python module is not installed (install the module and re-run)"
+                    .to_string(),
+            ],
+        ),
+        VolatilityError::Render(message) => (
+            "Volatility experienced an issue when rendering the output:".to_string(),
+            message.clone(),
+            vec!["An invalid renderer option, such as no visible columns".to_string()],
+        ),
+        VolatilityError::VersionMismatch(message) => (
+            "A version mismatch was detected between two components:".to_string(),
+            message.clone(),
+            vec![
+                "An outdated API caller, such as a method.".to_string(),
+                BUG.to_string(),
+            ],
+        ),
+        _ => (
+            "Volatility encountered an unexpected situation.".to_string(),
+            String::new(),
+            vec![BUG.to_string()],
+        ),
+    };
+
+    eprintln!("{general}");
+    eprintln!("{detail}\n");
+    for cause in &causes {
+        eprintln!("\t* {cause}");
+    }
+    eprintln!("\nNo further results will be produced");
+}
+
+/// Write the framework's own announcement.
+///
+/// A machine-readable format keeps its own stream clean, so the announcement
+/// goes to the error stream instead, which is the choice upstream makes from
+/// the renderer's `structured_output`.
+fn announce(arguments: &args::Arguments) {
+    let (major, minor, patch) = crate::interface_version();
+    let banner = format!("Volatility 3 Framework {major}.{minor}.{patch}");
+    if arguments.format.structured() {
+        eprintln!("{banner}");
+    } else {
+        println!("{banner}");
     }
 }

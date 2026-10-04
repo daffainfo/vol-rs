@@ -1,5 +1,3 @@
-//! Find Mac memory regions that look like injected code.
-//!
 //! As on Windows, code is normally mapped from a file. A region that is both
 //! writable and executable, with nothing backing it, was written at runtime.
 //!
@@ -15,6 +13,7 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::list_processes;
 
+/// Lists process memory ranges that potentially contain injected code.
 pub struct Malfind;
 
 /// How many bytes of each region to show.
@@ -44,8 +43,8 @@ impl Plugin for Malfind {
             Column::new("Start", ColumnType::UInt),
             Column::new("End", ColumnType::UInt),
             Column::string("Protection"),
-            Column::bytes("Hexdump"),
-            Column::string("Disasm"),
+            Column::hex_bytes("Hexdump"),
+            Column::new("Disasm", ColumnType::Disassembly),
         ]
     }
 
@@ -53,6 +52,20 @@ impl Plugin for Malfind {
         let kernel = kernel_module(&context, config)?;
         let filter = pid_filter(config);
         let mut grid = TreeGrid::new(self.columns());
+
+        // determine if we're on a 32 or 64 bit kernel, which decides the
+        // decoder.
+        let architecture = if context
+            .symbol_space
+            .table(&kernel.symbol_table_name)
+            .map(|table| table.pointer_size())
+            .unwrap_or(8)
+            == 4
+        {
+            "intel"
+        } else {
+            "intel64"
+        };
 
         for process in list_processes(&context, &kernel)? {
             let Ok(pid) = process.pid() else { continue };
@@ -90,9 +103,11 @@ impl Plugin for Malfind {
                         entry.end().map(Value::hex).unwrap_or_else(|_| Value::unreadable()),
                         Value::string(protection),
                         Value::HexDump(data.clone()),
-                        // Disassembly needs a decoder that is not available,
-                        // so the bytes are shown as they are.
-                        Value::HexPairs(data),
+                        Value::Disassembly {
+                            data,
+                            offset: start,
+                            architecture: architecture.to_string(),
+                        },
                     ],
                 )?;
             }

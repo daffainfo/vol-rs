@@ -1,5 +1,3 @@
-//! Locate the per-processor control regions.
-//!
 //! Each logical processor has a `_KPCR`, and the kernel keeps an array of
 //! pointers to their control blocks. Finding them gives a per-CPU view that
 //! several other analyses build on.
@@ -15,6 +13,7 @@ use crate::framework::plugins::windows::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Print KPCR structure for each processor
 pub struct Kpcrs;
 
 impl Plugin for Kpcrs {
@@ -52,6 +51,13 @@ impl Plugin for Kpcrs {
     }
 }
 
+/// Returns the KPCR structure for each processor
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+///
 /// The processor control region of each processor.
 ///
 /// The kernel keeps an array of pointers to the control blocks, and the region

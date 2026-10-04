@@ -227,7 +227,10 @@ pub struct VersionInfo {
     pub build: u16,
 }
 
-/// The signature opening a `VS_FIXEDFILEINFO` structure.
+/// The signature opening a `VS_FIXEDFILEINFO` structure. It is not checked,
+/// because the parser upstream relies on does not check it either, but a test
+/// builds a well formed block with it.
+#[allow(dead_code)]
 const VS_FIXEDFILEINFO_SIGNATURE: u32 = 0xFEEF_04BD;
 
 /// Recover a module's file version.
@@ -270,17 +273,20 @@ pub fn resource_directory(headers: &[u8]) -> Option<(u32, u32)> {
 /// Every resource of one kind, as where its data lies relative to the image
 /// base and how long it is.
 ///
-/// The directory has three levels (kind, then name, then language), and an
-/// image often carries the same resource in several languages, so all of them
-/// are returned in the order the directory lists them.
+/// The directory has three levels (kind, then name, then language). Only the
+/// first entry of the name level is followed, which is what the parser upstream
+/// relies on does: an image that carries the same kind of resource under two
+/// names has the second ignored, even when the first cannot be read. Within
+/// that one name every language is returned, in the order the directory lists
+/// them.
 pub fn resource_data(region: &[u8], wanted_kind: u32) -> Vec<(u32, u32)> {
     let Some(by_kind) = directory_entry(region, 0, Some(wanted_kind)) else {
         return Vec::new();
     };
 
     let mut found = Vec::new();
-    for by_name in directory_entries(region, by_kind) {
-        for by_language in directory_entries(region, by_name) {
+    if let Some(by_name) = directory_entries(region, by_kind).first() {
+        for by_language in directory_entries(region, *by_name) {
             let (Ok(address), Ok(size)) = (
                 read_u32(region, by_language),
                 read_u32(region, by_language + 4),
@@ -340,48 +346,68 @@ fn directory_entry(region: &[u8], directory: usize, wanted: Option<u32>) -> Opti
 }
 
 pub fn version_info(data: &[u8]) -> Option<VersionInfo> {
-    let needle = VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes();
+    // The resource opens with a VS_VERSION_INFO header: a length, the length
+    // of the value, a type, and then the key naming it, as wide text. The
+    // fixed information follows, aligned to four bytes. Looking for the
+    // signature anywhere instead would find one in whatever else the image
+    // happens to hold, which is why the layout is followed rather than
+    // searched.
+    const KEY: &[u8] = b"V\0S\0_\0V\0E\0R\0S\0I\0O\0N\0_\0I\0N\0F\0O\0\0\0";
+    const HEADER: usize = 6;
 
-    // The structure is 4-byte aligned within the resource section.
-    for at in (0..data.len().saturating_sub(52)).step_by(4) {
-        if data[at..at + 4] != needle {
-            continue;
-        }
-
-        // The product version follows the file version, each packing a high
-        // and a low word with the more significant half second. It is the
-        // product's that is reported.
-        let product_version_ms = read_u32(data, at + 16).ok()?;
-        let product_version_ls = read_u32(data, at + 20).ok()?;
-
-        return Some(VersionInfo {
-            major: (product_version_ms >> 16) as u16,
-            minor: (product_version_ms & 0xFFFF) as u16,
-            product: (product_version_ls >> 16) as u16,
-            build: (product_version_ls & 0xFFFF) as u16,
-        });
+    if data.len() < HEADER + KEY.len() || &data[HEADER..HEADER + KEY.len()] != KEY {
+        return None;
     }
-    None
+    // The fixed information follows the key, aligned to four bytes. Its
+    // signature is not checked: the parser upstream relies on does not check it
+    // either, and takes whatever thirteen words are there.
+    let at = (HEADER + KEY.len() + 3) & !3;
+    if data.len() < at + 52 {
+        return None;
+    }
+
+    // The product version follows the file version, each packing a high and a
+    // low word with the more significant half second. It is the product's that
+    // is reported.
+    let product_version_ms = read_u32(data, at + 16).ok()?;
+    let product_version_ls = read_u32(data, at + 20).ok()?;
+
+    Some(VersionInfo {
+        major: (product_version_ms >> 16) as u16,
+        minor: (product_version_ms & 0xFFFF) as u16,
+        product: (product_version_ls >> 16) as u16,
+        build: (product_version_ls & 0xFFFF) as u16,
+    })
 }
 
 #[cfg(test)]
 mod version_tests {
     use super::*;
 
-    #[test]
-    fn version_info_is_found_by_its_signature() {
-        let mut data = vec![0u8; 256];
-        let at = 64;
-        data[at..at + 4].copy_from_slice(&VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes());
-        // The product version, which is the one reported: 10.0.19041.1288.
-        // The file version before it is deliberately different, so a reader of
-        // the wrong field would be caught.
-        data[at + 8..at + 12].copy_from_slice(&((6u32 << 16) | 3).to_le_bytes());
-        data[at + 12..at + 16].copy_from_slice(&((9600u32 << 16) | 17415).to_le_bytes());
-        data[at + 16..at + 20].copy_from_slice(&((10u32 << 16)).to_le_bytes());
-        data[at + 20..at + 24].copy_from_slice(&((19041u32 << 16) | 1288).to_le_bytes());
+    /// A version resource laid out the way one really is.
+    fn resource(file: (u16, u16, u16, u16), product: (u16, u16, u16, u16)) -> Vec<u8> {
+        let key: &[u8] = b"V\0S\0_\0V\0E\0R\0S\0I\0O\0N\0_\0I\0N\0F\0O\0\0\0";
+        let mut data = vec![0u8; 6];
+        data.extend_from_slice(key);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        data.extend_from_slice(&VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&(((file.0 as u32) << 16) | file.1 as u32).to_le_bytes());
+        data.extend_from_slice(&(((file.2 as u32) << 16) | file.3 as u32).to_le_bytes());
+        data.extend_from_slice(&(((product.0 as u32) << 16) | product.1 as u32).to_le_bytes());
+        data.extend_from_slice(&(((product.2 as u32) << 16) | product.3 as u32).to_le_bytes());
+        data.resize(data.len() + 52, 0);
+        data
+    }
 
-        let version = version_info(&data).unwrap();
+    #[test]
+    fn the_product_version_is_the_one_reported() {
+        // The file version is deliberately different, so a reader of the
+        // wrong field would be caught.
+        let data = resource((6, 3, 9600, 17415), (10, 0, 19041, 1288));
+        let version = version_info(&data).expect("a well formed resource");
         assert_eq!(version.major, 10);
         assert_eq!(version.minor, 0);
         assert_eq!(version.product, 19041);
@@ -389,8 +415,19 @@ mod version_tests {
     }
 
     #[test]
-    fn absent_version_info_is_reported_as_absent() {
-        assert!(version_info(&vec![0u8; 256]).is_none());
+    fn a_signature_somewhere_else_is_not_a_version() {
+        // Bytes that happen to hold the signature are not a resource, and
+        // upstream reports nothing for an image whose resource it cannot
+        // parse.
+        let mut data = vec![0u8; 256];
+        data[64..68].copy_from_slice(&VS_FIXEDFILEINFO_SIGNATURE.to_le_bytes());
+        assert!(version_info(&data).is_none());
+    }
+
+    #[test]
+    fn a_resource_cut_short_is_not_a_version() {
+        let data = resource((1, 0, 0, 0), (1, 0, 0, 0));
+        assert!(version_info(&data[..20]).is_none());
     }
 }
 
@@ -443,6 +480,10 @@ pub fn imports(data: &[u8]) -> Option<Vec<Import>> {
 
     let pointer_size = if header.is_64bit { 8 } else { 4 };
     let mut results = Vec::new();
+    // A descriptor whose table yields nothing is an error, and the parser
+    // upstream relies on gives up on the whole directory after a handful of
+    // them, reporting nothing at all for the image.
+    let mut errors = 0usize;
 
     // The descriptor array ends with an all-zero entry.
     for index in 0..1024 {
@@ -471,6 +512,7 @@ pub fn imports(data: &[u8]) -> Option<Vec<Import>> {
         // nothing from it is reported.
         let mut library_imports = Vec::new();
         let mut usable = true;
+        let mut invalid = 0usize;
 
         for slot in 0..4096 {
             let name_entry = names_at + slot * pointer_size;
@@ -515,6 +557,21 @@ pub fn imports(data: &[u8]) -> Option<Vec<Import>> {
                 }
             };
 
+            // A name of anything but a linker's characters is skipped rather
+            // than reported, and a table made only of those is not one.
+            if function.as_deref() == Some("*invalid*") {
+                if invalid > 1000 && invalid == slot {
+                    usable = false;
+                    break;
+                }
+                invalid += 1;
+                continue;
+            }
+            // An entry naming neither a function nor an ordinal says nothing.
+            if function.is_none() && ordinal == 0 {
+                continue;
+            }
+
             library_imports.push(Import {
                 library: library.clone(),
                 function,
@@ -525,9 +582,19 @@ pub fn imports(data: &[u8]) -> Option<Vec<Import>> {
             });
         }
 
+        if errors > 5 {
+            break;
+        }
+        if !usable {
+            library_imports.clear();
+        }
+        if library_imports.is_empty() {
+            errors += 1;
+            continue;
+        }
         // A library with no name of its own is not reported at all, however
         // many entries its table holds.
-        if usable && !library.is_empty() {
+        if !library.is_empty() {
             results.extend(library_imports);
         }
     }
@@ -603,6 +670,8 @@ pub fn exports(data: &[u8]) -> Option<Vec<Export>> {
 }
 
 /// The largest image this framework will write back out.
+///
+/// No legitimate PE is going to be larger than this.
 pub const MAX_EXTRACTION_SIZE: u32 = 1024 * 1024 * 256;
 
 /// Rebuild the file a mapped image came from.
@@ -610,9 +679,12 @@ pub const MAX_EXTRACTION_SIZE: u32 = 1024 * 1024 * 256;
 /// The loader spreads a file's sections out to the alignment the image asks
 /// for, so writing the mapped bytes straight out produces a file whose section
 /// table no longer describes it. Each section header is rewritten to point at
-/// where the section now sits, and the recorded image base is set to where the
-/// image was actually found, which is what makes the result loadable by tools
-/// that expect a file on disk.
+/// where the section now sits, and the PE image base is fixed before the
+/// initial view of the data is yielded, which is what makes the result loadable
+/// by tools that expect a file on disk.
+///
+/// It doesn't matter if a section's recorded size is too big, because it'll get
+/// overwritten by the later sections.
 pub fn reconstruct(
     context: &std::sync::Arc<crate::framework::context::Context>,
     layer: &str,
@@ -632,8 +704,10 @@ pub fn reconstruct(
         ));
     }
 
-    // The machine, not the optional header's own magic, is what decides which
-    // shape of optional header this is.
+    // This checks if we need a PE32+ header: the machine, not the optional
+    // header's own magic, is what decides which shape of optional header this
+    // is. The 32- and 64-bit extensions behave the same way, but the underlying
+    // structure is different.
     let machine = read_u16(&nt_headers, 4)?;
     let is_64bit = machine == 0x8664;
     let number_of_sections = read_u16(&nt_headers, 6)? as usize;

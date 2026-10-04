@@ -16,6 +16,16 @@ fn main() -> ExitCode {
 
     match vol_rs::cli::run_cli(&argv) {
         Ok(code) => ExitCode::from(code as u8),
+        // A requirement the run could not meet has already been described in
+        // full, so all that is left to say is which ones they were.
+        Err(vol_rs::VolatilityError::Unsatisfied(paths)) => {
+            let listed: Vec<String> = paths.iter().map(|path| format!("'{path}'")).collect();
+            eprintln!(
+                "Unable to validate the plugin requirements: [{}]",
+                listed.join(", ")
+            );
+            ExitCode::from(1)
+        }
         Err(error) => {
             eprintln!("Error: {error}");
             ExitCode::from(1)

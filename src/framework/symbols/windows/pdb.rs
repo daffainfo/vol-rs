@@ -19,6 +19,10 @@ use crate::error::{Result, VolatilityError};
 const SYMBOL_SERVER: &str = "http://msdl.microsoft.com/download/symbols";
 
 /// The header every database of this generation begins with.
+///
+/// The header is verified and gives the version of the file. The stream table
+/// is then recovered through the root table, which is itself reached through
+/// the root table index table.
 const MSF_MAGIC: &[u8] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0";
 
 /// The public symbols a database describes.
@@ -60,6 +64,10 @@ impl PublicSymbols {
 ///
 /// The identifier is the one the binary carries, so a database fetched once is
 /// good for every image built from the same binary.
+///
+/// Upstream takes the first result of its search for the intermediate file, and
+/// if none are found, attempts to download the pdb, convert it and try again
+/// before constructing the appropriate symbol table.
 pub fn fetch(name: &str, guid: &str, age: u32) -> Result<Vec<u8>> {
     // Asked to stay offline, the fetch does not happen at all.
     if crate::framework::cache::offline() {
@@ -141,10 +149,12 @@ pub fn public_symbols(data: &[u8]) -> Result<PublicSymbols> {
             "The database describes no section headers".to_string(),
         ));
     }
+    // Skip past sections we don't care about to get to the DBG header.
     let section_stream = read_u16(&debug, optional_at + 10)?;
     let sections = image_sections(&file.stream(section_stream as usize)?);
 
-    // Every public symbol names a section and an offset within it.
+    // Every public symbol names a section and an offset within it. For speed
+    // we don't use the framework to read this (usually sizeable) data.
     let symbols = file.stream(symbol_stream)?;
     let mut addresses = HashMap::new();
     let mut at = 0usize;
@@ -154,7 +164,9 @@ pub fn public_symbols(data: &[u8]) -> Result<PublicSymbols> {
             break;
         }
         let kind = read_u16(&symbols, at + 2)?;
-        // S_PUB32: flags, offset, segment, then the name.
+        // S_PUB32: flags, offset, segment, then the name. Upstream reads v2
+        // symbols as a pascal-string and v3 as a c-string; only v3 names are
+        // read here. The length itself is added on to reach the next record.
         const PUBLIC_SYMBOL: u16 = 0x110E;
         if kind == PUBLIC_SYMBOL && length >= 12 {
             let offset = read_u32(&symbols, at + 8)?;

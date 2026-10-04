@@ -1,5 +1,3 @@
-//! Report the sessions on the system and which processes belong to them.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -14,6 +12,8 @@ use crate::framework::renderers::conversion::wintime_value;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 
+/// lists Processes with Session information extracted from Environmental
+/// Variables
 pub struct Sessions;
 
 impl Plugin for Sessions {
@@ -56,8 +56,8 @@ impl Plugin for Sessions {
         let mut timeline = Timeline::new();
         for row in self.run(context, config).ok()?.rows() {
             let values = &row.values;
-            // Without the user context the entry says no more than a process
-            // listing already does.
+            // Only add to timeline if we have the username. Without the user
+            // context PSList output is identical.
             if values[4].is_absent() {
                 continue;
             }
@@ -77,9 +77,10 @@ impl Plugin for Sessions {
         let physical = physical_layer(config);
         let filter = pid_filter(config);
 
-        // Rows are grouped by session and reported a session at a time, in the
-        // order the sessions were first seen. A process whose session cannot
-        // be named groups with nothing, not even another such process.
+        // Collect all the values as we will want to group them later. Rows are
+        // grouped by session and reported a session at a time, in the order the
+        // sessions were first seen. A process whose session cannot be named
+        // groups with nothing, not even another such process.
         let mut groups: Vec<(Option<u64>, Vec<Vec<Value>>)> = Vec::new();
 
         for process in list_processes(&context, &kernel)? {
@@ -97,8 +98,9 @@ impl Plugin for Sessions {
                 Err(_) => Value::unreadable(),
             };
 
-            // The session's kind and the user behind it are only recorded in
-            // the process's own environment.
+            // Detect RDP, Console or set default value, and construct the
+            // username from the process env: the session's kind and the user
+            // behind it are only recorded in the process's own environment.
             let mut session_type = Value::not_available();
             let (mut domain, mut user) = (String::new(), String::new());
             if let Ok(layer) = process.address_space(&physical) {

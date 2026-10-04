@@ -1,5 +1,3 @@
-//! Search a process's virtual address space for a regular expression.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -15,9 +13,15 @@ use crate::framework::plugins::{
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 
+/// Scans all virtual memory areas for tasks using RegEx.
 pub struct VadRegExScan;
 
 /// How much of a match to show.
+///
+/// Upstream reapplies the regex in order to extract just the match. Where the
+/// match is within the result data it reports the match itself, and where it is
+/// not (because it does not fit within `MAXSIZE_DEFAULT`) it reports what was
+/// read.
 const MATCH_PREVIEW: usize = 128;
 
 impl Plugin for VadRegExScan {
@@ -90,8 +94,8 @@ impl Plugin for VadRegExScan {
                 continue;
             };
 
-            // The VAD tree bounds the search to memory the process has actually
-            // reserved.
+            // get process sections for scanning: the VAD tree bounds the
+            // search to memory the process has actually reserved.
             let sections: Vec<(u64, u64)> = vadinfo::walk_vad_tree(&context, &kernel, &process)
                 .unwrap_or_default()
                 .into_iter()

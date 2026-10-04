@@ -1,5 +1,3 @@
-//! Report each process's environment variables.
-//!
 //! The environment block is a run of `NAME=VALUE` strings in the process's own
 //! address space, terminated by an empty string.
 //!
@@ -15,6 +13,7 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, Process};
 
+/// Display process environment variables
 pub struct Envars;
 
 impl Plugin for Envars {
@@ -30,6 +29,13 @@ impl Plugin for Envars {
         vec![
             Requirement::kernel(),
             Requirement::pid_filter("Filter on specific process IDs"),
+            // Enumerate persistent & common variables: the global (all users)
+            // and user-specific environment variables from the registry, plus
+            // the volatile user variables and those set explicitly but common
+            // enough to ignore safely. Any variables in a process env block
+            // that do not exist in the persistent list were explicitly set with
+            // the SetEnvironmentVariable() API.
+            //
             // The reference implementation looks this up under a different
             // spelling than the one it registers, so asking for it changes
             // nothing there and changes nothing here.

@@ -1,5 +1,3 @@
-//! Print the keys and values under a registry path.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -15,6 +13,7 @@ use crate::framework::symbols::windows::registry::{
     read_key, subkeys, value_cell, values, RegistryKey,
 };
 
+/// Lists the registry keys under a hive or specific key value.
 pub struct PrintKey;
 
 impl Plugin for PrintKey {
@@ -47,7 +46,7 @@ impl Plugin for PrintKey {
             Column::string("Type"),
             Column::string("Key"),
             Column::string("Name"),
-            Column::bytes("Data"),
+            Column::multi_type_data("Data"),
             Column::bool("Volatile"),
         ]
     }
@@ -131,75 +130,142 @@ fn walk_hive(
 ) -> Result<()> {
     let root = read_key(context, hive, table, hive.root_cell_offset(), String::new())?;
 
-    // The listing is of a node's children, not of the node itself, and the path
-    // each row carries is the parent's, which for the root is the hive's own
-    // name.
-    let mut pending: Vec<(RegistryKey, String, usize)> = vec![(root, hive_name.to_string(), 1)];
-
-    while let Some((node, path, depth)) = pending.pop() {
-        // Only the requested subtree, when one was asked for.
-        let wanted = requested_key
-            .map(|wanted| path.contains(wanted))
-            .unwrap_or(true);
-
-        let parent_write = node.last_write_time()?;
-
-        for child in subkeys(context, hive, table, &node)? {
-            if wanted {
-                grid.push(
-                    depth - 1,
-                    vec![
-                        // A subkey is stamped with its own time, not its
-                        // parent's.
-                        wintime_value(child.last_write_time()?),
-                        Value::hex(hive_offset),
-                        Value::string("Key"),
-                        Value::string(path.clone()),
-                        child
-                            .name()
-                            .map(Value::string)
-                            .unwrap_or_else(|_| Value::unreadable()),
-                        Value::not_applicable(),
-                        Value::Bool(child.volatile),
-                    ],
-                )?;
-            }
-            if recurse {
-                let name = child.name().unwrap_or_else(|_| "-".to_string());
-                pending.push((child, format!("{path}\\{name}"), depth + 1));
+    // A requested key is a path from the hive's root, and the listing starts
+    // at the node it names rather than at the root. A path that leads nowhere
+    // leaves the hive unreported, which the caller marks.
+    let mut chain = vec![root];
+    if let Some(wanted) = requested_key {
+        let wanted = wanted.strip_suffix('\\').unwrap_or(wanted);
+        for part in wanted.split('\\') {
+            let node = chain.last().expect("the root is always the first of these");
+            let found = subkeys(context, hive, table, node)?.into_iter().find(|child| {
+                // Registry key names are not case sensitive.
+                child
+                    .name()
+                    .map(|name| name.to_lowercase() == part.to_lowercase())
+                    .unwrap_or(false)
+            });
+            match found {
+                Some(child) => chain.push(child),
+                None => {
+                    return Err(crate::error::VolatilityError::Other(format!(
+                        "Key {part} not found"
+                    )))
+                }
             }
         }
+    }
 
-        if !wanted {
+    // The path a row carries names the hive and then each node of the chain
+    // below the root, which is what upstream joins together.
+    let mut names = vec![hive_name.to_string()];
+    for node in chain.iter().skip(1) {
+        names.push(node.name().unwrap_or_else(|_| "-".to_string()));
+    }
+    let path = names.join("\\");
+
+    let node = chain.last().expect("the root is always the first of these").clone();
+    let mut ancestors: Vec<u64> = chain.iter().map(|node| node.cell_index).collect();
+    list_node(
+        context,
+        hive,
+        table,
+        hive_offset,
+        &node,
+        &path,
+        &mut ancestors,
+        recurse,
+        0,
+        grid,
+    )
+}
+
+/// Report one node's subkeys and then its values.
+///
+/// A subkey is reported and then descended into straight away, which is the
+/// order upstream's own walk produces, and a node already on the way down is
+/// not descended into again.
+#[allow(clippy::too_many_arguments)]
+fn list_node(
+    context: &Arc<Context>,
+    hive: &crate::framework::layers::registry::RegistryHive,
+    table: &str,
+    hive_offset: u64,
+    node: &RegistryKey,
+    path: &str,
+    ancestors: &mut Vec<u64>,
+    recurse: bool,
+    depth: usize,
+    grid: &mut TreeGrid,
+) -> Result<()> {
+    let parent_write = node.last_write_time()?;
+
+    for child in subkeys(context, hive, table, node)? {
+        grid.push(
+            depth,
+            vec![
+                // A subkey is stamped with its own time, not its parent's.
+                wintime_value(child.last_write_time()?),
+                Value::hex(hive_offset),
+                Value::string("Key"),
+                Value::string(path.to_string()),
+                child
+                    .name()
+                    .map(Value::string)
+                    .unwrap_or_else(|_| Value::unreadable()),
+                Value::not_applicable(),
+                Value::Bool(child.volatile),
+            ],
+        )?;
+
+        if !recurse || ancestors.contains(&child.cell_index) {
             continue;
         }
-        for value in values(context, hive, table, &node)? {
-            grid.push(
-                depth - 1,
-                vec![
-                    wintime_value(parent_write),
-                    Value::hex(hive_offset),
-                    Value::string(value.value_type().as_str()),
-                    Value::string(path.clone()),
-                    value
-                        .name()
-                        .map(|name| {
-                            // A value with no name is the key's own.
-                            if name.is_empty() {
-                                Value::string("(Default)")
-                            } else {
-                                Value::string(name)
-                            }
-                        })
-                        .unwrap_or_else(|_| Value::unreadable()),
-                    value
-                        .data(hive)
-                        .map(|data| value_cell(value.value_type(), &data))
-                        .unwrap_or_else(|_| Value::unreadable()),
-                    Value::Bool(node.volatile),
-                ],
-            )?;
-        }
+        // A subkey whose name cannot be read is reported but not followed.
+        let Ok(name) = child.name() else { continue };
+        ancestors.push(child.cell_index);
+        let child_path = format!("{path}\\{name}");
+        list_node(
+            context,
+            hive,
+            table,
+            hive_offset,
+            &child,
+            &child_path,
+            ancestors,
+            recurse,
+            depth + 1,
+            grid,
+        )?;
+        ancestors.pop();
+    }
+
+    for value in values(context, hive, table, node)? {
+        grid.push(
+            depth,
+            vec![
+                wintime_value(parent_write),
+                Value::hex(hive_offset),
+                Value::string(value.value_type().as_str()),
+                Value::string(path.to_string()),
+                value
+                    .name()
+                    .map(|name| {
+                        // A value with no name is the key's own.
+                        if name.is_empty() {
+                            Value::string("(Default)")
+                        } else {
+                            Value::string(name)
+                        }
+                    })
+                    .unwrap_or_else(|_| Value::unreadable()),
+                value
+                    .data(hive)
+                    .map(|data| value_cell(value.value_type(), &data))
+                    .unwrap_or_else(|_| Value::unreadable()),
+                Value::Bool(node.volatile),
+            ],
+        )?;
     }
     Ok(())
 }

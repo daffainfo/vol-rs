@@ -1,5 +1,3 @@
-//! Derive the SID of each installed service from its name.
-//!
 //! Windows gives every service an account SID computed from its name rather
 //! than assigned: the name is upper-cased, hashed with SHA-1, and the digest's
 //! five words become the SID's sub-authorities under `S-1-5-80`. Recovering the
@@ -21,9 +19,10 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::registry::{read_key, subkeys};
 
+/// Lists process token sids.
 pub struct GetServiceSids;
 
-/// Compute the service SID for a service name.
+/// Calculate the Service SID.
 pub fn service_sid(name: &str) -> String {
     // The name is hashed upper-cased and as UTF-16, which is how Windows
     // canonicalises it before hashing.
@@ -67,7 +66,7 @@ impl Plugin for GetServiceSids {
         let table = kernel.symbol_table_name.clone();
         let mut grid = TreeGrid::new(self.columns());
 
-        // Services are named in the machine's own hive, under whichever
+        // Get the system hive, then ControlSet\Services under whichever
         // control set the machine last booted from.
         for hive_object in super::registry::list_hives(&context, &kernel)? {
             let Ok(hive) = super::registry::open_hive(&context, &kernel, hive_object) else {

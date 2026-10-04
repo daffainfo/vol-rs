@@ -1,9 +1,10 @@
-//! Detect processes that have patched out ETW logging.
-//!
 //! Event Tracing for Windows is what most security tooling reads. A process can
 //! blind that tooling by overwriting the first instruction of the logging
 //! function in its own copy of `ntdll` with an immediate return, which costs
 //! one byte and stops every event the process would have produced.
+//!
+//! EtwpEventWriteFull -> <https://github.com/SolitudePy/Stealthy-ETW-Patch>
+//! CAPA rule -> <https://github.com/mandiant/capa-rules/blob/master/anti-analysis/anti-av/patch-event-tracing-for-windows-function.yml>
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -18,9 +19,19 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, pe};
 
+/// Identifies ETW (Event Tracing for Windows) patching techniques used by
+/// malware to evade detection.
+///
+/// This plugin examines the first opcode of key ETW functions in ntdll.dll and
+/// advapi32.dll to detect common ETW bypass techniques such as return pointer
+/// manipulation (RET) or function redirection (JMP). Attackers often patch
+/// these functions to prevent security tools from receiving telemetry about
+/// process execution, API calls, and other system events.
 pub struct EtwPatch;
 
 /// The logging functions worth checking, and the module that exports them.
+///
+/// All of their addresses are resolved before looping through the processes.
 const WATCHED: &[(&str, &str)] = &[
     ("ntdll.dll", "EtwEventWrite"),
     ("ntdll.dll", "EtwEventWriteFull"),
@@ -161,7 +172,7 @@ impl Plugin for EtwPatch {
     }
 }
 
-/// Recognise a prologue that has been replaced with an early return.
+/// Map of opcodes to their instruction names.
 ///
 /// Returns `None` for an intact function, which is the normal case and not a
 /// finding.

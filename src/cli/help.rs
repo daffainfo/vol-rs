@@ -149,6 +149,14 @@ fn actions(plugin: &dyn Plugin) -> Vec<Action> {
 }
 
 /// The whole help page for a plugin.
+/// A plugin's `usage:` block on its own, which is what an error about its
+/// arguments is reported under.
+pub fn plugin_usage_block(plugin: &dyn Plugin) -> String {
+    let width = text_width();
+    let actions = actions(plugin);
+    format_usage(&format!("vol {}", plugin.name()), &actions, width)
+}
+
 pub fn plugin_help(plugin: &dyn Plugin) -> String {
     let width = text_width();
     let actions = actions(plugin);

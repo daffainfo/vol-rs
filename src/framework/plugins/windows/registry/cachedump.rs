@@ -1,5 +1,3 @@
-//! Recover cached domain credentials.
-//!
 //! Windows caches a verifier for each domain account that has logged in, so the
 //! machine can authenticate them while disconnected. The cache entries are
 //! encrypted under the `NL$KM` LSA secret.
@@ -20,6 +18,7 @@ use crate::framework::symbols::windows::sam::{
     assemble_bootkey, decrypt_lsa_aes, decrypt_secret, lsa_key, BOOTKEY_SUBKEYS,
 };
 
+/// Dumps lsa secrets from memory
 pub struct CacheDump;
 
 /// The header preceding each cache entry's variable-length fields.
@@ -162,7 +161,7 @@ impl CacheDump {
     }
 }
 
-/// One decoded cache entry.
+/// One decoded cache entry: the username, domain name, and hash data.
 struct CacheEntry {
     username: String,
     domain: String,
@@ -180,7 +179,7 @@ fn decode_entry(data: &[u8], nlkm: &[u8]) -> Option<CacheEntry> {
     let domain_length = u16::from_le_bytes(data[2..4].try_into().ok()?) as usize;
     let domain_name_length = u16::from_le_bytes(data[0x3C..0x3E].try_into().ok()?) as usize;
 
-    // An empty slot has no user name.
+    // Skip if nothing in this cache entry.
     if user_length == 0 || user_length > 512 {
         return None;
     }
@@ -224,6 +223,8 @@ fn decode_entry(data: &[u8], nlkm: &[u8]) -> Option<CacheEntry> {
 }
 
 /// Unwrap the NL$KM secret, which protects the credential cache.
+///
+/// Based on code from <http://lab.mediaservice.net/code/cachedump.rb>.
 fn read_nlkm(
     context: &Arc<Context>,
     hive: &RegistryHive,

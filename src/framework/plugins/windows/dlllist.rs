@@ -1,5 +1,3 @@
-//! List the modules loaded into each process, from the PEB's loader data.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -15,6 +13,7 @@ use crate::framework::renderers::conversion::wintime_value;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::WOW64_TABLE;
 
+/// Lists the loaded DLLs in a particular windows memory image.
 pub struct DllList;
 
 impl Plugin for DllList {
@@ -113,8 +112,9 @@ impl Plugin for DllList {
         let physical = physical_layer(config);
         let dump = config.get_bool("dump").unwrap_or(false);
         let wanted_base = config.get_int("base").filter(|base| *base != 0).map(|base| base as u64);
-        // A pattern is matched against both the short and the full name, and
-        // a module matching neither is left out.
+        // Check if a name regex was passed and apply it to only show matches.
+        // If Base or Full Dll Name are invalid, move on, and if the regex does
+        // not match either of them, move on.
         let pattern = match config.get_string("name") {
             Some(text) => {
                 let text = if config.get_bool("ignore-case").unwrap_or(false) {
@@ -134,9 +134,32 @@ impl Plugin for DllList {
         };
         let mut grid = TreeGrid::new(self.columns());
 
-        for process in
-            crate::framework::plugins::windows::selected_processes(&context, &kernel, config)?
-        {
+        // LoadTime only applies to versions higher or equal to Window 7
+        // (6.1 and higher), and 32-bit versions shouldn't have the Quadpart
+        // according to MSDN. Which release this is comes from the shared user
+        // data rather than from whether the symbols happen to describe the
+        // member.
+        let records_load_time = match crate::framework::plugins::windows::info::windows_version(
+            &context, &kernel,
+        ) {
+            Some((major, minor)) => major > 6 || (major == 6 && minor >= 1),
+            None => false,
+        };
+
+        // Upstream pulls the processes while the grid is being rendered, so a
+        // failure in choosing them is reported under the header rather than
+        // instead of it.
+        let selected =
+            match crate::framework::plugins::windows::selected_processes(&context, &kernel, config)
+            {
+                Ok(selected) => selected,
+                Err(error) => {
+                    grid.mark_failed(error);
+                    return Ok(grid);
+                }
+            };
+
+        for process in selected {
             let Ok(pid) = process.pid() else { continue };
             let name = process.image_file_name().unwrap_or_default();
 
@@ -146,15 +169,24 @@ impl Plugin for DllList {
             let entries = load_order_modules(&context, &kernel, &process, &layer, "InLoadOrderModuleList");
 
             for entry in entries {
+                // The short name is read first, and keeps its value even
+                // where the full name cannot be read. A short name that
+                // cannot be read leaves both unreported, since upstream never
+                // reaches the full one in that case.
                 let short = entry
                     .member("BaseDllName")
-                    .and_then(|value| unicode_string(&value));
-                let full = entry
-                    .member("FullDllName")
-                    .and_then(|value| unicode_string(&value));
+                    .and_then(|value| unicode_string(&value))
+                    .ok();
+                let full = match &short {
+                    Some(_) => entry
+                        .member("FullDllName")
+                        .and_then(|value| unicode_string(&value))
+                        .ok(),
+                    None => None,
+                };
                 if let Some(pattern) = &pattern {
                     // A module whose names cannot be read cannot be matched.
-                    let (Ok(short), Ok(full)) = (&short, &full) else {
+                    let (Some(short), Some(full)) = (&short, &full) else {
                         continue;
                     };
                     if !pattern.is_match(short) && !pattern.is_match(full) {
@@ -204,16 +236,14 @@ impl Plugin for DllList {
                             .and_then(|size| size.as_u64())
                             .map(Value::hex)
                             .unwrap_or_else(|_| Value::unreadable()),
-                        entry
-                            .member("BaseDllName")
-                            .and_then(|value| unicode_string(&value))
-                            .map(Value::string)
-                            .unwrap_or_else(|_| Value::unreadable()),
-                        entry
-                            .member("FullDllName")
-                            .and_then(|value| unicode_string(&value))
-                            .map(Value::string)
-                            .unwrap_or_else(|_| Value::unreadable()),
+                        match &short {
+                            Some(short) => Value::string(short.clone()),
+                            None => Value::unreadable(),
+                        },
+                        match &full {
+                            Some(full) => Value::string(full.clone()),
+                            None => Value::unreadable(),
+                        },
                         // A load count the kernel does not track is reported as
                         // unavailable rather than as zero.
                         entry
@@ -225,17 +255,20 @@ impl Plugin for DllList {
                             // rather than as sixty-five thousand.
                             .map(|value| Value::int(value as u16 as i16 as i64))
                             .unwrap_or_else(|_| Value::not_available()),
-                        // LoadTime only exists from Windows 7 onwards.
-                        match entry.member("LoadTime") {
-                            Ok(load_time) => load_time
-                                .member("QuadPart")
-                                .or_else(|_| Ok(load_time.clone()))
+                        // LoadTime only applies from Windows 7 onwards.
+                        if records_load_time {
+                            entry
+                                .member("LoadTime")
+                                .and_then(|load_time| {
+                                    load_time
+                                        .member("QuadPart")
+                                        .or_else(|_| Ok(load_time.clone()))
+                                })
                                 .and_then(|value| value.as_u64())
                                 .map(wintime_value)
-                                .unwrap_or_else(|_: crate::error::VolatilityError| {
-                                    Value::unreadable()
-                                }),
-                            Err(_) => Value::not_applicable(),
+                                .unwrap_or_else(|_| Value::unreadable())
+                        } else {
+                            Value::not_applicable()
                         },
                         Value::string(file_output),
                     ],
@@ -286,8 +319,9 @@ pub fn load_order_modules(
     let mut entries = Vec::new();
     for (head, entry_type) in lists {
         if let Ok(found) = walk_list(&head, &entry_type, list_link(list_member), true) {
-            // An entry whose base cannot be read says nothing about what is
-            // loaded, so it is left out.
+            // We assume that if BaseDllName points to an invalid buffer, so
+            // will FullDllName, so an entry whose base cannot be read is left
+            // out.
             entries.extend(found.into_iter().filter(|entry| {
                 entry
                     .member("DllBase")

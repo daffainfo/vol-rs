@@ -1,9 +1,13 @@
 //! Layers: sources of data, and translations applied on top of them.
 //!
-//! A `DataLayer` is a leaf that exposes raw bytes (a file, a buffer). A
-//! `TranslationLayer` sits above one or more layers and maps its own address
-//! space onto theirs, virtual-to-physical paging, decompression of a crash
-//! dump, and so on.
+//! A `DataLayer` is a leaf that directly holds data and does not translate it,
+//! exposing raw bytes from a file or a buffer. It directly accesses a data
+//! source and exposes it within volatility.
+//!
+//! A translation layer provides a layer that translates or transforms another
+//! layer or layers, and always depends on another layer, typically translating
+//! offsets in a virtual offset space into a smaller physical offset space:
+//! virtual-to-physical paging, decompression of a crash dump, and so on.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -19,6 +23,7 @@ pub mod qemu;
 pub mod avml;
 pub mod scanners;
 pub mod registry;
+pub mod xen;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -27,6 +32,10 @@ use crate::error::{Result, VolatilityError};
 
 /// One contiguous region of this layer's address space and where it lands in
 /// a lower layer.
+///
+/// `ignore_errors` will provide all available maps with gaps, but their total
+/// length may not add up to the requested length. This allows translation
+/// layers to provide maps of contiguous regions in one layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MappingEntry {
     /// Offset within *this* layer.
@@ -51,10 +60,10 @@ pub trait DataLayer: Send + Sync {
     /// The layer's name within the container.
     fn name(&self) -> &str;
 
-    /// Lowest valid address in this layer.
+    /// Returns the minimum valid address of the space.
     fn minimum_address(&self) -> u64;
 
-    /// Highest valid address in this layer (inclusive).
+    /// Returns the maximum valid address of the space.
     fn maximum_address(&self) -> u64;
 
     /// The regions of this layer that actually hold data.
@@ -69,7 +78,8 @@ pub trait DataLayer: Send + Sync {
         )]
     }
 
-    /// Mask covering the bits an address in this layer can actually use.
+    /// Returns a mask which encapsulates all the active bits of an address for
+    /// this layer.
     ///
     /// A 4-level Intel layer addresses 48 bits, so the sign-extension in the
     /// top 16 bits of a kernel pointer is not part of the address. Masking it
@@ -95,17 +105,37 @@ pub trait DataLayer: Send + Sync {
         }
     }
 
-    /// Whether the whole range `[offset, offset + length)` can be read.
+    /// Returns a boolean based on whether the entire chunk of data (from
+    /// offset to length) is valid or not.
+    ///
+    /// # Args
+    ///
+    /// * `offset` - The address to start determining whether bytes are
+    ///   readable/valid
+    /// * `length` - The number of bytes from offset of which to test the
+    ///   validity
     fn is_valid(&self, layers: &LayerContainer, offset: u64, length: u64) -> bool;
 
-    /// Read `length` bytes from `offset`.
+    /// Reads an offset for length bytes and returns the bytes read.
     ///
-    /// When `pad` is set, unreadable regions are returned as zero bytes rather
-    /// than raising an error.
+    /// If there is a fault of any kind (such as a page fault), an error will be
+    /// returned unless `pad` is set, in which case the read errors will be
+    /// replaced by null characters.
+    ///
+    /// # Args
+    ///
+    /// * `offset` - The offset at which to begin reading within the layer
+    /// * `length` - The number of bytes to read within the layer
+    /// * `pad` - Whether errors should be raised or bad bytes replaced with
+    ///   null characters
     fn read(&self, layers: &LayerContainer, offset: u64, length: usize, pad: bool) -> Result<Vec<u8>>;
 
-    /// Write `data` at `offset`. Layers backed by read-only sources may ignore
-    /// this, warning once.
+    /// Writes a chunk of data at offset.
+    ///
+    /// Any unavailable sections in the underlying bases will cause an error.
+    /// Note: writes are not guaranteed atomic, therefore some data may have
+    /// been written, even if an error is returned. Layers backed by read-only
+    /// sources may ignore this, warning once.
     fn write(&self, _layers: &LayerContainer, _offset: u64, _data: &[u8]) -> Result<()> {
         Err(VolatilityError::layer(
             self.name(),
@@ -113,17 +143,21 @@ pub trait DataLayer: Send + Sync {
         ))
     }
 
-    /// Names of the layers this layer is built on. Leaf data layers return an
+    /// A list of other layer names required by this layer.
+    ///
+    /// Note: data layers must never define other layers, so a leaf returns an
     /// empty list.
     fn dependencies(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Map a range of this layer's address space onto lower layers.
+    /// Returns a sorted iterable of (offset, sublength, mapped_offset,
+    /// mapped_length, layer) mappings.
     ///
-    /// Leaf layers map onto themselves. `ignore_errors` yields the readable
-    /// portions and silently drops the gaps, so the returned lengths need not
-    /// add up to `length`.
+    /// Leaf layers map onto themselves. `ignore_errors` will provide all
+    /// available maps with gaps, but their total length may not add up to the
+    /// requested length. This allows translation layers to provide maps of
+    /// contiguous regions in one layer.
     fn mapping(
         &self,
         _layers: &LayerContainer,
@@ -209,8 +243,12 @@ pub trait DataLayer: Send + Sync {
         None
     }
 
-    /// True when this layer maps addresses linearly, so that `a -> b` implies
-    /// `a + c -> b + c`. Scanners use this to read large contiguous blocks.
+    /// Differentiates linearly mapped layers, where `a => b` implies that
+    /// `a + c => b + c`.
+    ///
+    /// Scanners use this to read large contiguous blocks. Upstream redefines
+    /// `read` for such layers for speed reasons, so that it does not call a
+    /// processing method per page.
     fn is_linear(&self) -> bool {
         true
     }
@@ -314,8 +352,8 @@ impl LayerContainer {
     }
 }
 
-/// Collapse adjacent or overlapping `(start, length)` sections and clamp them
-/// to the layer's addressable range.
+/// Take a list of (start, length) sections and coalesce any adjacent sections,
+/// clamping them to the layer's addressable range.
 pub fn coalesce_sections(
     sections: &[(u64, u64)],
     minimum: u64,

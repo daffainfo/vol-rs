@@ -1,5 +1,3 @@
-//! Scan each process's virtual address space with YARA rules.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -17,6 +15,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, pslist_session_id};
 
+/// Scans all the Virtual Address Descriptor memory maps using yara.
 pub struct VadYaraScan;
 
 impl Plugin for VadYaraScan {
@@ -52,16 +51,24 @@ impl Plugin for VadYaraScan {
             Column::int("Threads"),
             Column::string("Rule"),
             Column::string("Component"),
-            Column::bytes("Value"),
+            Column::layer_data("Value"),
         ]
     }
 
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let physical = physical_layer(config);
-        let rules = Rules::from_config(config)?;
         let filter = pid_filter(config);
         let mut grid = TreeGrid::new(self.columns());
+        // As in the other scanners: the header precedes the failure.
+        let rules = match Rules::from_config(config) {
+            Ok(rules) => rules,
+            Err(error) => {
+                eprintln!("ERROR    volatility3.plugins.yarascan: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
 
         for process in list_processes(&context, &kernel)? {
             let Ok(pid) = process.pid() else { continue };
@@ -73,8 +80,10 @@ impl Plugin for VadYaraScan {
                 continue;
             };
 
-            // Each region is read whole and scanned in one piece, so a match
-            // is never split by where the reading happened to stop.
+            // Creates a map of start/end addresses within the virtual address
+            // descriptor tree, then scans the VAD data (in one contiguous
+            // block) with the yarascanner, so a match is never split by where
+            // the reading happened to stop.
             let mut regions: Vec<(u64, u64)> = Vec::new();
             for vad in vadinfo::walk_vad_tree(&context, &kernel, &process).unwrap_or_default() {
                 let (Some(start), Some(end)) =
@@ -139,4 +148,5 @@ impl Plugin for VadYaraScan {
 }
 
 /// A region larger than this is data rather than anything worth searching.
+/// 1 GB.
 const SANITY_LIMIT: u64 = 1024 * 1024 * 1024;

@@ -1,5 +1,3 @@
-//! List each module's imported functions.
-//!
 //! A module's import address table names every function it calls in another
 //! module. Comparing the resolved addresses against where those modules
 //! actually live is how import hooking becomes visible.
@@ -17,6 +15,10 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 use crate::framework::symbols::windows::pe;
 
+/// Extract Import Address Table to list API (functions) used by a program
+/// contained in external libraries
+///
+/// A descriptor's timestamp is initially set to 0 if the import is not bound.
 pub struct Iat;
 
 impl Plugin for Iat {

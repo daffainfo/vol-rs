@@ -1,5 +1,3 @@
-//! Scan physical memory for symbolic link objects.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,8 +11,9 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::conversion::wintime_value;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::object_name;
-use crate::framework::symbols::windows::poolscanner::scan_for_tag;
+use crate::framework::symbols::windows::poolscanner::scan_for_tags;
 
+/// Scans for links present in a particular windows memory image.
 pub struct SymlinkScan;
 
 impl Plugin for SymlinkScan {
@@ -62,11 +61,14 @@ impl Plugin for SymlinkScan {
         Some(timeline)
     }
 
+    /// Scans for links using the poolscanner module and constraints.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let _layer = physical_layer(config);
 
-        let objects = scan_for_tag(&context, &kernel, b"Symb")?;
+        // The tag gained its high bit when the allocation moved into the
+        // protected pool, so both spellings are searched for.
+        let objects = scan_for_tags(&context, &kernel, &[b"Sym\xe2", b"Symb"])?;
 
         let mut grid = TreeGrid::new(self.columns());
         for object in objects {

@@ -1,5 +1,3 @@
-//! List the mounted filesystems, as `/proc/pid/mountinfo` reports them.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,9 +11,10 @@ use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::linux::{
-    container_of, dentry_path, list_tasks, rbtree_nodes, resolve_path, Task,
+    container_of, dentry_path, list_tasks, path_for_mount, rbtree_nodes, Task,
 };
 
+/// Lists mount points on processes mount namespaces
 pub struct MountInfo;
 
 impl Plugin for MountInfo {
@@ -59,9 +58,11 @@ impl Plugin for MountInfo {
 
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
-        // Naming processes asks for each one's own mounts, so the listing then
-        // says which process each row belongs to and repeats a mount that
-        // several of them share.
+        // The PID column does not make sense when a PID filter is not
+        // specified. In that case, the default behavior is to display the
+        // mountpoints per namespace. When PIDs are filtered, it makes sense
+        // that the user wants to see each of those processes' mount points, so
+        // we don't filter by mount id in that case.
         let pids = crate::framework::plugins::pids_filter(config);
         let by_pid = pids.is_some();
         let namespaces: Option<Vec<u64>> = config
@@ -77,12 +78,26 @@ impl Plugin for MountInfo {
         let mut grid = TreeGrid::new(columns_for(by_pid, brief));
         let mut seen_mounts: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut seen_namespaces: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut unfilterable = false;
 
-        // Mounts live per namespace, so each namespace is visited once through
-        // whichever task happens to belong to it.
+        // Yield file system superblocks based on the tasks' mounted
+        // filesystems. No filter so that we get all the mount namespaces from
+        // all tasks, each visited once through whichever task happens to
+        // belong to it.
         for task in list_tasks(&context, &kernel, false)? {
             let Ok(task_pid) = task.pid() else { continue };
             if !crate::framework::plugins::pid_matches(&pids, task_pid) {
+                continue;
+            }
+            // This task doesn't have all the information required. It should
+            // be a kernel < 2.6.30.
+            if task
+                .object
+                .member("fs")
+                .and_then(|fs| fs.dereference())
+                .map(|fs| !fs.is_readable())
+                .unwrap_or(true)
+            {
                 continue;
             }
             let Ok(namespace) = task
@@ -94,20 +109,35 @@ impl Plugin for MountInfo {
             else {
                 continue;
             };
+            if !namespace.is_readable() {
+                continue;
+            }
 
-            let namespace_id = namespace
-                .member("ns")
-                .and_then(|ns| ns.member("inum"))
-                .and_then(|inum| inum.as_u64())
-                .unwrap_or(0);
-            if let Some(wanted) = &namespaces {
-                if !wanted.contains(&namespace_id) {
+            // The namespace's own inode number, which is where kernels from 3.8
+            // record a namespace's identity. Older ones have nothing to name it
+            // by, and then a namespace filter cannot be honoured at all.
+            let namespace_id = if namespace.has_member("proc_inum") {
+                // 3.8 <= kernels < 3.19
+                namespace.member("proc_inum").and_then(|id| id.as_u64()).ok()
+            } else {
+                namespace
+                    .member("ns")
+                    .ok()
+                    .filter(|ns| ns.has_member("inum"))
+                    .and_then(|ns| ns.member("inum").ok())
+                    .and_then(|inum| inum.as_u64().ok())
+            };
+            if namespaces.is_some() && namespace_id.is_none() {
+                unfilterable = true;
+            }
+            if let (Some(wanted), Some(id)) = (&namespaces, namespace_id) {
+                if !wanted.contains(&id) {
                     continue;
                 }
             }
-            // Each namespace is visited once through whichever task belongs to
-            // it, unless the caller asked about particular processes.
-            if !by_pid && !seen_namespaces.insert(namespace_id) {
+            // Walking the same namespace again through another task repeats
+            // mounts that are then dropped anyway, so each one is visited once.
+            if !seen_namespaces.insert(namespace.offset()) {
                 continue;
             }
 
@@ -117,7 +147,12 @@ impl Plugin for MountInfo {
                 namespace
                     .member("list")
                     .and_then(|head| {
-                        walk_list(&head, &kernel.qualified("mount"), "mnt_list", true)
+                        walk_list(
+                            &head,
+                            &crate::framework::symbols::linux::mount_type(&context, &kernel),
+                            "mnt_list",
+                            true,
+                        )
                     })
                     .unwrap_or_default()
             } else if namespace.has_member("mounts") {
@@ -148,7 +183,10 @@ impl Plugin for MountInfo {
                     continue;
                 }
 
-                let mut row = vec![Value::int(namespace_id as i64)];
+                let mut row = vec![match namespace_id {
+                    Some(id) => Value::int(id as i64),
+                    None => Value::not_available(),
+                }];
                 if by_pid {
                     row.push(Value::int(task_pid as i64));
                 }
@@ -188,12 +226,18 @@ impl Plugin for MountInfo {
                 grid.push(0, row)?;
             }
         }
+        if unfilterable {
+            eprintln!(
+                "WARNING  volatility3.plugins.linux.mountinfo: Could not filter by mount \
+                 namespace id. This field is not available in this kernel."
+            );
+        }
         Ok(grid)
     }
 }
 
-/// The columns, which depend on whose mounts were asked for and in how much
-/// detail.
+/// The columns, which follow the `/proc/[pid]/mountinfo` output format and
+/// depend on whose mounts were asked for and in how much detail.
 fn columns_for(by_pid: bool, brief: bool) -> Vec<Column> {
     let mut columns = vec![Column::int("MNT_NS_ID")];
     if by_pid {
@@ -260,14 +304,24 @@ const SB_RDONLY: u64 = 1;
 /// Device numbers pack the minor into this many low bits.
 const MINOR_BITS: u32 = 20;
 
+/// Extract various information about a mount point.
+///
+/// It mimics the Linux kernel `show_mountinfo` function.
 fn describe_mount(task: &Task, mount: &Object) -> Option<MountDescription> {
-    // The embedded vfsmount is what carries the root and flags.
-    let vfsmount = mount.member("mnt").ok()?;
+    // Kernel 3.3 split the per-mount bookkeeping out of `vfsmount` into a
+    // `mount` that embeds it. Before that the one structure carried both, so
+    // the thing walked is already the vfsmount.
+    let vfsmount = if mount.has_member("mnt") {
+        mount.member("mnt").ok()?
+    } else {
+        mount.clone()
+    };
     let mount_root = vfsmount.member("mnt_root").ok()?.dereference().ok()?;
 
-    // Resolution starts at the mount's own root: the walk immediately steps out
-    // to the parent mount, which is where the path to the mount point lives.
-    let mount_point = resolve_path(task, mount_root.clone(), vfsmount.clone(), None)?;
+    let mount_point = path_for_mount(task, mount)?;
+    if mount_point.is_empty() {
+        return None;
+    }
 
     let superblock = vfsmount.member("mnt_sb").ok()?.dereference().ok()?;
     let device = superblock.member("s_dev").and_then(|dev| dev.as_u64()).ok()?;
@@ -284,7 +338,7 @@ fn describe_mount(task: &Task, mount: &Object) -> Option<MountDescription> {
             .map(|(_, name)| name.to_string()),
     );
 
-    // Propagation state, which `findmnt` shows as tagged fields.
+    // Tagged fields.
     let mut fields = Vec::new();
     if flags & MNT_SHARED != 0 {
         let group = mount
@@ -305,6 +359,12 @@ fn describe_mount(task: &Task, mount: &Object) -> Option<MountDescription> {
             .and_then(|id| id.as_i64())
             .unwrap_or(0);
         fields.push(format!("master:{group}"));
+        // The closest peer group above this one that still has a mount under
+        // the task's root is what the kernel reports propagation comes from.
+        let dominating = dominating_id(task, mount);
+        if dominating != 0 && dominating != group {
+            fields.push(format!("propagate_from:{dominating}"));
+        }
     }
     if flags & MNT_UNBINDABLE != 0 {
         fields.push("unbindable".to_string());
@@ -371,4 +431,148 @@ fn describe_mount(task: &Task, mount: &Object) -> Option<MountDescription> {
         source,
         superblock_options: superblock_options.join(","),
     })
+}
+
+/// The closest dominating peer group with a mount reachable from the task's
+/// root, which is what the kernel reports as `propagate_from`.
+///
+/// This follows the master chain outwards, and for each master looks through
+/// its peer group for a mount in the same namespace whose root is reachable.
+fn dominating_id(task: &Task, mount: &Object) -> i64 {
+    let Ok(root) = task
+        .object
+        .member("fs")
+        .and_then(|fs| fs.dereference())
+        .and_then(|fs| fs.member("root"))
+    else {
+        return 0;
+    };
+    let Ok(namespace) = mount
+        .member("mnt_ns")
+        .and_then(|namespace| namespace.pointer_value())
+    else {
+        return 0;
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut current = mount
+        .member("mnt_master")
+        .and_then(|master| master.pointer_value())
+        .unwrap_or(0);
+    while current != 0 && seen.insert(current) {
+        let master = mount.at_offset(current);
+        if let Some(peer) = peer_under_root(&master, namespace, &root) {
+            let group = peer
+                .member("mnt_group_id")
+                .and_then(|id| id.as_i64())
+                .unwrap_or(0);
+            if peer.offset() != 0 {
+                return group;
+            }
+        }
+        current = master
+            .member("mnt_master")
+            .and_then(|master| master.pointer_value())
+            .unwrap_or(0);
+    }
+    0
+}
+
+/// A mount in the given namespace, from this one's peer group, whose root is
+/// reachable from the task's root.
+fn peer_under_root(mount: &Object, namespace: u64, root: &Object) -> Option<Object> {
+    let start = mount.offset();
+    let mut seen = std::collections::HashSet::new();
+    let mut current = mount.clone();
+    while seen.insert(current.offset()) {
+        let in_namespace = current
+            .member("mnt_ns")
+            .and_then(|value| value.pointer_value())
+            .map(|value| value == namespace)
+            .unwrap_or(false);
+        if in_namespace {
+            let mount_root = vfsmount_of(&current)
+                .and_then(|vfsmount| vfsmount.member("mnt_root").ok())
+                .and_then(|root| root.pointer_value().ok())
+                .unwrap_or(0);
+            if path_is_reachable(&current, mount_root, root) {
+                return Some(current);
+            }
+        }
+        current = next_peer(&current)?;
+        if current.offset() == start {
+            break;
+        }
+    }
+    None
+}
+
+/// Whether a mount's subtree is reachable from the given root.
+///
+/// The walk climbs towards the root mount, carrying the mount point dentry it
+/// crossed last, and the subtree is reachable when it lands on the root mount
+/// with that dentry under the root directory.
+fn path_is_reachable(mount: &Object, dentry: u64, root: &Object) -> bool {
+    let root_mount = root
+        .member("mnt")
+        .and_then(|mnt| mnt.pointer_value())
+        .unwrap_or(0);
+    let mut current_dentry = dentry;
+    let mut current = mount.clone();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let vfsmount = match vfsmount_of(&current) {
+            Some(vfsmount) => vfsmount.offset(),
+            None => return false,
+        };
+        let parent = current
+            .member("mnt_parent")
+            .and_then(|parent| parent.pointer_value())
+            .unwrap_or(0);
+        if vfsmount == root_mount || parent == current.offset() || !seen.insert(current.offset()) {
+            if vfsmount != root_mount {
+                return false;
+            }
+            // Upstream reaches the root directory through the address of the
+            // `root.dentry` member rather than the dentry it points at, so the
+            // ancestor search never matches and only the root itself counts.
+            let root_dentry = root
+                .member("dentry")
+                .and_then(|value| value.pointer_value())
+                .unwrap_or(0);
+            return current_dentry == root_dentry;
+        }
+        current_dentry = current
+            .member("mnt_mountpoint")
+            .and_then(|value| value.pointer_value())
+            .unwrap_or(0);
+        current = current.at_offset(parent);
+    }
+}
+
+/// The next mount in a peer group, reached through the `mnt_share` list.
+fn next_peer(mount: &Object) -> Option<Object> {
+    let next = mount
+        .member("mnt_share")
+        .ok()?
+        .member("next")
+        .ok()?
+        .pointer_value()
+        .ok()?;
+    let context = mount.context();
+    let offset = context
+        .symbol_space
+        .find_member(&mount.resolved_template().ok()?, "mnt_share")
+        .ok()?
+        .map(|(offset, _)| offset)?;
+    Some(mount.at_offset(next.wrapping_sub(offset)))
+}
+
+/// The `vfsmount` a mount carries, which before kernel 3.3 is the mount itself.
+fn vfsmount_of(mount: &Object) -> Option<Object> {
+    if mount.has_member("mnt") {
+        mount.member("mnt").ok()
+    } else {
+        Some(mount.clone())
+    }
 }

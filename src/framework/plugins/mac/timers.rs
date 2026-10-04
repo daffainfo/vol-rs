@@ -1,5 +1,3 @@
-//! List the kernel's pending timers.
-//!
 //! A timer gives an extension periodic execution without a thread of its own,
 //! which makes it a convenient hiding place for recurring malicious work.
 //!
@@ -15,6 +13,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::{walk_queue, ExtensionResolver};
 
+/// Check for malicious kernel timers.
 pub struct Timers;
 
 
@@ -52,15 +51,26 @@ impl Plugin for Timers {
         let resolver = ExtensionResolver::new(&context, &kernel).ok();
 
         // Each processor keeps its own queue of pending timers, reached through
-        // the table of processor state.
+        // the table of processor state, which returns a pointer to the absolute
+        // address.
         let processors = context
             .object_from_symbol(&kernel, "real_ncpus", None)
             .and_then(|count| count.as_u64())
             .unwrap_or(0);
 
         let table = context.symbol_offset(&kernel, "cpu_data_ptr")?;
-        let raw = context.layers.read(&kernel.layer_name, table, 8, false)?;
-        let first = u64::from_le_bytes(raw.try_into().unwrap());
+        // The table holds one pointer per processor, so its first entry is as
+        // wide as a pointer in the kernel this image came from.
+        let width = context
+            .symbol_space
+            .table(&kernel.symbol_table_name)
+            .map(|table| table.pointer_size())
+            .unwrap_or(8);
+        let raw = context.layers.read(&kernel.layer_name, table, width, false)?;
+        let first = raw
+            .iter()
+            .rev()
+            .fold(0u64, |value, byte| (value << 8) | *byte as u64);
 
         let cpu_template = context.symbol_space.get_type(&kernel.qualified("cpu_data"))?;
         let cpu_size = context.symbol_space.size_of(&cpu_template)?;

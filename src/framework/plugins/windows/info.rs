@@ -1,5 +1,3 @@
-//! Report what is known about the image and the system it came from.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,6 +11,7 @@ use crate::framework::layers::intel::IntelLayer;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Show OS & kernel details of the memory sample being analyzed.
 pub struct Info;
 
 impl Plugin for Info {
@@ -52,9 +51,7 @@ impl Plugin for Info {
         }
 
         let table = context.symbol_space.table(&kernel.symbol_table_name)?;
-        if let Some(source) = table.source() {
-            row("Symbols", Value::string(source))?;
-        }
+        row("Symbols", Value::string(table.source().unwrap_or_default()))?;
         row(
             "Is64Bit",
             Value::string(capitalised(table.pointer_size() == 8)),
@@ -66,7 +63,7 @@ impl Plugin for Info {
             )),
         )?;
 
-        // Each layer the kernel's rests on, and how far down it is.
+        // List the dependencies of a given layer, and how far down each one is.
         for (depth, name) in layer_depths(&context, &kernel.layer_name) {
             let layer = context.layers.get(&name)?;
             row(&name, Value::string(format!("{depth} {}", layer.kind())))?;
@@ -75,14 +72,35 @@ impl Plugin for Info {
         // The debugger data block, when this kernel still carries a readable one.
         if let Some(kdbg) = debugger_data_block(&context, &kernel) {
             row("KdDebuggerDataBlock", Value::hex(kdbg.offset()))?;
-            if let Some(build) = read_string(&kdbg, "NtBuildLab") {
+            // Returns the NT build lab string from the KDBG. The block points
+            // at the string, of which the reference implementation reads at
+            // most thirty two bytes.
+            if let Some(build) = read_string(&kdbg, "NtBuildLab", 32) {
                 row("NTBuildLab", Value::string(build))?;
             }
-            if let Ok(version) = kdbg.member("CmNtCSDVersion").and_then(|v| v.as_u64()) {
+            // Returns the CSDVersion as an integer (i.e. Service Pack
+            // number). The block points at it rather than holding it, and the
+            // number sits in all but the lowest byte.
+            if let Some(version) = kdbg
+                .member("CmNtCSDVersion")
+                .and_then(|pointer| pointer.as_u64())
+                .ok()
+                .filter(|address| *address != 0)
+                .and_then(|address| {
+                    context
+                        .layers
+                        .read(&kernel.layer_name, address, 4, false)
+                        .ok()
+                })
+                .map(|raw| {
+                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) >> 8
+                })
+            {
                 row("CSDVersion", Value::string(version.to_string()))?;
             }
         }
 
+        // The KdVersionBlock information from a kernel.
         let version = context.object_from_symbol(&kernel, "KdVersionBlock", Some("_DBGKD_GET_VERSION64"))?;
         row("KdVersionBlock", Value::hex(version.offset()))?;
         let field = |name: &str| version.member(name).and_then(|value| value.as_u64());
@@ -98,7 +116,7 @@ impl Plugin for Info {
             Value::string(processors.as_u64()?.to_string()),
         )?;
 
-        // Shared user data sits at a fixed address in every Windows kernel.
+        // The _KUSER_SHARED_DATA structure for a kernel.
         let shared = shared_user_data(&context, &kernel)?;
         row(
             "SystemTime",
@@ -135,6 +153,21 @@ impl Plugin for Info {
     }
 }
 
+/// The major and minor release the shared user data records.
+///
+/// Several plugins decide what a structure holds by the release rather than by
+/// what the symbols describe, and this is where they read it from.
+pub fn windows_version(context: &Arc<Context>, kernel: &Module) -> Option<(u64, u64)> {
+    let shared = shared_user_data(context, kernel).ok()?;
+    let part = |name: &str| {
+        shared
+            .member(name)
+            .and_then(|value| value.as_u64())
+            .ok()
+    };
+    Some((part("NtMajorVersion")?, part("NtMinorVersion")?))
+}
+
 /// How the reference implementation spells a boolean.
 fn capitalised(value: bool) -> &'static str {
     if value {
@@ -144,14 +177,16 @@ fn capitalised(value: bool) -> &'static str {
     }
 }
 
-/// Every layer beneath `name`, with how far below the kernel's it is.
+/// List the dependencies of a given layer.
 ///
-/// The kernel's own layer comes first, then whatever it rests on, which is how
-/// an image's description lists them.
+/// Returns an iterable containing the levels and layer objects for all
+/// dependent layers. The kernel's own layer comes first, then whatever it rests
+/// on, which is how an image's description lists them.
 fn layer_depths(context: &Arc<Context>, name: &str) -> Vec<(usize, String)> {
     fn walk(context: &Arc<Context>, name: &str, depth: usize, found: &mut Vec<(usize, String)>) {
         found.push((depth, name.to_string()));
         let Ok(layer) = context.layers.get(name) else {
+            // FileLayer won't have dependencies
             return;
         };
         // In the order the layer names them, so an image is described the way
@@ -166,11 +201,18 @@ fn layer_depths(context: &Arc<Context>, name: &str) -> Vec<(usize, String)> {
     found
 }
 
-/// The debugger data block, if this kernel carries one that reads.
+/// Returns the KDDEBUGGER_DATA64 structure for a kernel, if this kernel
+/// carries one that reads.
 fn debugger_data_block(context: &Arc<Context>, kernel: &Module) -> Option<Object> {
-    let block = context
-        .object_from_symbol(kernel, "KdDebuggerDataBlock", Some("_KDDEBUGGER_DATA64"))
+    // The kernel names where the block sits but does not always describe its
+    // shape, so the description that ships with the tool is used instead.
+    context.ensure_table("kdbg", "windows", "kdbg").ok()?;
+    let address = context.symbol_offset(kernel, "KdDebuggerDataBlock").ok()?;
+    let template = context
+        .symbol_space
+        .get_type("kdbg!_KDDEBUGGER_DATA64")
         .ok()?;
+    let block = context.object_from_template(template, &kernel.layer_name, address);
     // The block names itself. Anything else means it was not really there.
     let tag = block
         .member("Header")
@@ -181,7 +223,7 @@ fn debugger_data_block(context: &Arc<Context>, kernel: &Module) -> Option<Object
 }
 
 /// A NUL-terminated string a structure points at.
-fn read_string(object: &Object, member: &str) -> Option<String> {
+fn read_string(object: &Object, member: &str, length: usize) -> Option<String> {
     let address = object.member(member).ok()?.pointer_value().ok()?;
     if address == 0 {
         return None;
@@ -189,20 +231,20 @@ fn read_string(object: &Object, member: &str) -> Option<String> {
     let data = object
         .context()
         .layers
-        .read(object.native_layer_name(), address, 128, true)
+        .read(object.native_layer_name(), address, length, true)
         .ok()?;
     let end = data.iter().position(|byte| *byte == 0).unwrap_or(data.len());
     Some(String::from_utf8_lossy(&data[..end]).to_string())
 }
 
-/// The shared user data page, which every Windows kernel maps at a fixed
-/// address.
+/// Returns the _KUSER_SHARED_DATA structure for a kernel.
 fn shared_user_data(context: &Arc<Context>, kernel: &Module) -> Result<Object> {
     let pointer_size = context
         .symbol_space
         .table(&kernel.symbol_table_name)
         .map(|table| table.pointer_size())
         .unwrap_or(8);
+    // this is a hard-coded address in the Windows OS
     let address: u64 = if pointer_size == 4 {
         0xFFDF_0000
     } else {
@@ -230,13 +272,11 @@ fn system_root(shared: &Object) -> Option<String> {
     let data = shared
         .context()
         .layers
-        .read(shared.layer_name(), field.offset(), 520, true)
+        // Two hundred and sixty bytes, which is how many the reference
+        // implementation reads, not how many characters the name may have.
+        .read(shared.layer_name(), field.offset(), 260, true)
         .ok()?;
-    let units: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    let decoded = String::from_utf16_lossy(&units);
+    let decoded = crate::framework::objects::utility::decode_utf16_le(&data);
     let end = decoded.find('\0').unwrap_or(decoded.len());
     Some(decoded[..end].to_string())
 }
@@ -250,7 +290,7 @@ fn product_type(shared: &Object) -> Option<String> {
     Some(value)
 }
 
-/// What the kernel's own PE headers say it was built for.
+/// Gets the ntheader structure for the kernel of the specified layer.
 fn pe_headers(context: &Arc<Context>, kernel: &Module) -> Option<Vec<(String, String)>> {
     let data = context
         .layers

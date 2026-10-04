@@ -1,5 +1,3 @@
-//! Write a layer's contents out to a file.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -11,6 +9,8 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::{Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Runs the automagics and writes out the primary layer produced by the
+/// stacker.
 pub struct LayerWriter;
 
 /// Copy in blocks rather than reading a whole image into memory.
@@ -84,8 +84,8 @@ impl Plugin for LayerWriter {
             .map(|value| value as usize)
             .unwrap_or(DEFAULT_BLOCK_SIZE);
 
-        // With no layer named, the most recently added one that is not a
-        // mapping of another is written.
+        // Choose the most recently added layer that isn't virtual. Check the
+        // layer exists and validate the output file.
         let requested: Vec<String> = config
             .get("layers")
             .and_then(|value| {
@@ -139,14 +139,25 @@ impl Plugin for LayerWriter {
     }
 }
 
-/// Copy a whole layer out, block by block.
+/// Produces a FileHandler from the named layer in the provided context or None
+/// on failure
+///
+/// # Args
+///
+/// * `context` - the context from which to read the memory layer
+/// * `layer_name` - the name of the layer to write out
+/// * `preferred_name` - a string with the preferred filename for the file
+/// * `block_size` - an optional size for the chunks that should be written
+///
+/// The layer is copied out block by block. The filename reported back may have
+/// changed if a file with the same name already existed.
 fn write_layer(
     context: &Arc<Context>,
     layer: &dyn crate::framework::layers::DataLayer,
     output: &str,
     block_size: usize,
 ) -> Result<()> {
-    let mut file = std::fs::File::create(output)
+    let mut file = crate::framework::plugins::create_output_file(output)
         .map_err(|error| VolatilityError::Io(format!("{error}")))?;
     let end = layer.maximum_address();
     let mut offset = 0u64;

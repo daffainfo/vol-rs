@@ -1,9 +1,15 @@
-//! Report threads that are suspended.
+//! The goal of this plugin is to report on threads that are suspended.
 //!
-//! A thread created suspended has been set up but not yet allowed to run, which
-//! is the state a process sits in during hollowing while its image is being
-//! replaced. Reporting where each suspended thread would start shows what it
-//! was going to do.
+//! Legitimate programs can start threads suspended but then will later resume
+//! them.
+//!
+//! Subsets of malware techniques, such as EDR evasion and process hollowing,
+//! create suspended threads and do not resume them. These are the threads that
+//! this plugin is designed to catch.
+//!
+//! See the whitepaper from our DEF CON 2024 presentation for more details:
+//!
+//! https://www.volexity.com/wp-content/uploads/2024/08/Defcon24_EDR_Evasion_Detection_White-Paper_Andrew-Case.pdf
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -23,6 +29,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, Process};
 
+/// Enumerates suspended threads.
 pub struct SuspendedThreads;
 
 impl Plugin for SuspendedThreads {
@@ -59,8 +66,8 @@ impl Plugin for SuspendedThreads {
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let mut grid = TreeGrid::new(self.columns());
-        // Reading a process's mapped files is expensive, and almost no sample
-        // has a suspended thread at all, so it is done only when one turns up.
+        // Only compute this if needed as its expensive and 99.9% of samples
+        // will not have suspended threads.
         let mut ranges_by_process: HashMap<u64, Vec<MappedRange>> = HashMap::new();
 
         for process in list_processes(&context, &kernel)? {
@@ -178,7 +185,7 @@ fn owning_process(thread: &Object, kernel: &Module) -> Option<Process> {
     Some(Process::new(process))
 }
 
-/// The one library whose threads are found suspended in healthy systems.
+/// the only false positive found in mass scanning of samples.
 fn ends_in_work_folders(path: &str) -> bool {
     path.ends_with("\\WorkFoldersShell.dll")
 }

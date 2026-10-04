@@ -1,5 +1,3 @@
-//! Show processes as a tree, each child nested under its parent.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -17,6 +15,7 @@ use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::pyset::PythonSet;
 use crate::framework::symbols::windows::{list_processes, Process};
 
+/// Plugin for listing processes in a tree based on their parent process ID.
 pub struct PsTree;
 
 /// One process, reduced to what the tree needs.
@@ -80,9 +79,10 @@ impl Plugin for PsTree {
             }
         }
 
-        // How deep each process sits, and who each one's children are. The
-        // walk goes upwards from every process, so a parent learns of a child
-        // the first time that child is reached from anywhere.
+        // Finds how deep each pid is in the processes list, and builds the
+        // child/level maps. The walk goes upwards from every process, so a
+        // parent learns of a child the first time that child is reached from
+        // anywhere.
         let mut levels: Vec<(u64, u64)> = Vec::new();
         let mut children: HashMap<u64, PythonSet> = HashMap::new();
         let mut ancestors: HashSet<u64> = HashSet::new();
@@ -236,19 +236,16 @@ fn emit(
 
     // The command line and image path live in user space, so they need the
     // process's own address space. A process that has exited has none.
-    let user_space = process.address_space(physical);
-    let (cmd, path) = match &user_space {
-        Ok(layer) => (
-            process
-                .command_line(layer)
-                .map(Value::string)
-                .unwrap_or_else(|_| Value::unreadable()),
-            process
-                .image_path(layer)
-                .map(Value::string)
-                .unwrap_or_else(|_| Value::unreadable()),
-        ),
-        Err(_) => (Value::unreadable(), Value::unreadable()),
+    // Both come from the same structure, and upstream reads them together, so
+    // either one failing leaves both unreported.
+    let both = process.address_space(physical).and_then(|layer| {
+        let cmd = process.command_line(&layer)?;
+        let path = process.image_path(&layer)?;
+        Ok((cmd, path))
+    });
+    let (cmd, path) = match both {
+        Ok((cmd, path)) => (Value::string(cmd), Value::string(path)),
+        Err(_) => (Value::not_available(), Value::not_available()),
     };
 
     grid.push(
@@ -274,8 +271,8 @@ fn emit(
                 .exit_time()
                 .map(wintime_value)
                 .unwrap_or_else(|_| Value::unreadable()),
-            // An empty audit path means the field was never populated, which is
-            // reported as unavailable rather than as an empty string.
+            // If 'audit' is set to the empty string, display
+            // NotAvailableValue.
             match process.audit_image_file_name() {
                 Ok(name) if !name.is_empty() => Value::string(name),
                 _ => Value::not_available(),

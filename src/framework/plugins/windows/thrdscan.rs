@@ -1,4 +1,4 @@
-//! Scan physical memory for thread objects.
+//! Plugin for testing addition of threads scan support to poolscanner.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -22,6 +22,7 @@ use crate::framework::symbols::windows::{process_is_valid, Process};
 /// The largest identifier the kernel ever hands out.
 const MAX_PID: u64 = 0xFFFF_FFFC;
 
+/// Scans for windows threads.
 pub struct ThrdScan;
 
 impl Plugin for ThrdScan {
@@ -57,8 +58,9 @@ impl Plugin for ThrdScan {
         let mut timeline = Timeline::new();
         for row in self.run(context, config).ok()?.rows() {
             let values = &row.values;
-            // A thread with no creation time is almost always one the system
-            // started before it began recording them.
+            // Skip threads with no creation time, mainly system process
+            // threads. Yield the created time, and if there is an exit time,
+            // yield it too.
             if !is_time(&values[7]) {
                 continue;
             }
@@ -98,7 +100,18 @@ pub fn thread_columns() -> Vec<Column> {
     ]
 }
 
-/// Every thread object the pools still hold.
+/// Scans for threads using the poolscanner module and constraints.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `kernel` - The module to use for scanning
+///
+/// # Returns
+///
+/// A list of `_ETHREAD` objects found by scanning memory for the
+/// "Thre" / "Thr\xE5" pool signatures.
 pub fn scan_threads(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Object>> {
     scan_for_tags(context, kernel, &[b"Thr\xe5", b"Thre"])
 }
@@ -136,10 +149,7 @@ pub fn report_threads(
                 continue;
             };
             let (Ok(created), Ok(exited)) = (
-                thread
-                    .member("CreateTime")
-                    .and_then(|time| time.member("QuadPart"))
-                    .and_then(|value| value.as_u64()),
+                crate::framework::symbols::windows::thread_create_time(&thread),
                 thread
                     .member("ExitTime")
                     .and_then(|time| time.member("QuadPart"))
@@ -148,14 +158,15 @@ pub fn report_threads(
                 continue;
             };
 
-            // Identifiers the kernel would never hand out mark an allocation
-            // that only looked like a thread.
+            // Filter junk PIDs: identifiers the kernel would never hand out
+            // mark an allocation that only looked like a thread.
             if pid > MAX_PID || pid == 0 || pid % 4 != 0 {
                 continue;
             }
 
-            // The files a thread starts in are known only through the process
-            // that owns it, and the system process maps none.
+            // Get VAD mappings for valid non-system (PID 4) processes: the
+            // files a thread starts in are known only through the process that
+            // owns it, and the system process maps none.
             let owner = owning_process(&thread, kernel);
             let mut start_path = Value::not_available();
             let mut win32_path = Value::not_available();

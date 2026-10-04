@@ -1,5 +1,3 @@
-//! Report each task's memory mappings, as `/proc/pid/maps` would.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -10,11 +8,12 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::linux::list_tasks;
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Lists all memory maps for all processes.
 pub struct Maps;
 
-/// Mappings larger than this are left alone rather than written out.
+/// Mappings larger than this are left alone rather than written out. 1 Gb.
 pub const MAXSIZE_DEFAULT: u64 = 1024 * 1024 * 1024;
 
 impl Plugin for Maps {
@@ -83,8 +82,9 @@ impl Plugin for Maps {
             .get_int("maxsize")
             .map(|value| value as u64)
             .unwrap_or(MAXSIZE_DEFAULT);
-        // An address selects the mapping that contains it, so only the parts of
-        // a process the caller named are reported.
+        // build filter for addresses if required: if any of the user supplied
+        // addresses would fall within a vma, that vma is reported. Without an
+        // address list, nothing is filtered.
         let wanted: Vec<u64> = config
             .get("address")
             .and_then(|value| {
@@ -97,11 +97,16 @@ impl Plugin for Maps {
             .unwrap_or_default();
         let mut grid = TreeGrid::new(self.columns());
 
-        for task in list_tasks(&context, &kernel, false)? {
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
             let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
             let comm = task.comm().unwrap_or_default();
 
             let mapped = task.vmas().unwrap_or_default();
@@ -157,10 +162,20 @@ impl Plugin for Maps {
     }
 }
 
-/// Write one mapping's contents out, named for the process and the range.
+/// Extracts the complete data for a VMA as a file.
 ///
-/// Pages the capture does not hold are written as zeros, so the file keeps the
-/// shape the mapping had.
+/// # Args
+///
+/// * `task` - a task_struct instance
+/// * `start` - The start virtual address from the vma to dump
+/// * `end` - The end virtual address from the vma to dump
+/// * `maxsize` - Max size of VMA section
+///
+/// # Returns
+///
+/// The name of the file written, or `None` in the case of failure. Pages the
+/// capture does not hold are written as zeros, so the file keeps the shape the
+/// mapping had.
 fn dump_vma(
     context: &Arc<Context>,
     task: &crate::framework::symbols::linux::Task,
@@ -192,11 +207,32 @@ fn dump_vma(
     }
 
     let name = format!("pid.{pid}.vma.{start:#x}-{end:#x}.dmp");
-    let Ok(data) = context.layers.read(&layer, start, size as usize, true) else {
+    // Upstream reads in ten megabyte pieces and opens the file before the
+    // first of them, so a read that fails part way still leaves the pieces
+    // before it behind even though the listing reports a failure.
+    let Ok((stored, mut handle)) = crate::framework::plugins::open_extracted(&name) else {
         return Value::string("Error outputting file");
     };
-    match crate::framework::plugins::write_extracted(&name, &data) {
-        Ok(_) => Value::string(name),
-        Err(_) => Value::string("Error outputting file"),
+    const CHUNK: u64 = 1024 * 1024 * 10;
+    let mut offset = start;
+    let mut complete = true;
+    while offset < start + size {
+        let take = CHUNK.min(start + size - offset);
+        let Ok(piece) = context.layers.read(&layer, offset, take as usize, true) else {
+            complete = false;
+            break;
+        };
+        if std::io::Write::write_all(&mut handle, &piece).is_err() {
+            complete = false;
+            break;
+        }
+        offset += take;
+    }
+    // The name reported is the one written, which is not the one asked for
+    // when a file of that name was already there.
+    if complete {
+        Value::string(stored)
+    } else {
+        Value::string("Error outputting file")
     }
 }

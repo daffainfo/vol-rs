@@ -186,6 +186,9 @@ fn name_or_index(name: String, index: u32) -> String {
 }
 
 /// Read one type record, given its leaf and the bytes after it.
+///
+/// Since types can only refer to earlier types, assigning the name at this
+/// point is fine.
 fn read_record(kind: u16, body: &[u8], index: u32) -> Result<Record> {
     match kind {
         leaf::CLASS
@@ -207,6 +210,7 @@ fn read_record(kind: u16, body: &[u8], index: u32) -> Result<Record> {
                 forward: properties & FORWARD_REFERENCE != 0,
             })
         }
+        // Deal with UNION types.
         leaf::UNION => {
             let properties = u16_at(body, 2)?;
             let fields = u32_at(body, 4)?;
@@ -242,13 +246,15 @@ fn read_record(kind: u16, body: &[u8], index: u32) -> Result<Record> {
         }
         leaf::POINTER => {
             let subtype = u32_at(body, 0)?;
-            // The attributes say how wide the pointer is, in their low bits
-            // after the kind.
+            // The attributes carry the width in six bits of their own. Where
+            // those are empty the kind says it instead, with one kind meaning
+            // a near 32-bit pointer and another a full 64-bit one.
             let attributes = u32_at(body, 4)?;
-            let size = match (attributes >> 13) & 0xFF {
+            let size = match (attributes >> 13) & 0x3F {
                 0 => match attributes & 0x1F {
-                    0x0A | 0x0C => 8,
-                    _ => 4,
+                    0x0A => 4,
+                    0x0C => 8,
+                    _ => return Ok(Record::Other),
                 },
                 width => width as u64,
             };
@@ -742,8 +748,28 @@ fn read_symbols(file: &super::pdb::MultiStreamFile<'_>) -> Result<Map<String, Va
             "The database describes no section headers".to_string(),
         ));
     }
+    // A binary whose code was reordered after linking carries the sections it
+    // was linked with, and a table translating the addresses it recorded into
+    // the ones it ended up with. Where that is present it is the one to use.
+    const ABSENT: u16 = 0xFFFF;
+    let original_sections = u16_at(&debug, optional_at + 20)?;
+    let mapping_stream = u16_at(&debug, optional_at + 8)?;
     let section_stream = u16_at(&debug, optional_at + 10)?;
-    let sections = super::pdb::image_sections(&file.stream(section_stream as usize)?);
+
+    let (sections, mapping) = if original_sections != ABSENT {
+        let sections = super::pdb::image_sections(&file.stream(original_sections as usize)?);
+        let mapping = if mapping_stream != ABSENT {
+            read_mapping(&file.stream(mapping_stream as usize)?)
+        } else {
+            Vec::new()
+        };
+        (sections, mapping)
+    } else {
+        (
+            super::pdb::image_sections(&file.stream(section_stream as usize)?),
+            Vec::new(),
+        )
+    };
 
     let stream = file.stream(symbol_stream)?;
     let mut symbols = Map::new();
@@ -768,7 +794,8 @@ fn read_symbols(file: &super::pdb::MultiStreamFile<'_>) -> Result<Map<String, Va
                     .unwrap_or(at + 2 + length);
                 let raw = String::from_utf8_lossy(&stream[name_at..end]).to_string();
                 let name = strip_name(&raw);
-                let address = sections[segment - 1] as u64 + offset as u64;
+                let recorded = sections[segment - 1] as u64 + offset as u64;
+                let address = translate(&mapping, recorded);
                 let mut described = Map::new();
                 described.insert("address".to_string(), json!(address));
                 if name != raw {
@@ -782,6 +809,37 @@ fn read_symbols(file: &super::pdb::MultiStreamFile<'_>) -> Result<Map<String, Va
         at += 2 + length;
     }
     Ok(symbols)
+}
+
+/// Read the table translating linked addresses into final ones.
+fn read_mapping(data: &[u8]) -> Vec<(u64, u64)> {
+    data.chunks_exact(8)
+        .map(|entry| {
+            let from = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let to = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]);
+            (from as u64, to as u64)
+        })
+        .collect()
+}
+
+/// Where an address ended up, after the reordering the table describes.
+///
+/// The entry covering an address is the last one at or below it. An entry
+/// leading nowhere means the code it covered was dropped.
+fn translate(mapping: &[(u64, u64)], address: u64) -> u64 {
+    if mapping.is_empty() {
+        return address;
+    }
+    let position = match mapping.binary_search_by(|(from, _)| from.cmp(&address)) {
+        Ok(exact) => exact,
+        Err(0) => 0,
+        Err(after) => after - 1,
+    };
+    let (from, to) = mapping[position];
+    if to == 0 {
+        return 0;
+    }
+    to + (address - from)
 }
 
 /// Take off the decoration a compiler puts on a name.
@@ -822,6 +880,19 @@ mod tests {
         // A constant written in hexadecimal only looks decorated.
         assert_eq!(strip_name("__xmm@0000000000000000ffffffff"), "__xmm@0000000000000000ffffffff");
         assert_eq!(strip_name("__real@41612a8800000000"), "__real@41612a8800000000");
+    }
+
+    #[test]
+    fn an_address_is_translated_through_the_reordering_table() {
+        let mapping = vec![(0x1000, 0x5000), (0x2000, 0), (0x3000, 0x9000)];
+        // Inside the first run, carried across by its own offset.
+        assert_eq!(translate(&mapping, 0x1000), 0x5000);
+        assert_eq!(translate(&mapping, 0x1234), 0x5234);
+        // A run leading nowhere means the code was dropped.
+        assert_eq!(translate(&mapping, 0x2500), 0);
+        assert_eq!(translate(&mapping, 0x3010), 0x9010);
+        // Nothing to translate leaves an address alone.
+        assert_eq!(translate(&[], 0x1234), 0x1234);
     }
 
     #[test]

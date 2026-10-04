@@ -1,5 +1,3 @@
-//! Find virtual machines running under the captured host.
-//!
 //! Intel's hardware virtualisation keeps a control structure per guest, one
 //! page long, holding the guest's page-table root and the nested paging root.
 //! Finding those makes the guest's own memory addressable, which is how a
@@ -20,17 +18,28 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Scans for Intel VT-d structures and generates VM volatility configs for them
 pub struct Vmscan;
 
 /// The control structure occupies one page.
+///
+/// The VMCS should have been constructed on the physical layer, even a nested
+/// VMCS. The abort field must be valid, generally 0, although other abort
+/// codes may exist, and the VMCS link pointer is supposed to always be set.
 const PAGE_SIZE: usize = 0x1000;
 
 /// The bit in the host's fourth control register that says virtualisation is
-/// on. A host running a guest has it set.
+/// on.
+///
+/// To have a VMCS the host needs the VTx bit set in CR4. This can false
+/// positive often when all bits are set.
 const CR4_VMXE: u64 = 1 << 13;
 
-/// Bits the fourth control register reserves. A guest with any of them set is
-/// not a guest.
+/// Bits the fourth control register reserves.
+///
+/// The guest CR3 is *exceptionally* unlikely to be 0 and the guest CR4 is
+/// likely to have some bits unset, so a guest with any of these set is not a
+/// guest.
 const CR4_RESERVED: u64 = 0xFFFF_FFFF_FF88_9000;
 
 impl Plugin for Vmscan {
@@ -162,8 +171,8 @@ impl Layout {
     }
 }
 
-/// The arrangements that are installed, in the order the descriptions are
-/// found.
+/// Scan for VMCS structures based on the known VMCS structures found in the
+/// symbols/vmcs directory, in the order the descriptions are found.
 fn layouts(context: &Arc<Context>) -> Vec<Layout> {
     let finder = context.symbol_finder();
     let mut found = Vec::new();

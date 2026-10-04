@@ -1,8 +1,9 @@
-//! Report the AmCache, which records the programs and drivers a system has seen.
-//!
 //! Windows keeps a hive of its own describing every executable and driver it
 //! has come across, whether or not it still exists on disk. That makes it one
 //! of the few records that survives a program deleting itself.
+//!
+//! More information about the records read here can be found in the report
+//! 'Analysis of the AmCache' by Blanche Lagny, 2019.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -21,6 +22,7 @@ use crate::framework::symbols::windows::registry::{
     read_key, subkeys, values, RegistryKey, RegistryValue, ValueType,
 };
 
+/// Extract information on executed applications from the AmCache.
 pub struct Amcache;
 
 /// One record, in the order its columns are reported.
@@ -268,6 +270,9 @@ impl Plugin for Amcache {
 }
 
 /// Which generation of records a key holds.
+///
+/// Depending on the Windows version, the key name will be either the name of
+/// the driver or its path.
 enum Generation {
     WindowsEight,
     WindowsTen,

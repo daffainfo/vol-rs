@@ -1,5 +1,3 @@
-//! Scan memory for NTFS Master File Table records.
-//!
 //! An MFT record describes one file: its timestamps, its names, and where its
 //! data lives. Records are self-identifying (each opens with `FILE`, or with
 //! `BAAD` when the filesystem marked it corrupt), so they can be recovered from
@@ -23,11 +21,14 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, Requiremen
 use crate::framework::renderers::conversion::wintime_unsigned_value;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Scans for MFT FILE objects present in a particular windows memory image.
 pub struct MftScan;
 
-/// What a record's first bytes look like. The fifth byte is where the update
-/// sequence begins, and only two placements of it are ever seen, so searching
-/// for them together rejects most text that happens to read `FILE`.
+/// Yara rule to scan for MFT header signatures.
+///
+/// The fifth byte is where the update sequence begins, and only two placements
+/// of it are ever seen, so searching for them together rejects most text that
+/// happens to read `FILE`.
 const SIGNATURES: [&[u8]; 3] = [b"FILE0", b"FILE*", b"BAAD"];
 
 /// How much of a record is read at a time. Records are 1KB in practice. The
@@ -62,6 +63,9 @@ const ATTRIBUTE_TYPES: &[(u8, &str)] = &[
 ];
 
 /// What a record says it is.
+///
+/// The MFT flags determine the file type or dir. If we don't have a valid
+/// enum, the value is coerced to hex so we can keep the record.
 const RECORD_FLAGS: &[(u8, &str)] = &[
     (0, "Removed"),
     (1, "File"),
@@ -85,6 +89,9 @@ const PERMISSION_FLAGS: &[(u8, &str)] = &[
 
 /// The largest content or name a record is believed about. A record claiming
 /// more than this has been smeared.
+///
+/// 4MB chosen as cutoff instead of 4KB to allow for recovery from
+/// `format /L` created file systems.
 const MAX_RESIDENT: u32 = 0x400000;
 
 impl Plugin for MftScan {
@@ -246,7 +253,7 @@ impl Plugin for MftScan {
     }
 }
 
-/// Reports the streams a file carries beside its own content.
+/// Scans for Alternate Data Stream
 ///
 /// NTFS lets a file hold any number of named streams, which no ordinary
 /// listing shows. Hiding a payload in one is a long-standing technique.
@@ -282,7 +289,7 @@ impl Plugin for Ads {
             Column::string("MFT Type"),
             Column::string("Filename"),
             Column::string("ADS Filename"),
-            Column::bytes("Hexdump"),
+            Column::layer_data("Hexdump"),
         ]
     }
 
@@ -318,7 +325,7 @@ impl Plugin for Ads {
     }
 }
 
-/// Reports file content small enough to be stored inside its MFT record.
+/// Scans for MFT Records with Resident Data
 ///
 /// NTFS keeps a small file's content in the record itself rather than
 /// allocating clusters for it, so those files can be recovered whole from the
@@ -354,7 +361,7 @@ impl Plugin for ResidentData {
             Column::int("Record Number"),
             Column::string("MFT Type"),
             Column::string("Filename"),
-            Column::bytes("Hexdump"),
+            Column::layer_data("Hexdump"),
         ]
     }
 
@@ -461,6 +468,12 @@ impl MftRecord {
     /// The chain has no count: it runs until an attribute names a kind that
     /// does not exist, and a zero-length attribute ends it too, since it would
     /// otherwise never advance.
+    /// Every attribute the record chains, in order.
+    ///
+    /// There is no field that has a count of attributes, so attributes are read
+    /// until an invalid attribute type turns up. The base offset is updated on
+    /// each pass to point at the next one, and where there is no advancement
+    /// the loop would never end, so it is broken then.
     fn attributes(&mut self, context: &Arc<Context>, layer: &str) -> Vec<Attribute> {
         let mut found = Vec::new();
         let mut at = self.first_attribute as usize;

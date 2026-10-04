@@ -1,5 +1,3 @@
-//! List the kernel's sysctl knobs and their handlers.
-//!
 //! sysctl entries expose kernel state and let it be changed. A handler owned by
 //! no loaded extension has been redirected, which lets an attacker intercept or
 //! falsify what the system reports about itself.
@@ -19,6 +17,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::ExtensionResolver;
 
+/// Check sysctl handlers for hooks.
 pub struct CheckSysctl;
 
 /// Guard against a corrupt tree. The real set is a few thousand entries.

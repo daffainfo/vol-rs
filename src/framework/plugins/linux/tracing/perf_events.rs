@@ -1,5 +1,3 @@
-//! List the perf events processes have registered.
-//!
 //! perf can attach a program to almost any kernel or userspace event. It is the
 //! kernel's profiling interface, and equally a way to gain execution on events
 //! of interest, so what is attached is worth enumerating.
@@ -13,10 +11,11 @@ use crate::error::Result;
 use crate::framework::context::{Configuration, Context};
 use crate::framework::objects::utility::walk_list;
 use crate::framework::plugins::linux::kernel_module;
-use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin, Requirement};
+use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::linux::list_tasks;
 
+/// Lists performance events for each process.
 pub struct PerfEvents;
 
 /// The event types perf distinguishes.
@@ -63,18 +62,21 @@ impl Plugin for PerfEvents {
 
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
-        let filter = pid_filter(config);
         let mut grid = TreeGrid::new(self.columns());
 
-        for task in list_tasks(&context, &kernel, false)? {
+        // Walks the `perf_event_list` of each `task_struct` and reports valid
+        // event structures found. This plugin is one of several to detect eBPF
+        // based malware. Events belong to threads as much as to processes, so
+        // the walk covers both. This plugin takes no filter.
+        for task in list_tasks(&context, &kernel, true)? {
             let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
             let comm = task.comm().unwrap_or_default();
 
-            // A task's events hang off its perf context, which most tasks do
-            // not have.
+            // walk the list of perf_event entries for this process. A task's
+            // events hang off its perf context, which most tasks do not have.
+            // If the names are smeared then bail, and if the kernel has the
+            // prog member then ensure it is not 0. We at least need one useful
+            // string.
             let Ok(perf_context) = task
                 .object
                 .member("perf_event_ctxp")

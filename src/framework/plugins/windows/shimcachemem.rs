@@ -1,5 +1,3 @@
-//! Report the shim cache, which records the programs Windows has run.
-//!
 //! The application-compatibility infrastructure keeps a cache of every
 //! executable it has examined, in kernel memory rather than the registry. An
 //! entry survives the program itself being deleted, which is what makes it
@@ -20,9 +18,14 @@ use crate::framework::renderers::conversion::wintime_value;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{pe, versions};
 
+/// Reads Shimcache entries from the ahcache.sys AVL tree
 pub struct ShimcacheMem;
 
 /// The modules the cache lives in, newest first.
+///
+/// These checks must be completed from newest to oldest OS version. The
+/// ahcache kernel module's .data section is iterated over in search of *two*
+/// SHIM handles.
 const CACHE_MODULES: &[&str] = &["ahcache.sys"];
 /// Where the cache lived before it moved out of the kernel proper.
 const KERNEL_MODULES: &[&str] = &[
@@ -92,63 +95,322 @@ impl Plugin for ShimcacheMem {
 
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
+        let physical = crate::framework::plugins::windows::physical_layer(config);
         let table = shimcache_table(&context, &kernel)?;
         let mut grid = TreeGrid::new(self.columns());
 
-        // The cache moved into its own driver with Windows 8.1.
-        let recent = versions::matches(&context, &kernel, versions::IS_WINDOWS_8_1_OR_LATER)
-            || versions::matches(&context, &kernel, versions::IS_WINDOWS_10);
-        let names = if recent { CACHE_MODULES } else { KERNEL_MODULES };
-
-        let (Some((data_offset, data_size)), Some((page_offset, page_size))) = (
-            module_section(&context, &kernel, names, ".data"),
-            module_section(&context, &kernel, names, "PAGE"),
-        ) else {
-            return Ok(grid);
-        };
-
-        // Two handles sit in the driver's data section, and which of them holds
-        // the cache depends on the release.
-        let handle_type = format!("{table}!SHIM_CACHE_HANDLE");
-        let mut heads = Vec::new();
-        let mut offset = data_offset;
-        while offset < data_offset + data_size {
-            if let Some(head) = handle_head(
-                &context,
-                &kernel,
-                &table,
-                &handle_type,
-                offset,
-                page_offset,
-                page_offset + page_size,
-            ) {
-                heads.push(head);
-                if heads.len() == 2 {
-                    break;
-                }
-            }
-            offset += 8;
-        }
-        if heads.len() != 2 {
-            return Ok(grid);
-        }
-        // Later releases keep the cache in the second handle.
-        let head = if recent {
-            heads.remove(1)
+        // Where the cache is kept, and how it is reached, changed twice: the
+        // driver of its own in Windows 8, and before that a table in the
+        // kernel's own data. Windows XP keeps it in a process instead.
+        let entries = if versions::matches(&context, &kernel, &versions::IS_WINDOWS_8_OR_LATER) {
+            find_in_driver(&context, &kernel, &table)
+        } else if versions::matches(&context, &kernel, &versions::IS_2003)
+            || versions::matches(&context, &kernel, &versions::IS_VISTA_OR_LATER)
+            || versions::matches(&context, &kernel, &versions::IS_WINDOWS_7)
+        {
+            find_in_kernel_data(&context, &kernel, &table)
+        } else if versions::matches(&context, &kernel, &versions::IS_WINDOWS_XP_SP2)
+            || versions::matches(&context, &kernel, &versions::IS_WINDOWS_XP_SP3)
+        {
+            find_in_processes(&context, &kernel, &table, &physical)
         } else {
-            heads.remove(0)
-        };
-
-        let entry_type = format!("{table}!SHIM_CACHE_ENTRY");
-        let Ok(list) = head.member("ListEntry") else {
+            eprintln!(
+                "WARNING  volatility3.plugins.windows.shimcachemem: Cannot parse shimcache \
+                 entries for this version of Windows"
+            );
             return Ok(grid);
         };
 
-        for (order, entry) in walk_list(&list, &entry_type, "ListEntry", true)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(entry_is_valid)
-            .enumerate()
+        for (order, entry) in entries.into_iter().enumerate() {
+            emit_entry(&mut grid, order, &entry)?;
+        }
+        Ok(grid)
+    }
+}
+
+/// The entries the driver of Windows 8 and later keeps.
+///
+/// Both the data section and the module's page are required in order to handle
+/// the AVL table accurately.
+///
+/// Two handles sit in its data section, and which of them holds the cache
+/// depends on the release and the width of the kernel.
+fn find_in_driver(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<Object> {
+    let recent = versions::matches(context, kernel, &versions::IS_WINDOWS_8_1_OR_LATER)
+        || versions::matches(context, kernel, &versions::IS_WIN10);
+    let names = if recent { CACHE_MODULES } else { KERNEL_MODULES };
+    let sixty_four_bit = context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|held| held.pointer_size())
+        .unwrap_or(8)
+        == 8;
+
+    let (Some((data_offset, data_size)), Some((page_offset, page_size))) = (
+        module_section(context, kernel, names, ".data"),
+        module_section(context, kernel, names, "PAGE"),
+    ) else {
+        return Vec::new();
+    };
+
+    let handle_type = format!("{table}!SHIM_CACHE_HANDLE");
+    let mut heads = Vec::new();
+    let mut offset = data_offset;
+    let stride = if sixty_four_bit { 8 } else { 4 };
+    while offset < data_offset + data_size {
+        if let Some(head) = handle_head(
+            context,
+            kernel,
+            table,
+            &handle_type,
+            offset,
+            page_offset,
+            page_offset + page_size,
+        ) {
+            heads.push(head);
+            if heads.len() == 2 {
+                break;
+            }
+        }
+        offset += stride;
+    }
+    if heads.len() != 2 {
+        return Vec::new();
+    }
+    // Windows 8 on a 64-bit kernel keeps the cache in the first handle;
+    // everything else keeps it in the second.
+    let head = if !sixty_four_bit && !recent {
+        heads.remove(1)
+    } else if !recent {
+        heads.remove(0)
+    } else {
+        heads.remove(1)
+    };
+
+    let Ok(list) = head.member("ListEntry") else {
+        return Vec::new();
+    };
+    walk_list(&list, &format!("{table}!SHIM_CACHE_ENTRY"), "ListEntry", true)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(entry_is_valid)
+        .collect()
+}
+
+/// The entries a kernel from Windows 2003 to 7 keeps in its own data section.
+///
+/// The cache hangs off a balanced tree whose own structure is what identifies
+/// it: the tree is preceded by a lock and followed by the list head.
+fn find_in_kernel_data(context: &Arc<Context>, kernel: &Module, table: &str) -> Vec<Object> {
+    let (Some((data_offset, data_size)), Some((page_offset, page_size))) = (
+        module_section(context, kernel, KERNEL_MODULES, ".data"),
+        module_section(context, kernel, KERNEL_MODULES, "PAGE"),
+    ) else {
+        return Vec::new();
+    };
+    let stride = context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|held| held.pointer_size() as u64)
+        .unwrap_or(8);
+
+    let mut head = None;
+    let mut offset = data_offset;
+    while offset < data_offset + data_size {
+        if let Some(found) = tree_head(
+            context,
+            kernel,
+            table,
+            offset,
+            page_offset,
+            page_offset + page_size,
+        ) {
+            head = Some(found);
+            break;
+        }
+        offset += stride;
+    }
+    let Some(head) = head else {
+        return Vec::new();
+    };
+    let Ok(list) = head.member("ListEntry") else {
+        return Vec::new();
+    };
+    // Every entry the list names is reported, without the per-entry test the
+    // driver's own listing applies.
+    walk_list(&list, &format!("{table}!SHIM_CACHE_ENTRY"), "ListEntry", true)
+        .unwrap_or_default()
+}
+
+/// The list head a candidate balanced tree is followed by, where the tree and
+/// the lock before it both read as real.
+fn tree_head(
+    context: &Arc<Context>,
+    kernel: &Module,
+    table: &str,
+    offset: u64,
+    page_start: u64,
+    page_end: u64,
+) -> Option<Object> {
+    let tree_type = context
+        .symbol_space
+        .get_type(&format!("{table}!_RTL_AVL_TABLE"))
+        .ok()?;
+    let tree = context.object_from_template(tree_type.clone(), &kernel.layer_name, offset);
+    if !tree_is_valid(&tree, page_start, page_end) {
+        return None;
+    }
+
+    // The lock sits immediately before the tree, aligned to its own size.
+    let lock_size = context
+        .symbol_space
+        .get_type(&kernel.qualified("_ERESOURCE"))
+        .and_then(|template| context.symbol_space.size_of(&template))
+        .ok()?;
+    let alignment = if context
+        .symbol_space
+        .table(&kernel.symbol_table_name)
+        .map(|held| held.pointer_size())
+        .unwrap_or(8)
+        == 8
+    {
+        0x20
+    } else {
+        0x10
+    };
+    let back = lock_size + (offset.wrapping_sub(lock_size) % alignment);
+    if !eresource_is_valid(context, kernel, offset.wrapping_sub(back)) {
+        return None;
+    }
+
+    let tree_size = context.symbol_space.size_of(&tree_type).ok()?;
+    let head_offset = offset + tree_size;
+    if !context
+        .layers
+        .is_valid(&kernel.layer_name, head_offset, 1)
+    {
+        return None;
+    }
+    let head = context.object(
+        &format!("{table}!SHIM_CACHE_ENTRY"),
+        &kernel.layer_name,
+        head_offset,
+    )
+    .ok()?;
+    entry_is_valid(&head).then_some(head)
+}
+
+/// The entries Windows XP keeps in the process that owns the cache.
+///
+/// The cache is a fixed-size array inside one of the process's own mappings,
+/// which is found by the marker it opens with.
+fn find_in_processes(
+    context: &Arc<Context>,
+    kernel: &Module,
+    table: &str,
+    physical: &str,
+) -> Vec<Object> {
+    const COUNT_OFFSET: u64 = 0x8;
+    const MAXIMUM_ENTRIES: u64 = 0x60;
+    const ORDER_OFFSET: u64 = 0x10;
+    const HEADER_SIZE: u64 = 0x190;
+    const ENTRY_SIZE: u64 = 0x228;
+    const MARKER: [u8; 4] = [0xEF, 0xBE, 0xAD, 0xDE];
+
+    let mut found = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for process in crate::framework::symbols::windows::list_processes(context, kernel)
+        .unwrap_or_default()
+    {
+        for vad in crate::framework::plugins::windows::vadinfo::walk_vad_tree(
+            context, kernel, &process,
+        )
+        .unwrap_or_default()
+        {
+            // Only a private, read-write mapping holds the cache.
+            if crate::framework::plugins::windows::vadinfo::tag(context, &vad).as_deref()
+                != Some("Vad ")
+            {
+                continue;
+            }
+            let protection = vad
+                .member("u")
+                .and_then(|union| union.member("VadFlags"))
+                .and_then(|flags| flags.member("Protection"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if protection != 4 {
+                continue;
+            }
+            let Ok(layer) = process.address_space(physical) else {
+                continue;
+            };
+            let Some(start) = crate::framework::plugins::windows::vadinfo::start_vpn(&vad) else {
+                continue;
+            };
+
+            match context.layers.read(&layer, start, 4, false) {
+                Ok(data) if data == MARKER => {}
+                _ => continue,
+            }
+
+            let count = match context.layers.read(&layer, start + COUNT_OFFSET, 4, false) {
+                Ok(data) => u32::from_le_bytes(data.try_into().unwrap()) as u64,
+                Err(_) => continue,
+            };
+            if count > MAXIMUM_ENTRIES {
+                continue;
+            }
+
+            for index in 0..count {
+                let at = start + ORDER_OFFSET + index * 4;
+                let Ok(data) = context.layers.read(&layer, at, 4, false) else {
+                    continue;
+                };
+                let position = u32::from_le_bytes(data.try_into().unwrap()) as u64;
+                if position > MAXIMUM_ENTRIES - 1 {
+                    continue;
+                }
+                let entry_offset = start + HEADER_SIZE + ENTRY_SIZE * position;
+                if !context.layers.is_valid(&layer, entry_offset, 1) {
+                    continue;
+                }
+                // An entry reached through two processes is reported once, and
+                // the same bytes are what makes them the same entry.
+                let Ok(mapped) = context
+                    .layers
+                    .get(&layer)
+                    .and_then(|handle| handle.mapping(&context.layers, entry_offset, 1, false))
+                else {
+                    continue;
+                };
+                let Some(mapping) = mapped.first().map(|entry| entry.mapped_offset) else {
+                    continue;
+                };
+                if !seen.insert(mapping) {
+                    continue;
+                }
+                let Ok(entry) = context.object(
+                    &format!("{table}!SHIM_CACHE_ENTRY"),
+                    &layer,
+                    entry_offset,
+                ) else {
+                    continue;
+                };
+                if !entry_is_valid(&entry) {
+                    continue;
+                }
+                found.push(entry);
+            }
+        }
+    }
+    found
+}
+
+/// Write one entry as a row.
+fn emit_entry(grid: &mut TreeGrid, order: usize, entry: &Object) -> Result<()> {
+    {
         {
             let detail = entry
                 .member("ListEntryDetail")
@@ -194,15 +456,34 @@ impl Plugin for ShimcacheMem {
                 ],
             )?;
         }
-        Ok(grid)
     }
+    Ok(())
 }
 
 /// Whether an entry's links hold together.
+///
+/// On some platforms `ListEntry.Blink` is null, so that cannot be validated on
+/// its own.
 fn entry_is_valid(entry: &Object) -> bool {
     let Ok(list) = entry.member("ListEntry") else {
-        // An entry with no links at all is judged by its contents instead.
-        return entry.member("LastModified").is_ok();
+        // Shim entries on Windows XP do not have list entry attributes; in this
+        // case, perform a different set of validations. The two times have to
+        // read, and the size has to be something.
+        return entry
+            .member("LastModified")
+            .and_then(|time| time.member("QuadPart"))
+            .and_then(|time| time.as_u64())
+            .is_ok()
+            && entry
+                .member("LastUpdate")
+                .and_then(|time| time.member("QuadPart"))
+                .and_then(|time| time.as_u64())
+                .is_ok()
+            && entry
+                .member("FileSize")
+                .and_then(|size| size.as_i64())
+                .map(|size| size != 0)
+                .unwrap_or(false);
     };
     let (Ok(forward), Ok(backward)) = (
         list.member("Flink").and_then(|link| link.pointer_value()),
@@ -279,10 +560,31 @@ fn file_path(entry: &Object) -> Value {
     let Ok(path) = entry.member("Path") else {
         return Value::unreadable();
     };
-    match unicode_string(&path) {
-        Ok(text) => Value::string(text),
-        Err(_) => Value::unreadable(),
+    // A path held as a counted string is read through it. One held as an array
+    // of characters is read straight out of the entry, up to its own length.
+    if path.has_member("Buffer") {
+        return match unicode_string(&path) {
+            Ok(text) => Value::string(text),
+            Err(_) => Value::unreadable(),
+        };
     }
+    let Ok(count) = path.count() else {
+        return Value::unreadable();
+    };
+    let Ok(data) = path
+        .context()
+        .layers
+        .read(path.layer_name(), path.offset(), count as usize, false)
+    else {
+        return Value::unreadable();
+    };
+    let text = crate::framework::objects::utility::decode_utf16_le(&data);
+    // The text ends at its first terminator, which a replacement character
+    // counts as, since that is where decoding first went wrong.
+    let end = text
+        .find(|character| character == '\0' || character == '\u{FFFD}')
+        .unwrap_or(text.len());
+    Value::string(text[..end].to_string())
 }
 
 /// The head of the cache a handle names, if the handle is one at all.
@@ -493,13 +795,21 @@ fn shimcache_table(context: &Arc<Context>, kernel: &Module) -> Result<String> {
         .unwrap_or(8)
         == 8;
 
-    let candidates: &[(&[versions::Check], bool, &str)] = &[
-        (versions::IS_WINDOWS_10, true, "shimcache-win10-x64"),
-        (versions::IS_WINDOWS_10, false, "shimcache-win10-x86"),
-        (versions::IS_WINDOWS_8_OR_LATER, true, "shimcache-win8-x64"),
-        (versions::IS_WINDOWS_8_OR_LATER, false, "shimcache-win8-x86"),
-        (versions::IS_VISTA_OR_LATER, true, "shimcache-vista-x64"),
-        (versions::IS_VISTA_OR_LATER, false, "shimcache-vista-x86"),
+    let candidates: &[(&versions::Distinguisher, bool, &str)] = &[
+        (&versions::IS_WIN10, true, "shimcache-win10-x64"),
+        (&versions::IS_WIN10, false, "shimcache-win10-x86"),
+        (&versions::IS_WINDOWS_8_OR_LATER, true, "shimcache-win8-x64"),
+        (&versions::IS_WINDOWS_8_OR_LATER, false, "shimcache-win8-x86"),
+        (&versions::IS_WINDOWS_7, true, "shimcache-win7-x64"),
+        (&versions::IS_WINDOWS_7, false, "shimcache-win7-x86"),
+        (&versions::IS_VISTA_OR_LATER, true, "shimcache-vista-x64"),
+        (&versions::IS_VISTA_OR_LATER, false, "shimcache-vista-x86"),
+        (&versions::IS_2003, false, "shimcache-2003-x86"),
+        (&versions::IS_2003, true, "shimcache-2003-x64"),
+        (&versions::IS_WINDOWS_XP_SP3, false, "shimcache-xp-sp3-x86"),
+        (&versions::IS_WINDOWS_XP_SP2, false, "shimcache-xp-sp2-x86"),
+        (&versions::IS_XP_OR_2003, true, "shimcache-xp-2003-x64"),
+        (&versions::IS_XP_OR_2003, false, "shimcache-xp-2003-x86"),
     ];
 
     let table = candidates

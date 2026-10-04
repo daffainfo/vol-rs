@@ -77,7 +77,11 @@ impl ValueType {
     }
 }
 
-/// A key read out of a hive.
+/// Extension to allow traversal of registry keys.
+///
+/// A key read out of a hive. Note that some attributes are unpredictably blank
+/// across different OS versions while others are populated, so all
+/// possibilities are checked and the first non-empty one is taken.
 #[derive(Clone)]
 pub struct RegistryKey {
     pub object: Object,
@@ -91,6 +95,10 @@ pub struct RegistryKey {
 
 impl RegistryKey {
     /// The key's own name.
+    ///
+    /// Registry key names are not case sensitive, so callers comparing them
+    /// should compare likewise. See
+    /// <https://learn.microsoft.com/en-us/windows/win32/sysinfo/structure-of-the-registry>
     ///
     /// Names are stored either as Latin-1 bytes or as UTF-16, which a flag bit
     /// distinguishes.
@@ -147,7 +155,7 @@ impl RegistryKey {
     }
 }
 
-/// A value read out of a hive.
+/// Extensions to extract data from CM_KEY_VALUE nodes.
 pub struct RegistryValue {
     pub object: Object,
     pub cell_index: u64,
@@ -170,8 +178,11 @@ impl RegistryValue {
 
     /// The raw bytes of the value's data.
     ///
-    /// Data of four bytes or fewer is stored inline in the `Data` field itself,
-    /// with the high bit of the length marking that case.
+    /// Determine if the data is stored inline: data of four bytes or fewer is
+    /// stored inline in the `Data` field itself, with the high bit of the
+    /// length marking that case, and the high bit is then removed. Anything
+    /// larger is bigdata, where, oddly, we get a list of addresses, at which
+    /// are addresses, which then point to data blocks.
     pub fn data(&self, hive: &RegistryHive) -> Result<Vec<u8>> {
         let raw_length = self.object.member("DataLength")?.as_u64()?;
         let inline = raw_length & 0x8000_0000 != 0;
@@ -274,11 +285,14 @@ fn read_cell_name(
         true,
     )?;
 
-    Ok(if compressed {
+    let name: String = if compressed {
         data.iter().map(|&byte| byte as char).collect()
     } else {
         decode_utf16(&data)
-    })
+    };
+    // A name is read as a string of the recorded length, and a string ends at
+    // its first terminator however many bytes were asked for.
+    Ok(name.split('\0').next().unwrap_or_default().to_string())
 }
 
 /// Read the key at a cell index, if the cell really is a key.
@@ -320,9 +334,10 @@ pub fn subkeys(
 ) -> Result<Vec<RegistryKey>> {
     let mut results = Vec::new();
 
-    // A key has a stable subkey list and a volatile one. The recorded counts
-    // are not consulted: a volatile list can hold keys the count does not
-    // admit to, and the list itself says when it ends.
+    // Returns a list of the key nodes. A key has a stable subkey list and a
+    // volatile one. The recorded counts are not consulted: a volatile list can
+    // hold keys the count does not admit to, and the list itself says when it
+    // ends.
     for store in 0..2u64 {
         let Ok(list_index) = key
             .object
@@ -357,8 +372,11 @@ pub fn subkeys(
 
 /// Read a subkey list cell, which may itself point at further lists.
 ///
-/// `lf` and `lh` hold `(cell, hash)` pairs. `li` holds bare cell indices. `ri`
-/// holds indices of further lists, so it recurses.
+/// `lf` and `lh` hold `(cell, hash)` pairs: the keylist appears to include 4
+/// bytes of key name after each value, so either the list is doubled and only
+/// the even items used, or the array type becomes a struct with both parts.
+/// `li` holds bare cell indices. `ri` holds indices of further lists, so it
+/// recurses.
 fn read_subkey_list(
     context: &Arc<Context>,
     hive: &RegistryHive,
@@ -472,6 +490,15 @@ pub fn values(
         if cell_index == 0 {
             continue;
         }
+        // A cell is read as whatever its own two-byte signature names, and only
+        // a value cell is a value. Anything else in the list is not one.
+        let signature = context
+            .layers
+            .read(hive.name(), cell_index + 4, 2, false)
+            .unwrap_or_default();
+        if signature != b"vk" {
+            continue;
+        }
         results.push(RegistryValue {
             object: context.object_from_template(
                 template.clone(),
@@ -557,7 +584,7 @@ pub fn value_cell(kind: ValueType, data: &[u8]) -> crate::framework::renderers::
             };
             Value::MultiTypeData(number.to_string().into_bytes())
         }
-        ValueType::Binary | ValueType::None => Value::HexDump(data.to_vec()),
+        ValueType::Binary | ValueType::None => Value::MultiTypeHex(data.to_vec()),
         ValueType::MultiString => Value::MultiString(data.to_vec()),
         _ => Value::WideText(data.to_vec()),
     }

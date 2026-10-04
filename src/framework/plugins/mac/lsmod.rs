@@ -1,5 +1,3 @@
-//! List the loaded kernel extensions on a Mac system.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,6 +11,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::list_extensions;
 
+/// Lists loaded kernel modules.
 pub struct Lsmod;
 
 impl Plugin for Lsmod {
@@ -40,6 +39,7 @@ impl Plugin for Lsmod {
         ]
     }
 
+    /// Lists all the modules in the primary layer.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let mut grid = TreeGrid::new(self.columns());

@@ -1,5 +1,3 @@
-//! Report each process's command line, read from its PEB.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -12,6 +10,7 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::list_processes;
 
+/// Lists process command line arguments.
 pub struct CmdLine;
 
 impl Plugin for CmdLine {
@@ -51,14 +50,16 @@ impl Plugin for CmdLine {
                 continue;
             }
 
-            // The command line lives in user space, so it can only be read
-            // through the process's own page tables.
+            // Extracts the cmdline from the PEB, which lives in user space, so
+            // it can only be read through the process's own page tables.
             let args = match process
                 .address_space(&physical)
                 .and_then(|layer| process.command_line(&layer))
             {
-                Ok(line) => Value::string(line),
-                Err(_) => Value::unreadable(),
+                // An empty command line is no more readable than a failed
+                // read, which is how upstream reports both.
+                Ok(line) if !line.is_empty() => Value::string(line),
+                _ => Value::unreadable(),
             };
 
             grid.push(

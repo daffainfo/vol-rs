@@ -1,5 +1,3 @@
-//! List the certificates the registry's certificate stores hold.
-//!
 //! Each store keeps one key per certificate, named after the certificate's
 //! thumbprint, whose values carry the certificate itself and the name it is
 //! displayed under. Reading them says which roots a machine trusts, which is
@@ -32,6 +30,7 @@ const PROPERTY_NAME: u64 = 0x1_0000_000B;
 /// The property holding the certificate itself.
 const PROPERTY_CERTIFICATE: u64 = 0x1_0000_0020;
 
+/// Lists the certificates in the registry's Certificate Store.
 pub struct Certificates;
 
 impl Plugin for Certificates {

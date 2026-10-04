@@ -1,5 +1,3 @@
-//! List the threads each process owns, and the kernel threads no module claims.
-//!
 //! A thread found by walking a process's own list is one the kernel still
 //! acknowledges. A kernel thread whose entry point falls in no loaded module
 //! is the opposite: nothing on the system admits to having started it, which
@@ -28,6 +26,7 @@ const SYSTEM_PID: u64 = 4;
 /// A thread the kernel has finished with.
 const TERMINATED: u64 = 4;
 
+/// Lists process threads
 pub struct Threads;
 
 impl Plugin for Threads {
@@ -90,8 +89,9 @@ impl Plugin for Threads {
             let Ok(head) = process.object.member("ThreadListHead") else {
                 continue;
             };
-            // A list that loops back on itself is followed only once. A
-            // corrupted link would otherwise be walked forever.
+            // Lists the Threads of a specific process. A list that loops back
+            // on itself is followed only once, since a corrupted link would
+            // otherwise be walked forever.
             let mut seen: Vec<u64> = Vec::new();
             for thread in walk_list(
                 &head,
@@ -112,7 +112,7 @@ impl Plugin for Threads {
     }
 }
 
-/// Kernel threads whose entry point belongs to no loaded module.
+/// Lists process threads
 pub struct OrphanKernelThreads;
 
 impl Plugin for OrphanKernelThreads {
@@ -173,8 +173,12 @@ impl Plugin for OrphanKernelThreads {
         let kernel_space_start =
             crate::framework::plugins::windows::modules::kernel_space_start(&context, &kernel);
 
+        // Yields thread objects of kernel threads that do not map to a module.
         let mut orphans: Vec<Object> = Vec::new();
         for thread in scan_threads(&context, &kernel)? {
+            // We don't want smeared or terminated threads, so we access the
+            // owning process (which could also be terminated or smeared) plus
+            // check the start address holding page.
             let Some((pid, parent_pid)) = owning_identifiers(&thread, &kernel) else {
                 continue;
             };
@@ -185,16 +189,22 @@ impl Plugin for OrphanKernelThreads {
                 continue;
             };
 
-            // Only the kernel's own threads are of interest, and the kernel
-            // starts them from the system process or one of its children.
+            // we only care about kernel threads, 4 = System. Previous methods
+            // for determining if a thread was a kernel thread such as bit
+            // fields and flags are not stable in Win10+, so we check if the
+            // thread is from the kernel itself or one its child kernel
+            // processes (MemCompression, Registry, ...).
             if pid != SYSTEM_PID && parent_pid != SYSTEM_PID {
                 continue;
             }
 
+            // if the thread has an exit time or terminated (4) state, then
+            // skip it. A live thread keeps a list where its exit time would be,
+            // so the value reads as a large negative number. It is signed.
             let exited = thread
                 .member("ExitTime")
                 .and_then(|time| time.member("QuadPart"))
-                .and_then(|value| value.as_u64())
+                .and_then(|value| value.as_i64())
                 .unwrap_or(0);
             let state = thread
                 .member("Tcb")
@@ -205,12 +215,13 @@ impl Plugin for OrphanKernelThreads {
                 continue;
             }
 
-            // A kernel thread starting in user space is a smeared or
-            // half-torn-down structure, not a real one.
+            // threads pointing into userland, which is from smeared or
+            // terminated threads
             if start < kernel_space_start {
                 continue;
             }
 
+            // alert on threads that do not map to a module
             if collection.modules_at(&context, start).is_empty() {
                 orphans.push(thread);
             }

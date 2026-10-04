@@ -47,9 +47,6 @@ pub fn unicode_string(object: &Object) -> Result<String> {
     }
     let buffer = object.member("Buffer")?;
     let address = buffer.pointer_value()?;
-    if address == 0 {
-        return Ok(String::new());
-    }
     // The length is in bytes but the characters are UTF-16, and an absurd length
     // means the structure was misread rather than that the string is huge.
     if length > 0x10000 {
@@ -64,14 +61,10 @@ pub fn unicode_string(object: &Object) -> Result<String> {
             .context()
             .layers
             .read(buffer.native_layer_name(), address, length, false)?;
-    let units: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
     // Decoded whole, then cut at the first terminator: a byte that is not
     // valid text becomes a replacement character and the string carries on,
     // which is what upstream prints.
-    let decoded = String::from_utf16_lossy(&units);
+    let decoded = decode_utf16(&data);
     let end = decoded.find('\0').unwrap_or(decoded.len());
     Ok(decoded[..end].to_string())
 }
@@ -195,7 +188,10 @@ fn walk_list_into(
         // readable counts, even when the link out of it is not.
         results.push(object.clone());
 
-        let next = match object.member(member).and_then(|entry| entry.member(&link)) {
+        // The link is read as a list of its own at that address rather than as
+        // a member of the containing structure, which is what upstream does and
+        // is the only thing that works when the link sits inside a union.
+        let next = match head.at_offset(current).member(&link) {
             Ok(entry) => match entry.pointer_value() {
                 Ok(value) => value,
                 Err(error) => {
@@ -439,4 +435,155 @@ mod tests {
         assert!(lines[0].ends_with("ABCDEFGHIJKLMNOP"));
         assert!(lines[1].ends_with(".."));
     }
+}
+
+/// A byte string written the way Python writes one.
+///
+/// Several plugins print a value that is bytes on the Python side, and what
+/// reaches the table is its representation rather than its contents: a `b`, a
+/// pair of quotes, and escapes inside.
+pub fn python_bytes_repr(bytes: &[u8]) -> String {
+    // A single quote inside the value switches the surrounding quotes to
+    // double ones, so that the value itself needs no escaping.
+    let quote = if bytes.contains(&b'\'') && !bytes.contains(&b'"') {
+        '"'
+    } else {
+        '\''
+    };
+
+    let mut text = String::with_capacity(bytes.len() + 3);
+    text.push('b');
+    text.push(quote);
+    for byte in bytes {
+        match byte {
+            b'\\' => text.push_str("\\\\"),
+            b'\t' => text.push_str("\\t"),
+            b'\n' => text.push_str("\\n"),
+            b'\r' => text.push_str("\\r"),
+            byte if *byte as char == quote => {
+                text.push('\\');
+                text.push(quote);
+            }
+            0x20..=0x7E => text.push(*byte as char),
+            byte => text.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    text.push(quote);
+    text
+}
+
+#[cfg(test)]
+mod repr_tests {
+    use super::python_bytes_repr;
+
+    #[test]
+    fn bytes_are_written_the_way_python_writes_them() {
+        assert_eq!(python_bytes_repr(b"foo"), "b'foo'");
+        assert_eq!(python_bytes_repr(b""), "b''");
+        assert_eq!(python_bytes_repr(b"\xff"), "b'\\xff'");
+        assert_eq!(python_bytes_repr(b"it's"), "b\"it's\"");
+        assert_eq!(python_bytes_repr(b"say \"hi\""), "b'say \"hi\"'");
+        assert_eq!(python_bytes_repr(b"a\nb\0"), "b'a\\nb\\x00'");
+    }
+}
+
+/// Decode wide text the way Python's `utf-16-le` codec does with
+/// `errors="replace"`.
+///
+/// An unpaired surrogate becomes a replacement character, which Rust's own
+/// lossy decoding already does, and so does a trailing byte with no partner,
+/// which it does not.
+pub fn decode_utf16_le(data: &[u8]) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let mut text = String::from_utf16_lossy(&units);
+    if data.len() % 2 == 1 {
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    text
+}
+
+/// The same, big-endian.
+pub fn decode_utf16_be(data: &[u8]) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+        .collect();
+    let mut text = String::from_utf16_lossy(&units);
+    if data.len() % 2 == 1 {
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    text
+}
+
+/// Decode wide text the way Python's `utf16` codec does, which reads a byte
+/// order mark where there is one and assumes little-endian where there is not.
+pub fn decode_utf16(data: &[u8]) -> String {
+    match data {
+        [0xFF, 0xFE, rest @ ..] => decode_utf16_le(rest),
+        [0xFE, 0xFF, rest @ ..] => decode_utf16_be(rest),
+        _ => decode_utf16_le(data),
+    }
+}
+
+#[cfg(test)]
+mod wide_tests {
+    use super::{decode_utf16, decode_utf16_le};
+
+    #[test]
+    fn a_byte_with_no_partner_becomes_a_replacement() {
+        assert_eq!(decode_utf16_le(b"A"), "\u{fffd}");
+        assert_eq!(decode_utf16_le(b"A\x00B"), "A\u{fffd}");
+        assert_eq!(decode_utf16_le(b"\x00"), "\u{fffd}");
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_becomes_a_replacement() {
+        assert_eq!(decode_utf16_le(b"\x00\xd8"), "\u{fffd}");
+        assert_eq!(decode_utf16_le(b"\x00\xd8\x00\xdc"), "\u{10000}");
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_read_and_removed() {
+        assert_eq!(decode_utf16(b"\xff\xfe"), "");
+        assert_eq!(decode_utf16(b"\xff\xfeA\x00"), "A");
+        assert_eq!(decode_utf16(b"\xfe\xff\x00A"), "A");
+        assert_eq!(decode_utf16(b"A\x00"), "A");
+    }
+
+    #[test]
+    fn an_embedded_null_is_a_character_not_a_terminator() {
+        assert_eq!(decode_utf16_le(b"A\x00\x00\x00B\x00"), "A\0B");
+    }
+}
+
+/// Split text the way Python's `str.splitlines` splits it.
+///
+/// It breaks on more than the newline, and the extra characters do appear in
+/// the kernel's own buffers.
+pub fn python_splitlines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e) {
+            lines.push(&text[start..index]);
+            // A carriage return followed by a newline is one break.
+            if byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                index += 1;
+            }
+            index += 1;
+            start = index;
+            continue;
+        }
+        index += 1;
+    }
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+    lines
 }

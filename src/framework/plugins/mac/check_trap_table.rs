@@ -1,5 +1,3 @@
-//! Check the Mach trap table for hooked entries.
-//!
 //! Mach traps are the kernel's other system call interface, dispatched through
 //! their own table. It is hooked the same way and checked the same way.
 //!
@@ -15,6 +13,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::ExtensionResolver;
 
+/// Check mach trap table for hooks.
 pub struct CheckTrapTable;
 
 

@@ -3,7 +3,7 @@
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
-use crate::error::Result;
+use crate::error::{Result, VolatilityError};
 use crate::framework::objects::Object;
 
 /// Render a `_SID` in the conventional `S-1-5-21-...` string form.
@@ -14,15 +14,22 @@ pub fn format_sid(sid: &Object) -> Result<String> {
     let revision = sid.member("Revision")?.as_u64()?;
     let count = sid.member("SubAuthorityCount")?.as_u64()?;
 
-    let authority_bytes = sid.member("IdentifierAuthority")?.member("Value")?;
-    let mut authority: u64 = 0;
-    for index in 0..6 {
-        authority = (authority << 8) | authority_bytes.index(index)?.as_u64()?;
+    // The same two checks the Windows API makes before calling a structure a
+    // security identifier. Failing either means this is not one, and the
+    // reference implementation stops reading the token rather than skipping
+    // the entry.
+    if revision & 0xF != 1 || count > 15 {
+        return Err(VolatilityError::Other(
+            "Not a security identifier".to_string(),
+        ));
     }
 
+    // The authority is six bytes, of which the reference implementation keeps
+    // the last. Every authority Windows defines fits in that byte.
+    let authority_bytes = sid.member("IdentifierAuthority")?.member("Value")?;
+    let authority = authority_bytes.index(5)?.as_u64()?;
+
     let mut text = format!("S-{revision}-{authority}");
-    // A count beyond the architectural maximum means the structure was misread.
-    let count = count.min(15);
 
     // The sub-authorities are declared as an array of one and continue past
     // its end, so they are read by position rather than by index.

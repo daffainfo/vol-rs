@@ -1,8 +1,9 @@
 //! Objects: typed views onto bytes in a layer.
 //!
-//! An `Object` pairs a template with a location, a layer and an offset. It
-//! reads lazily, so constructing one costs nothing and walking a large
-//! structure only touches the bytes actually asked for.
+//! A base object required to be the ancestor of every object used in
+//! volatility. An `Object` pairs a template with a location, a layer and an
+//! offset. It reads lazily, so constructing one costs nothing and walking a
+//! large structure only touches the bytes actually asked for.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -19,7 +20,15 @@ use crate::framework::objects::template::{
 };
 use crate::framework::symbols::isf::Endian;
 
-/// Where an object lives and what type it has.
+/// Contains common information useful/pertinent only to an individual object
+/// (like an instance).
+///
+/// This typically contains information such as the layer the object belongs to,
+/// the offset where it was constructed, and if it is a subordinate object, its
+/// parent.
+///
+/// This is primarily used to reduce the number of parameters passed to object
+/// constructors and keep them all together in a single place.
 #[derive(Clone)]
 pub struct ObjectInfo {
     pub layer_name: String,
@@ -72,7 +81,8 @@ impl Object {
         }
     }
 
-    /// Location and type metadata, mirroring the `vol` attribute plugins use.
+    /// Returns the volatility specific object information, which is what
+    /// plugins reach through the `vol` attribute.
     pub fn vol(&self) -> &ObjectInfo {
         &self.info
     }
@@ -102,12 +112,36 @@ impl Object {
         &self.info.type_name
     }
 
+    /// Returns the symbol table name for this particular object.
+    ///
+    /// A plain name is not enough to look a type up again, so anything that
+    /// has to name a second type relative to this one needs the table as well.
+    /// `None` where the object's symbol does not contain an explicit table.
+    pub fn table_name(&self) -> Option<String> {
+        // A member of a structure carries no table of its own, so the chain of
+        // parents is followed until one that does is reached.
+        let mut current = Some(self);
+        while let Some(object) = current {
+            if let Ok(template) = object.resolved_template() {
+                match template.as_ref() {
+                    Template::Struct(structure) => return Some(structure.table.clone()),
+                    Template::Enumeration(enumeration) => {
+                        return Some(enumeration.table.clone())
+                    }
+                    _ => {}
+                }
+            }
+            current = object.info.parent.as_deref();
+        }
+        None
+    }
+
     /// The template with any reference expanded.
     pub fn resolved_template(&self) -> Result<Arc<Template>> {
         self.context.symbol_space.resolve(&self.template)
     }
 
-    /// Size in bytes of this object.
+    /// Returns the size of the template.
     pub fn size(&self) -> Result<u64> {
         self.context.symbol_space.size_of(&self.template)
     }
@@ -301,8 +335,15 @@ impl Object {
         }
     }
 
-    /// Whether the struct has a member of this name, following anonymous
-    /// members.
+    /// Returns whether the object would contain a member called `name`.
+    ///
+    /// # Args
+    ///
+    /// * `name` - Name to test whether a member exists within the type
+    ///   structure
+    ///
+    /// Anonymous members are followed, so a member they carry counts as one of
+    /// this object's own.
     pub fn has_member(&self, name: &str) -> bool {
         self.context
             .symbol_space
@@ -313,6 +354,13 @@ impl Object {
 
     /// A member of this struct or union.
     pub fn member(&self, name: &str) -> Result<Object> {
+        // A member reached through a pointer is a member of what the pointer
+        // refers to. Upstream gets there by attribute access, which follows
+        // the pointer on its own, so a port has to follow it here.
+        if matches!(self.resolved_template()?.as_ref(), Template::Pointer { .. }) {
+            return self.dereference()?.member(name);
+        }
+
         let (offset, template) = self
             .context
             .symbol_space
@@ -404,9 +452,18 @@ impl Object {
 
     /// Re-interpret the same bytes as a different type, given as `table!name`.
     pub fn cast(&self, type_name: &str) -> Result<Object> {
-        let template = self.context.symbol_space.get_type(type_name)?;
-        Ok(self
-            .rebuild(template, self.info.offset))
+        // A name with no table belongs to the table this object came from,
+        // which is how upstream resolves one.
+        let qualified = if type_name.contains('!') {
+            type_name.to_string()
+        } else {
+            match self.table_name() {
+                Some(table) => crate::framework::symbols::join_name(&table, type_name),
+                None => type_name.to_string(),
+            }
+        };
+        let template = self.context.symbol_space.get_type(&qualified)?;
+        Ok(self.rebuild(template, self.info.offset))
     }
 
     /// Re-interpret the same bytes using an already-built template.
@@ -556,12 +613,12 @@ pub fn decode_string(data: &[u8], encoding: Encoding) -> String {
             decoded[..end].to_string()
         }
         Encoding::Utf16Le => {
-            let units: Vec<u16> = data
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .take_while(|&unit| unit != 0)
-                .collect();
-            String::from_utf16_lossy(&units)
+            // Decoded whole, so that a byte with no partner becomes a
+            // replacement character as it does upstream, and then cut at the
+            // first terminator.
+            let decoded = crate::framework::objects::utility::decode_utf16_le(data);
+            let end = decoded.find('\0').unwrap_or(decoded.len());
+            decoded[..end].to_string()
         }
     }
 }

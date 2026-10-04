@@ -1,8 +1,10 @@
 //! The analysis context: the layers, symbols and configuration a run works on.
 //!
-//! Everything a plugin touches hangs off a `Context`, which is shared behind an
-//! `Arc` so objects can hold onto it cheaply. Interior mutability lets automagic
-//! add layers and symbol tables after the context exists.
+//! Allows objects to have requirements and read configuration data from the
+//! context config tree. Everything a plugin touches hangs off a `Context`,
+//! which is shared behind an `Arc` so objects can hold onto it cheaply.
+//! Interior mutability lets automagic add layers and symbol tables after the
+//! context exists.
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -64,7 +66,8 @@ impl ConfigValue {
     }
 }
 
-/// A hierarchical configuration store, keyed by dotted paths.
+/// The core of configuration data: a mapping that stores keys within itself,
+/// and also stores lower hierarchies.
 #[derive(Default)]
 pub struct Configuration {
     values: RwLock<HashMap<String, ConfigValue>>,
@@ -97,6 +100,9 @@ impl Configuration {
     }
 
     /// Every key under `prefix`, with the prefix stripped.
+    ///
+    /// Upstream's equivalent returns the `path` up to a certain depth, where a
+    /// negative depth returns all elements except for the last few.
     pub fn branch(&self, prefix: &str) -> HashMap<String, ConfigValue> {
         let full_prefix = format!("{prefix}.");
         self.values
@@ -124,7 +130,10 @@ impl Configuration {
     }
 }
 
-/// Join configuration path components.
+/// Joins configuration paths together.
+///
+/// If a path element (particularly the first) is empty, then it is removed from
+/// the list.
 pub fn path_join(parts: &[&str]) -> String {
     parts
         .iter()

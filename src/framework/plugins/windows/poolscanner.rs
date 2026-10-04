@@ -1,5 +1,3 @@
-//! Scan physical memory for pool allocations of every known tag.
-//!
 //! Where the individual `*scan` plugins each look for one kind of object, this
 //! reports every tagged allocation it recognises, which is useful for surveying
 //! what a capture contains before deciding what to look at closely.
@@ -17,6 +15,7 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::objects::utility::unicode_string;
 use crate::framework::symbols::windows::poolscanner::{builtin_constraints, generate_pool_scan};
 
+/// A generic pool scanner plugin.
 pub struct PoolScanner;
 
 impl Plugin for PoolScanner {
@@ -58,11 +57,18 @@ impl Plugin for PoolScanner {
                     .member("ImageFileName")
                     .and_then(|field| field.as_string())
                     .ok(),
-                Some("File") => hit
-                    .object
-                    .member("FileName")
-                    .ok()
-                    .and_then(|field| unicode_string(&field).ok()),
+                Some("File") => {
+                    // A file whose name cannot be read is left out entirely,
+                    // which is what upstream does with it.
+                    match hit
+                        .object
+                        .member("FileName")
+                        .and_then(|field| unicode_string(&field))
+                    {
+                        Ok(name) => Some(name),
+                        Err(_) => continue,
+                    }
+                }
                 // Only those two kinds carry a name worth showing here.
                 _ => None,
             };

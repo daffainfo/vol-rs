@@ -7,6 +7,7 @@
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
+use crate::error::{Result, VolatilityError};
 use crate::framework::renderers::TreeGrid;
 
 /// One `[+-]column,pattern[!]` rule.
@@ -14,8 +15,10 @@ struct Rule {
     /// The column it looks at, or every column when it names none.
     column: Option<usize>,
     pattern: String,
-    /// Whether the pattern is a regular expression rather than a substring.
-    regex: Option<regex::Regex>,
+    /// The compiled pattern, where the rule asked for a regular expression
+    /// rather than a substring. An inner `None` is a pattern that would not
+    /// compile, which nothing matches.
+    regex: Option<Option<regex::Regex>>,
     /// Whether a match means the row is unwanted rather than wanted.
     exclude: bool,
 }
@@ -87,7 +90,13 @@ impl RenderOptions {
             });
             self.rules.push(Rule {
                 column,
-                regex: is_regex.then(|| regex::Regex::new(&pattern).ok()).flatten(),
+                regex: if is_regex {
+                    // A pattern that will not compile matches nothing rather
+                    // than quietly becoming a search for its own text.
+                    Some(regex::Regex::new(&pattern).ok())
+                } else {
+                    None
+                },
                 pattern,
                 exclude,
             });
@@ -95,11 +104,15 @@ impl RenderOptions {
     }
 
     /// The columns to leave out of the output.
-    pub fn ignored(&self, grid: &TreeGrid) -> Vec<usize> {
+    ///
+    /// Hiding every column leaves nothing to render, which upstream refuses
+    /// rather than printing an empty table.
+    pub fn ignored(&self, grid: &TreeGrid) -> Result<Vec<usize>> {
         let Some(hidden) = &self.hidden else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        grid.columns()
+        let ignored: Vec<usize> = grid
+            .columns()
             .iter()
             .enumerate()
             .filter(|(_, column)| {
@@ -111,7 +124,13 @@ impl RenderOptions {
                 })
             })
             .map(|(index, _)| index)
-            .collect()
+            .collect();
+        if ignored.len() == grid.columns().len() {
+            return Err(VolatilityError::Render(
+                "No visible columns to render".to_string(),
+            ));
+        }
+        Ok(ignored)
     }
 
     /// Whether a row should be left out.
@@ -141,7 +160,8 @@ impl Rule {
 
     fn find(&self, cell: &str) -> bool {
         match &self.regex {
-            Some(regex) => regex.is_match(cell),
+            Some(Some(regex)) => regex.is_match(cell),
+            Some(None) => false,
             None => cell.contains(&self.pattern),
         }
     }

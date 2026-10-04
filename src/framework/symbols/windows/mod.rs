@@ -23,10 +23,10 @@ use std::sync::Arc;
 use crate::error::{Result, VolatilityError};
 use crate::framework::context::{Context, Module};
 use crate::framework::layers::intel::{IntelLayer, WINDOWS_INTEL, WINDOWS_INTEL_32E};
-use crate::framework::objects::utility::{unicode_string, walk_list};
+use crate::framework::objects::utility::unicode_string;
 use crate::framework::objects::Object;
 
-/// A process, wrapping an `_EPROCESS`.
+/// A class for executive kernel processes objects.
 #[derive(Clone)]
 pub struct Process {
     pub object: Object,
@@ -83,11 +83,32 @@ impl Process {
             return Ok(None);
         }
         let context = self.object.context().clone();
-        let template = context
-            .symbol_space
-            .get_type(&qualify(&self.object, "_MM_SESSION_SPACE")?)?;
-        let space = context.object_from_template(template, self.object.layer_name(), address);
-        Ok(Some(space.member("SessionId")?.as_u64()?))
+        let table = qualify(&self.object, "_MM_SESSION_SPACE")?;
+        match context.symbol_space.get_type(&table) {
+            Ok(template) => {
+                // The session space is named by a kernel pointer, so it is
+                // read in the layer that pointer refers to rather than in the
+                // one the process itself was found in.
+                let space = context.object_from_template(
+                    template,
+                    self.object.native_layer_name(),
+                    address,
+                );
+                Ok(Some(space.member("SessionId")?.as_u64()?))
+            }
+            // Windows 11 24H2 renamed the structure and its symbols do not
+            // describe the members, so the identifier is read from where that
+            // structure has always kept it.
+            Err(_) => {
+                let data = context.layers.read(
+                    self.object.native_layer_name(),
+                    address + 8,
+                    4,
+                    false,
+                )?;
+                Ok(Some(u32::from_le_bytes(data.try_into().unwrap_or([0; 4])) as u64))
+            }
+        }
     }
 
     pub fn create_time(&self) -> Result<u64> {
@@ -113,11 +134,7 @@ impl Process {
 
     /// The page directory base for this process's address space.
     pub fn directory_table_base(&self) -> Result<u64> {
-        self.object
-            .member("Pcb")?
-            .member("DirectoryTableBase")
-            .or_else(|_| self.object.member("Pcb")?.member("DirectoryTableBase"))?
-            .as_u64()
+        directory_table_base(&self.object)
     }
 
     /// The image path recorded by the audit subsystem at process creation.
@@ -226,7 +243,13 @@ pub fn list_processes(context: &Arc<Context>, kernel: &Module) -> Result<Vec<Pro
     let head = context.object_from_symbol(kernel, "PsActiveProcessHead", Some("_LIST_ENTRY"))?;
     let type_name = kernel.qualified("_EPROCESS");
 
-    Ok(walk_list(&head, &type_name, "ActiveProcessLinks", true)?
+    // Upstream walks the list forwards and then backwards from the same head,
+    // so a single unreadable entry does not strand everything past it.
+    Ok(crate::framework::objects::utility::walk_list_both(
+        &head,
+        &type_name,
+        "ActiveProcessLinks",
+    )?
         .into_iter()
         .map(Process::new)
         .collect())
@@ -249,11 +272,16 @@ pub fn object_header(object: &Object, kernel: &Module) -> Result<Object> {
             VolatilityError::Other("_OBJECT_HEADER has no Body member".to_string())
         })?;
 
-    Ok(context.object_from_template(
-        header_type,
-        object.layer_name(),
-        object.offset().wrapping_sub(body_offset),
-    ))
+    Ok(context
+        .object_from_template(
+            header_type,
+            object.layer_name(),
+            object.offset().wrapping_sub(body_offset),
+        )
+        // An object carved out of a pool lives in physical memory while its
+        // pointers still name the kernel's address space, so the header keeps
+        // the layer those pointers refer to.
+        .with_native_layer(object.native_layer_name()))
 }
 
 #[cfg(test)]
@@ -365,18 +393,23 @@ pub fn object_name(object: &Object, kernel: &Module) -> Option<String> {
 /// no name, which is normal rather than an error.
 pub fn header_name(header: &Object, kernel: &Module) -> Option<String> {
     let context = header.context().clone();
-    let info_mask = header.member("InfoMask").and_then(|f| f.as_u64()).ok()?;
 
-    // How far the name sits ahead of the object header depends on which other
-    // optional headers are present, and the kernel keeps a table of exactly
-    // that: indexed by the mask's low bits, it gives the distance back.
-    const NAME_INFO_BIT: u64 = 0x2;
-    let table = context.symbol_offset(kernel, "ObpInfoMaskToOffset").ok()?;
-    let index = info_mask & (NAME_INFO_BIT | (NAME_INFO_BIT - 1));
-    let distance = context
-        .layers
-        .read(header.native_layer_name(), table + index, 1, false)
-        .ok()?[0] as u64;
+    // Vista and earlier record the distance back to the name in the header
+    // itself. Windows 7 and later record only which optional headers are
+    // present, and the kernel keeps a table that turns that into the distance.
+    let distance = match header.member("NameInfoOffset") {
+        Ok(field) => field.as_u64().ok()?,
+        Err(_) => {
+            const NAME_INFO_BIT: u64 = 0x2;
+            let info_mask = header.member("InfoMask").and_then(|f| f.as_u64()).ok()?;
+            let table = context.symbol_offset(kernel, "ObpInfoMaskToOffset").ok()?;
+            let index = info_mask & (NAME_INFO_BIT | (NAME_INFO_BIT - 1));
+            context
+                .layers
+                .read(header.native_layer_name(), table + index, 1, false)
+                .ok()?[0] as u64
+        }
+    };
     // A distance of zero means this object carries no name at all.
     if distance == 0 {
         return None;
@@ -393,6 +426,46 @@ pub fn header_name(header: &Object, kernel: &Module) -> Option<String> {
     unicode_string(&info.member("Name").ok()?).ok()
 }
 
+/// The same name, rejected unless the two lengths agree with each other.
+///
+/// The reference implementation applies this check only where it reads a name
+/// through the object header's own accessor, not where a kernel object reads
+/// its own name, so the two are kept apart here as well.
+pub fn header_name_checked(header: &Object, kernel: &Module) -> Option<String> {
+    let context = header.context().clone();
+    let distance = match header.member("NameInfoOffset") {
+        Ok(field) => field.as_u64().ok()?,
+        Err(_) => {
+            const NAME_INFO_BIT: u64 = 0x2;
+            let info_mask = header.member("InfoMask").and_then(|f| f.as_u64()).ok()?;
+            let table = context.symbol_offset(kernel, "ObpInfoMaskToOffset").ok()?;
+            let index = info_mask & (NAME_INFO_BIT | (NAME_INFO_BIT - 1));
+            context
+                .layers
+                .read(header.native_layer_name(), table + index, 1, false)
+                .ok()?[0] as u64
+        }
+    };
+    if distance == 0 {
+        return None;
+    }
+    let template = context
+        .symbol_space
+        .get_type(&kernel.qualified("_OBJECT_HEADER_NAME_INFO"))
+        .ok()?;
+    let address = header.offset().checked_sub(distance)?;
+    let info = context
+        .object_from_template(template, header.layer_name(), address)
+        .with_native_layer(header.native_layer_name());
+    let name = info.member("Name").ok()?;
+    let length = name.member("Length").and_then(|f| f.as_u64()).ok()?;
+    let maximum = name.member("MaximumLength").and_then(|f| f.as_u64()).ok()?;
+    if length == 0 || maximum == 0 || length > maximum {
+        return None;
+    }
+    unicode_string(&name).ok()
+}
+
 impl Process {
     /// The process's access token.
     ///
@@ -400,12 +473,7 @@ impl Process {
     /// must be masked off before the value is a usable pointer.
     pub fn token(&self) -> Result<Object> {
         let field = self.object.member("Token")?;
-        let raw = field
-            .member("Object")
-            .and_then(|object| object.pointer_value())
-            .or_else(|_| field.pointer_value())?;
-        // The bottom four bits hold the count on both architectures.
-        let address = raw & !0xF;
+        let address = fast_reference(&field)?;
         if address == 0 {
             return Err(VolatilityError::Other("Process has no token".to_string()));
         }
@@ -422,7 +490,7 @@ impl Process {
         let token = self.token()?;
         let count = token.member("UserAndGroupCount")?.as_u64()?;
         // A count beyond this means the token was misread.
-        if count > 0x400 {
+        if count >= 0xFFFF {
             return Err(VolatilityError::Other(
                 "Implausible SID count in token".to_string(),
             ));
@@ -447,11 +515,12 @@ impl Process {
         for index in 0..count {
             let entry = context.object_from_template(
                 entry_template.clone(),
-                self.object.layer_name(),
+                self.object.native_layer_name(),
                 base + index * entry_size,
             );
-            // An entry whose SID cannot be read is skipped rather than
-            // aborting the whole token.
+            // An entry whose identifier cannot be read is passed over, but one
+            // that is not an identifier at all means the count was wrong and
+            // nothing past it can be trusted.
             let Ok(address) = entry.member("Sid").and_then(|sid| sid.pointer_value()) else {
                 continue;
             };
@@ -460,11 +529,13 @@ impl Process {
             }
             let sid = context.object_from_template(
                 sid_template.clone(),
-                self.object.layer_name(),
+                self.object.native_layer_name(),
                 address,
             );
-            if let Ok(text) = sid::format_sid(&sid) {
-                sids.push(text);
+            match sid::format_sid(&sid) {
+                Ok(text) => sids.push(text),
+                Err(VolatilityError::Other(_)) => break,
+                Err(_) => continue,
             }
         }
         Ok(sids)
@@ -477,21 +548,59 @@ impl Process {
         let token = self.token()?;
         let privileges = token.member("Privileges")?;
 
-        let present = privileges.member("Present")?.as_u64()?;
-        let enabled = privileges.member("Enabled")?.as_u64()?;
-        let default = privileges.member("EnabledByDefault")?.as_u64()?;
+        // Vista and later keep three bitmaps, one bit per privilege.
+        if let (Ok(present), Ok(enabled), Ok(default)) = (
+            privileges.member("Present").and_then(|f| f.as_u64()),
+            privileges.member("Enabled").and_then(|f| f.as_u64()),
+            privileges.member("EnabledByDefault").and_then(|f| f.as_u64()),
+        ) {
+            return Ok((0..64)
+                .map(|bit| {
+                    (
+                        bit,
+                        present & (1 << bit) != 0,
+                        enabled & (1 << bit) != 0,
+                        default & (1 << bit) != 0,
+                    )
+                })
+                .collect());
+        }
 
-        // Each bit position is a privilege LUID.
-        Ok((0..64)
-            .map(|bit| {
-                (
-                    bit,
-                    present & (1 << bit) != 0,
-                    enabled & (1 << bit) != 0,
-                    default & (1 << bit) != 0,
-                )
-            })
-            .collect())
+        // Windows XP instead points at an array with one entry per privilege
+        // the token actually holds, so every entry it lists is present.
+        let count = token.member("PrivilegeCount")?.as_u64()?;
+        if count >= 1024 {
+            return Err(VolatilityError::Other(
+                "Implausible privilege count in token".to_string(),
+            ));
+        }
+        let context = self.object.context().clone();
+        let template = context
+            .symbol_space
+            .get_type(&qualify(&self.object, "_LUID_AND_ATTRIBUTES")?)?;
+        let size = context.symbol_space.size_of(&template)?;
+        let base = token.member("Privileges")?.pointer_value()?;
+
+        let mut found = Vec::new();
+        for index in 0..count {
+            let entry = context.object_from_template(
+                template.clone(),
+                token.native_layer_name(),
+                base + index * size,
+            );
+            let Ok(attributes) = entry.member("Attributes").and_then(|f| f.as_u64()) else {
+                continue;
+            };
+            let Ok(luid) = entry
+                .member("Luid")
+                .and_then(|luid| luid.member("LowPart"))
+                .and_then(|part| part.as_u64())
+            else {
+                continue;
+            };
+            found.push((luid, true, attributes & 2 != 0, attributes & 1 != 0));
+        }
+        Ok(found)
     }
 }
 
@@ -512,6 +621,20 @@ pub fn pslist_session_id(process: &Process) -> crate::framework::renderers::Valu
 ///
 /// A tag match lands on anything. These are the checks the reference
 /// implementation makes before believing what it found is really a process.
+/// The page directory base a process's control block records.
+///
+/// Thirty two bit kernels declare it as a two element array, where the first
+/// element is the base and the second holds process context identifiers. A
+/// pointer sized read at the start of the array is what the reference
+/// implementation takes in that case.
+pub fn directory_table_base(process: &Object) -> Result<u64> {
+    let field = process.member("Pcb")?.member("DirectoryTableBase")?;
+    match field.as_u64() {
+        Ok(value) => Ok(value),
+        Err(_) => field.cast(&qualify(process, "pointer")?)?.as_u64(),
+    }
+}
+
 pub fn process_is_valid(context: &Arc<Context>, kernel: &Module, object: &Object) -> bool {
     let _ = (context, kernel);
     let Ok(name) = object
@@ -575,11 +698,7 @@ pub fn process_is_valid(context: &Arc<Context>, kernel: &Module, object: &Object
         return false;
     }
 
-    let Ok(directory_table_base) = object
-        .member("Pcb")
-        .and_then(|pcb| pcb.member("DirectoryTableBase"))
-        .and_then(|field| field.as_u64())
-    else {
+    let Ok(directory_table_base) = directory_table_base(object) else {
         return false;
     };
     // The low bits hold process-context identifiers rather than an address, so
@@ -601,6 +720,41 @@ pub fn process_is_valid(context: &Arc<Context>, kernel: &Module, object: &Object
 }
 
 /// Whether a thread carved out of a pool allocation is coherent.
+/// Follow a fast reference: a pointer with a small count packed into the bits
+/// below the alignment it is guaranteed to have.
+///
+/// There are four such bits on a sixty four bit kernel and three on a thirty
+/// two bit one.
+pub fn fast_reference(field: &Object) -> Result<u64> {
+    let raw = field
+        .member("Object")
+        .and_then(|object| object.pointer_value())
+        .or_else(|_| field.pointer_value())?;
+    let pointer_size = field
+        .table_name()
+        .and_then(|table| field.context().symbol_space.table(&table).ok())
+        .map(|table| table.pointer_size())
+        .unwrap_or(8);
+    let count_bits = if pointer_size == 8 { 15 } else { 7 };
+    Ok(raw & !count_bits)
+}
+
+/// When a thread was created, as the kernel records it.
+///
+/// Windows XP keeps three flag bits in the low end of the field, so there the
+/// value has to be shifted before it is a time at all. Which kernel this is
+/// shows in whether the thread still names its process the old way.
+pub fn thread_create_time(thread: &Object) -> Result<u64> {
+    let raw = thread
+        .member("CreateTime")?
+        .member("QuadPart")?
+        .as_u64()?;
+    if thread.has_member("ThreadsProcess") {
+        return Ok(raw >> 3);
+    }
+    Ok(raw)
+}
+
 pub fn thread_is_valid(object: &Object) -> bool {
     let Ok(cid) = object.member("Cid") else {
         return false;
@@ -618,11 +772,7 @@ pub fn thread_is_valid(object: &Object) -> bool {
 
     // Every thread but the system process's has a creation time.
     if process != 4 {
-        let Ok(created) = object
-            .member("CreateTime")
-            .and_then(|field| field.member("QuadPart"))
-            .and_then(|field| field.as_u64())
-        else {
+        let Ok(created) = thread_create_time(object) else {
             return false;
         };
         let Some(created) = crate::framework::renderers::conversion::wintime_to_datetime(created)

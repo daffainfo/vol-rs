@@ -1,8 +1,9 @@
-//! Check the kernel's tracepoints for attached probes.
-//!
 //! A tracepoint is a fixed instrumentation site the kernel exposes. Attaching a
 //! probe to one gives a callback on every hit, which is a supported hooking
 //! mechanism and therefore worth enumerating.
+//!
+//! Public research:
+//! https://i.blackhat.com/USA21/Wednesday-Handouts/us-21-Fixing-A-Memory-Forensics-Blind-Spot-Linux-Kernel-Tracing-wp.pdf
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -17,9 +18,18 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::linux::resolver::ModuleResolver;
 
+/// Detect tracepoints hooking
+///
+/// Investigate the tracepoints subsystem to uncover kernel attached probes,
+/// which can be leveraged to hook kernel functions and modify their behaviour.
 pub struct CheckTracepoints;
 
 /// A probe list longer than this means the structure was misread.
+///
+/// Tracepoints without attached probes are ignored. The walk is inspired by
+/// the kernel's `debug_print_probes()`, and the array is read the way the
+/// kernel's own `tracepoint_ptr_deref()` and `tracepoint_ptr_t` do, adjusting
+/// depending on the use of PC-relative addressing or not.
 const MAX_PROBES: u64 = 64;
 
 impl Plugin for CheckTracepoints {

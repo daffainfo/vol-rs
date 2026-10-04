@@ -1,5 +1,3 @@
-//! Report the UserAssist records, which track programs a user has launched.
-//!
 //! Explorer records each launched program under a per-category GUID key, with
 //! the program's path as the value name. The names are ROT13-encoded (an
 //! obfuscation, not encryption), and the data holds a run count and timestamps.
@@ -17,9 +15,15 @@ use crate::framework::renderers::conversion::wintime_value;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::registry::{read_key, subkeys, values};
 
+/// Print userassist registry keys and information.
 pub struct UserAssist;
 
 /// Where Explorer keeps the records, below a user's hive root.
+///
+/// Taken from
+/// http://msdn.microsoft.com/en-us/library/dd378457%28v=vs.85%29.aspx. The
+/// GUIDs under the userassist key are iterated through, and each guid key
+/// should have a Count key in it.
 const USERASSIST_PATH: &[&str] = &[
     "Software",
     "Microsoft",
@@ -76,7 +80,7 @@ impl Plugin for UserAssist {
             Column::int("Focus Count"),
             Column::string("Time Focused"),
             Column::datetime("Last Updated"),
-            Column::bytes("Raw Data"),
+            Column::hex_bytes("Raw Data"),
         ]
     }
 
@@ -92,9 +96,10 @@ impl Plugin for UserAssist {
         let mut timeline = Timeline::new();
         for row in self.run(context, config).ok()?.rows() {
             let values = &row.values;
-            // Both the name and the timestamp have to be there for the entry
-            // to say anything.
-            if values[5].is_absent() || values[10].is_absent() {
+            // The name has to be text, and the timestamp has to be something
+            // other than the value saying it does not apply. A timestamp that
+            // could not be read is still reported.
+            if values[5].is_absent() || values[10].is_not_applicable() {
                 continue;
             }
             let description = format!(
@@ -297,6 +302,10 @@ impl Plugin for UserAssist {
 }
 
 /// Where the fields of a record sit, which differs between Windows versions.
+///
+/// `_KUSER_SHARED_DATA.CookiePad` is in Windows 6.1 (Win7) and later, which is
+/// how the two layouts are told apart. If the OS is still unknown at this
+/// point, the default item is returned, which just has the raw data.
 struct Layout {
     win7: bool,
     size: usize,

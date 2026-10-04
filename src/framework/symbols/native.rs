@@ -13,7 +13,10 @@ use std::sync::Arc;
 use crate::framework::objects::template::{Encoding, Template};
 use crate::framework::symbols::isf::{BaseKind, BaseType, Endian};
 
-/// A fallback set of base types.
+/// Symbol List that handles Native types.
+///
+/// A fallback set of base types, created once early because it may get used a
+/// lot.
 pub struct NativeTable {
     name: String,
     types: HashMap<String, BaseType>,
@@ -50,7 +53,12 @@ impl NativeTable {
             )
     }
 
-    /// Build a template for a native type name.
+    /// Resolves a symbol name into an object template.
+    ///
+    /// This always constructs a new template, rather than using a cached value,
+    /// since otherwise changes made later may affect the cached copy. Upstream
+    /// found that calling clone after every native type construction was
+    /// extremely slow.
     ///
     /// The compound names (`array`, `enum`, and so on) come back in their empty
     /// form. Callers fill in counts and subtypes.
@@ -95,7 +103,7 @@ impl NativeTable {
         }))
     }
 
-    /// Every type name this table can produce.
+    /// Returns an iterable (set) of the available symbol type names.
     pub fn types(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.types.keys().map(String::as_str).collect();
         names.extend(["void", "function", "array", "bitfield", "string", "bytes"]);

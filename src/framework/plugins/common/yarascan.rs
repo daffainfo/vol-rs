@@ -1,5 +1,3 @@
-//! Compiling and running YARA rules against a memory region.
-//!
 //! Both the Windows and Linux scanning plugins take the same options (a rule
 //! file, an inline rule, or a bare string to match), so the compilation and
 //! matching live here and each plugin supplies only the regions to scan.
@@ -184,7 +182,7 @@ mod tests {
 
     #[test]
     fn a_plain_string_compiles_and_matches() {
-        let mut config = Configuration::new();
+        let config = Configuration::new();
         config.set(
             "yara_string",
             crate::framework::context::ConfigValue::Str("secret".to_string()),
@@ -200,7 +198,7 @@ mod tests {
 
     #[test]
     fn asking_for_wide_matches_the_wide_encoding_too() {
-        let mut config = Configuration::new();
+        let config = Configuration::new();
         config.set(
             "yara_string",
             crate::framework::context::ConfigValue::Str("secret".to_string()),
@@ -214,7 +212,7 @@ mod tests {
 
     #[test]
     fn a_byte_sequence_is_taken_as_one_rather_than_quoted() {
-        let mut config = Configuration::new();
+        let config = Configuration::new();
         config.set(
             "yara_string",
             crate::framework::context::ConfigValue::Str("{ DE AD BE EF }".to_string()),

@@ -1,5 +1,3 @@
-//! Recover the kernel call stack of each thread.
-//!
 //! A task's kernel stack holds return addresses left by the calls that led to
 //! where it is now. Resolving those to symbols shows what each thread was doing
 //! when the capture was taken, and an address resolving to no known module is a
@@ -18,9 +16,14 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::linux::list_tasks_filtered;
 use crate::framework::plugins::linux::kallsyms::KallsymsTable;
 
+/// Enumerates the call stack of each task
 pub struct PsCallStack;
 
 /// A kernel stack is two pages on x86-64.
+///
+/// Safe since kernel 3.15. The order would need one more if CONFIG_KASAN were
+/// enabled in kernels >= 4.0, or CONFIG_KASAN_EXTRA in kernels >= 4.19, both of
+/// which default to disabled.
 const STACK_SIZE: usize = 0x4000;
 
 impl Plugin for PsCallStack {
@@ -198,6 +201,9 @@ impl Plugin for PsCallStack {
 }
 
 /// The symbol whose range contains `address`, with its `nm` type letter.
+///
+/// Stack values that cannot be resolved to a known symbol are included only
+/// when asked for.
 fn containing_symbol(
     symbols: &[crate::framework::plugins::linux::kallsyms::Symbol],
     address: u64,

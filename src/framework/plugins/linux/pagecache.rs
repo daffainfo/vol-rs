@@ -1,5 +1,3 @@
-//! Report the files the kernel currently holds in its page cache.
-//!
 //! Every filesystem the kernel has mounted keeps a list of the inodes it has
 //! touched, and each inode records how much of its content is resident. That
 //! makes the page cache a record of which files were recently read or written,
@@ -19,9 +17,10 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::conversion::timespec_to_datetime;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::linux::{
-    mount_points, read_qstr, resolve_path, walk_hlist, xarray_entries,
+    mount_points, path_for_mount, read_qstr, walk_hlist, xarray_entries,
 };
 
+/// Lists files from memory
 pub struct Files;
 
 /// The page size every file in the cache is held in.
@@ -53,35 +52,7 @@ fn inode_type(inode: &Object) -> Value {
 /// The mode, rendered the way `ls -l` shows it.
 fn file_mode(inode: &Object) -> String {
     let mode = inode.member("i_mode").and_then(|m| m.as_u64()).unwrap_or(0);
-    let mut text = String::with_capacity(10);
-    text.push(match mode & 0xF000 {
-        0x4000 => 'd',
-        0x8000 => '-',
-        0xA000 => 'l',
-        0x1000 => 'p',
-        0xC000 => 's',
-        0x2000 => 'c',
-        0x6000 => 'b',
-        _ => '?',
-    });
-    for shift in [6, 3, 0] {
-        let bits = (mode >> shift) & 0x7;
-        text.push(if bits & 0x4 != 0 { 'r' } else { '-' });
-        text.push(if bits & 0x2 != 0 { 'w' } else { '-' });
-        text.push(if bits & 0x1 != 0 { 'x' } else { '-' });
-    }
-    // The set-user, set-group and sticky bits replace the execute characters.
-    let mut bytes: Vec<char> = text.chars().collect();
-    if mode & 0o4000 != 0 {
-        bytes[3] = if bytes[3] == 'x' { 's' } else { 'S' };
-    }
-    if mode & 0o2000 != 0 {
-        bytes[6] = if bytes[6] == 'x' { 's' } else { 'S' };
-    }
-    if mode & 0o1000 != 0 {
-        bytes[9] = if bytes[9] == 'x' { 't' } else { 'T' };
-    }
-    bytes.into_iter().collect()
+    crate::framework::symbols::linux::filemode(mode)
 }
 
 impl Plugin for Files {
@@ -209,7 +180,7 @@ pub struct CachedInode {
     pub path: String,
 }
 
-/// Every inode reachable from a mounted filesystem's dentry tree.
+/// Retrieves the inodes from the superblocks
 ///
 /// The kernel keeps a dentry for each name it has looked up, so walking them
 /// from each mount's root recovers the paths of files still in the page cache.
@@ -224,13 +195,17 @@ pub fn cached_inodes(
     let mut seen_dentries = std::collections::HashSet::new();
 
     for (task, mount) in mount_points(context, kernel)? {
-        let Ok(vfsmount) = mount.member("mnt") else {
-            continue;
+        // Before kernel 3.3 the one `vfsmount` carried the per-mount
+        // bookkeeping too, so there is no separate structure to step into.
+        let vfsmount = if mount.has_member("mnt") {
+            match mount.member("mnt") {
+                Ok(vfsmount) => vfsmount,
+                Err(_) => continue,
+            }
+        } else {
+            mount.clone()
         };
-        let Ok(mount_root) = vfsmount.member("mnt_root").and_then(|r| r.dereference()) else {
-            continue;
-        };
-        let Some(mount_point) = resolve_path(&task, mount_root, vfsmount.clone(), None) else {
+        let Some(mount_point) = path_for_mount(&task, &mount).filter(|path| !path.is_empty()) else {
             continue;
         };
 
@@ -284,13 +259,19 @@ pub fn cached_inodes(
     Ok(results)
 }
 
-/// The inode behind a dentry, if it can hold cached pages.
-fn cacheable_inode(dentry: &Object) -> Option<Object> {
-    let inode = dentry.member("d_inode").ok()?.dereference().ok()?;
+/// The inode behind a dentry, where the numbers the kernel keeps consistent
+/// say it is a live one.
+///
+/// Dentry and inode sanity checks.
+fn live_inode(dentry: &Object) -> Option<Object> {
+    let pointer = dentry.member("d_inode").ok()?;
+    if pointer.pointer_value().ok()? == 0 {
+        return None;
+    }
+    let inode = pointer.dereference().ok()?;
     if !inode.is_readable() {
         return None;
     }
-    // The same liveness test the rest of the port uses for an inode.
     let number = inode.member("i_ino").ok()?.as_u64().ok()?;
     let references = inode
         .member("i_count")
@@ -300,6 +281,14 @@ fn cacheable_inode(dentry: &Object) -> Option<Object> {
     if number == 0 || references < 0 {
         return None;
     }
+    Some(inode)
+}
+
+/// The inode behind a dentry, if it can hold cached pages.
+///
+/// Retrieving data from the page cache requires a valid address space.
+fn cacheable_inode(dentry: &Object) -> Option<Object> {
+    let inode = live_inode(dentry)?;
     // Reading cached pages needs an address space to read them from.
     let mapping = inode.member("i_mapping").ok()?;
     if mapping.pointer_value().ok()? == 0 || !mapping.dereference().ok()?.is_readable() {
@@ -309,6 +298,7 @@ fn cacheable_inode(dentry: &Object) -> Option<Object> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Walks dentries recursively
 fn walk_dentries(
     context: &Arc<Context>,
     kernel: &Module,
@@ -321,39 +311,74 @@ fn walk_dentries(
     seen_inodes: &mut std::collections::HashSet<u64>,
     results: &mut Vec<CachedInode>,
 ) {
-    // Kernel 6.8 moved the children from a doubly-linked list into an hlist,
-    // renaming both the head and the link within each child.
-    let entries = if parent_dentry.has_member("d_children") {
+    // Where a dentry's children hang, and what each child is linked by, has
+    // changed twice: kernel 3.19 renamed the link out of the `d_u` union, and
+    // kernel 6.8 moved the children into an hlist.
+    let entries = if parent_dentry.has_member("d_sib") && parent_dentry.has_member("d_children") {
+        // kernels >= 6.8
         let Ok(head) = parent_dentry.member("d_children") else {
             return;
         };
         walk_hlist(context, &head, &kernel.qualified("dentry"), "d_sib")
-    } else {
+    } else if parent_dentry.has_member("d_child") && parent_dentry.has_member("d_subdirs") {
+        // 3.19 <= kernels < 6.8
         let Ok(head) = parent_dentry.member("d_subdirs") else {
             return;
         };
         walk_list(&head, &kernel.qualified("dentry"), "d_child", true)
+    } else if parent_dentry.has_member("d_u") && parent_dentry.has_member("d_subdirs") {
+        // kernels < 3.19, where the link is `d_u.d_child`. Every member of a
+        // union starts at the same place, so the union itself will do.
+        let Ok(head) = parent_dentry.member("d_subdirs") else {
+            return;
+        };
+        walk_list(&head, &kernel.qualified("dentry"), "d_u", true)
+    } else {
+        return;
     };
     let Ok(entries) = entries else {
         return;
     };
 
     for dentry in entries {
+        // Corruption, where a dentry claims itself as a child.
         if dentry.offset() == parent_dentry.offset() || !seen_dentries.insert(dentry.offset()) {
             continue;
         }
-        let Some(inode) = cacheable_inode(&dentry) else {
+        // The walk continues through any live inode, whether or not it can hold
+        // cached pages: a directory that cannot is still a directory to descend.
+        let Some(inode) = live_inode(&dentry) else {
             continue;
         };
-        let Some(name) = dentry.member("d_name").ok().and_then(|qstr| read_qstr(&qstr)) else {
+        // A name that cannot be read at all ends this branch, while a name that
+        // reads as empty leaves an empty component in the path, which is how
+        // upstream keeps smear visible.
+        let Ok(name_pointer) = dentry
+            .member("d_name")
+            .and_then(|qstr| qstr.member("name"))
+            .and_then(|name| name.pointer_value())
+        else {
             continue;
         };
-        if name.is_empty() {
+        if name_pointer == 0 {
             continue;
         }
+        let name = dentry
+            .member("d_name")
+            .ok()
+            .and_then(|qstr| read_qstr(&qstr))
+            .unwrap_or_default();
         let path = format!("{parent_path}/{name}");
 
-        if seen_inodes.insert(inode.offset()) {
+        // Reading cached pages needs an address space to read them from.
+        let mappable = inode
+            .member("i_mapping")
+            .ok()
+            .filter(|mapping| mapping.pointer_value().unwrap_or(0) != 0)
+            .and_then(|mapping| mapping.dereference().ok())
+            .map(|mapping| mapping.is_readable())
+            .unwrap_or(false);
+        if mappable && seen_inodes.insert(inode.offset()) {
             let mode = inode.member("i_mode").and_then(|m| m.as_u64()).unwrap_or(0);
             // A fast symlink stores its target inline, which is worth showing.
             let shown = if follow_symlinks && mode & 0xF000 == 0xA000 {
@@ -401,7 +426,9 @@ fn mode_is_directory(inode: &Object) -> bool {
         .unwrap_or(false)
 }
 
-/// Render one cached inode as a row.
+/// Augment the inode information to be presented to the user
+///
+/// The number of pages is rounded up to fit the inode's size.
 pub fn inode_row(entry: &CachedInode) -> Vec<Value> {
     let inode = &entry.inode;
     let read = |name: &str| inode.member(name).and_then(|value| value.as_i64()).unwrap_or(0);
@@ -470,7 +497,7 @@ fn inode_time(inode: &Object, member: &str) -> Value {
 }
 
 
-/// Reports the individual cached pages of one file.
+/// Lists and recovers cached inode pages
 pub struct InodePages;
 
 impl Plugin for InodePages {
@@ -640,10 +667,14 @@ fn inode_is_valid(inode: &Object) -> bool {
         .unwrap_or(false)
 }
 
-/// Write a file's cached pages out, leaving holes where pages are missing.
+/// Extracts the inode's contents from the page cache and saves them to a
+/// stream
 ///
-/// The result is as long as the file was, so a page that was never cached
-/// leaves a gap rather than shifting everything after it.
+/// By using truncate and seek, provided the filesystem supports it and the
+/// stream is a file, a sparse file will be created, saving both disk space and
+/// I/O time. Additionally, using the page index will guarantee that each page
+/// is written at the appropriate file position, so a page that was never
+/// cached leaves a gap rather than shifting everything after it.
 fn write_inode_contents(
     context: &Arc<Context>,
     kernel: &Module,
@@ -689,7 +720,7 @@ fn write_inode_contents(
 
         // The file is only created once there is something to put in it.
         if file.is_none() {
-            match std::fs::File::create(&chosen) {
+            match crate::framework::plugins::create_output_file(&chosen) {
                 Ok(handle) => {
                     let _ = handle.set_len(size);
                     file = Some(handle);
@@ -781,8 +812,9 @@ fn cached_pages(
         return (pages, false);
     }
 
+    // Kernel 4.17 renamed the page cache tree; before that it was `page_tree`.
     let (Ok(tree), Ok(page_type)) = (
-        space.member("i_pages"),
+        space.member("i_pages").or_else(|_| space.member("page_tree")),
         context.symbol_space.get_type(&kernel.qualified("page")),
     ) else {
         return (pages, false);
@@ -853,7 +885,15 @@ fn find_inode(context: &Arc<Context>, kernel: &Module, wanted: &str) -> Option<O
         .map(|entry| entry.inode)
 }
 
-/// Reports the cached files with the sizes a recovery would produce.
+/// Recovers the cached filesystem (directories, files, symlinks) into a
+/// compressed tarball.
+///
+/// Details: level 0 directories are named after the UUID of the parent
+/// superblock; metadata aren't replicated to extracted objects; objects
+/// modification time is set to the plugin run time; absolute symlinks are
+/// converted to relative symlinks to prevent referencing the analyst's
+/// filesystem. Troubleshooting: to fix extraction errors related to long paths,
+/// please consider using https://github.com/mxmlnkn/ratarmount.
 pub struct RecoverFs;
 
 impl Plugin for RecoverFs {
@@ -1033,6 +1073,9 @@ impl Plugin for RecoverFs {
 
 /// A symlink's target, made relative so that it cannot reach out of the
 /// recovered tree into the filesystem it is unpacked on.
+///
+/// Absolute symlinks are converted to relative symlinks to prevent
+/// referencing the analyst's filesystem.
 fn relative_target(source: &str, destination: &str) -> String {
     let Some(absolute) = destination.strip_prefix('/') else {
         return destination.to_string();

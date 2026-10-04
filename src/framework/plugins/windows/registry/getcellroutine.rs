@@ -1,5 +1,3 @@
-//! Check each registry hive's cell-lookup routine for hooking.
-//!
 //! Every hive carries a function pointer the configuration manager calls to
 //! translate a cell index into an address. Replacing it lets an attacker hide
 //! or falsify registry content for every reader on the system, so a routine
@@ -18,6 +16,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::resolver::ModuleResolver;
 
+/// Reports registry hives with a hooked GetCellRoutine handler
 pub struct GetCellRoutine;
 
 impl Plugin for GetCellRoutine {
@@ -52,8 +51,10 @@ impl Plugin for GetCellRoutine {
         let mut grid = TreeGrid::new(self.columns());
 
         for hive in super::list_hives(&context, &kernel)? {
-            // The routine lives on the inner hive structure, which older
-            // kernels expose directly on the _CMHIVE.
+            // walk each hive and validate that the GetCellRoutine handler is
+            // inside of the kernel (ntoskrnl). The routine lives on the inner
+            // hive structure, which older kernels expose directly on the
+            // _CMHIVE.
             let inner = hive.member("Hive").unwrap_or_else(|_| hive.clone());
             let Ok(handler) = inner
                 .member("GetCellRoutine")
@@ -69,8 +70,9 @@ impl Plugin for GetCellRoutine {
                 _ => None,
             };
 
-            // A routine inside the kernel image is the expected case. Reporting
-            // it would bury the hooked hives among the healthy ones.
+            // GetCellRoutine handlers should only be in the kernel, so
+            // reporting those would bury the hooked hives among the healthy
+            // ones. A routine that doesn't map to any module is reported.
             let hooked = module
                 .as_deref()
                 .map(|name| !name.eq_ignore_ascii_case("ntoskrnl.exe"))

@@ -1,5 +1,3 @@
-//! Search a layer for a regular expression.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -11,6 +9,7 @@ use crate::framework::layers::scanners::{scan_layer, RegExScanner};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Scans kernel memory using RegEx patterns.
 pub struct RegExScan;
 
 impl Plugin for RegExScan {
@@ -84,9 +83,10 @@ impl Plugin for RegExScan {
                 .read(&context.layers, offset, context_bytes, true)
                 .unwrap_or_default();
 
-            // The pattern is applied a second time to what was read, so the
-            // match alone is reported. A match too long to fit in the context
-            // leaves the whole of it standing instead.
+            // reapply the regex in order to extract just the match. Where the
+            // match is within the result data (e.g. it fits within maxsize) the
+            // match itself is extracted, and where it is not, what was read is
+            // reported instead.
             let matched = scanner.first_match(&data).unwrap_or(data);
             let text = String::from_utf8_lossy(&matched).to_string();
 

@@ -1,5 +1,3 @@
-//! Find sockets by scanning memory rather than walking file descriptors.
-//!
 //! A socket whose owning process has exited, or whose descriptor table has been
 //! tampered with, is invisible to `sockstat` but its structure may still be
 //! resident. Two things give one away: the destructor pointer stored inside the
@@ -23,9 +21,15 @@ use crate::framework::plugins::linux::sockstat::{describe, text_or_absent};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Scans for network connections found in memory layer.
 pub struct Sockscan;
 
 /// Symbols a socket's own destructor pointer can hold.
+///
+/// The address of each is converted to the bytes as they would appear in
+/// memory so that they can be scanned for. A symbol that cannot be found is
+/// ignored and not included in the results, and where none at all resolve a
+/// warning is made.
 const DESTRUCTORS: &[&str] = &[
     "sock_def_destruct",
     "packet_sock_destruct",
@@ -34,7 +38,8 @@ const DESTRUCTORS: &[&str] = &[
     "inet_sock_destruct",
 ];
 
-/// Symbols the file operations of a socket descriptor can hold.
+/// Retrieves socket file symbols, which are scanned for alongside the offset
+/// to the `f_op` pointer.
 const FILE_OPERATIONS: &[&str] = &["socket_file_ops", "sockfs_dentry_operations"];
 
 /// What following a descriptor's file operations led to.
@@ -122,6 +127,27 @@ impl Plugin for Sockscan {
         let destructor_offset = member_offset(&context, &sock_type, "sk_destruct");
         let operations_offset = member_offset(&context, &file_type, "f_op");
 
+        // The handler the reference implementation builds is bound to the
+        // initial task, so it is that task's network namespace the interfaces
+        // are looked up in.
+        let namespace = context
+            .object_from_symbol(&kernel, "init_task", Some("task_struct"))
+            .and_then(|task| task.member("nsproxy"))
+            .and_then(|proxy| proxy.dereference())
+            .and_then(|proxy| proxy.member("net_ns"))
+            .and_then(|net| net.dereference())
+            .ok()
+            .and_then(|net| {
+                if net.has_member("proc_inum") {
+                    return net.member("proc_inum").and_then(|id| id.as_u64()).ok();
+                }
+                net.member("ns")
+                    .ok()
+                    .filter(|ns| ns.has_member("inum"))
+                    .and_then(|ns| ns.member("inum").ok())
+                    .and_then(|inum| inum.as_u64().ok())
+            });
+
         let layer = context.layers.get(&physical)?;
         let scanner = MultiStringScanner::new(needles)?;
         let mut hits: Vec<u64> = Vec::new();
@@ -178,7 +204,7 @@ impl Plugin for Sockscan {
             if !seen.insert(physical_address) {
                 continue;
             }
-            if let Some(row) = row_for(&context, &kernel, &socket) {
+            if let Some(row) = row_for(&context, &kernel, &socket, namespace) {
                 grid.push(0, row)?;
             }
         }
@@ -187,6 +213,10 @@ impl Plugin for Sockscan {
 }
 
 /// The offset of `member` within `template`, or zero if it has none.
+///
+/// This is so that the object can be created at the correct offset: the
+/// results of the scanner are for the member within the structure rather than
+/// for the structure itself.
 fn member_offset(
     context: &Arc<Context>,
     template: &Arc<crate::framework::objects::template::Template>,
@@ -202,6 +232,10 @@ fn member_offset(
 }
 
 /// Sign-extend a kernel address the way the layer canonicalises it.
+///
+/// The plugin scans for pointers and these need to be formatted to the
+/// correct size, with the appropriate sign extension, so that they can be
+/// accurately located in the physical layer.
 fn canonical(address: u64) -> u64 {
     if address & (1 << 47) != 0 {
         address | 0xFFFF_0000_0000_0000
@@ -210,7 +244,10 @@ fn canonical(address: u64) -> u64 {
     }
 }
 
-/// The layer holding the machine's physical memory.
+/// Find the memory layer below the kernel.
+///
+/// The kernel layer is virtual and built on top of a physical layer, which is
+/// the one that is scanned. Only a single layer is returned.
 fn physical_layer(context: &Arc<Context>, kernel: &Module) -> String {
     context
         .layers
@@ -225,7 +262,14 @@ fn physical_layer(context: &Arc<Context>, kernel: &Module) -> String {
         .unwrap_or_else(|| kernel.layer_name.clone())
 }
 
-/// Follow a descriptor found in physical memory to the socket it owns.
+/// This method attempts to walk from the `f_op` member of files to the
+/// corresponding socket. If successful the socket object is created on the
+/// memory layer and returned.
+///
+/// The file is created in the memory layer with a native layer matching the
+/// kernel, so that pointers can be followed. Having traversed from file to
+/// sock, the sock exists in the kernel layer and its offset is translated to
+/// the memory layer before it is built there.
 fn walk_descriptor(
     context: &Arc<Context>,
     kernel: &Module,
@@ -301,8 +345,18 @@ fn walk_descriptor(
 }
 
 /// Describe a socket, or decide it says nothing worth reporting.
-fn row_for(context: &Arc<Context>, kernel: &Module, socket: &Object) -> Option<Vec<Value>> {
-    let details = describe(context, kernel, socket)?;
+///
+/// A result with no family is removed, as is one whose fields could not be
+/// extracted at all, and one whose addresses are empty. The extended
+/// attributes are a mapping, so they are formatted to show each key and value
+/// pair separated with a comma.
+fn row_for(
+    context: &Arc<Context>,
+    kernel: &Module,
+    socket: &Object,
+    namespace: Option<u64>,
+) -> Option<Vec<Value>> {
+    let details = describe(context, kernel, socket, namespace)?;
 
     // Memory holds plenty of sockets that were never connected to anything, and
     // structures that only look like sockets. A row with neither end named is

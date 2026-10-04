@@ -1,5 +1,3 @@
-//! Count what the kernel's address space actually maps.
-//!
 //! Walking every page of the kernel's address space says how much of it a
 //! capture recovered: how many pages are present, how many the system had
 //! written to its page file, and how many the tables describe but the image
@@ -30,6 +28,10 @@ fn fault_of(error: &crate::error::VolatilityError) -> Option<(bool, u32)> {
     }
 }
 
+/// Lists statistics about the memory space.
+///
+/// Does mass mapping and determines the number of different layers and how many
+/// pages go to each one.
 pub struct Statistics;
 
 impl Plugin for Statistics {

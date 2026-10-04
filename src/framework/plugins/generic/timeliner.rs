@@ -1,5 +1,3 @@
-//! Collect the timestamps other plugins produce into one timeline.
-//!
 //! Many plugins report times, process creation, file modification, registry
 //! writes. Running them and gathering those into a single ordered view is often
 //! the fastest way to see what happened and in what order.
@@ -16,6 +14,13 @@ use crate::framework::plugins::{
 };
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Runs all relevant plugins that provide time related information and orders
+/// the results by time.
+///
+/// The body file is opened before the plugins run, so output can start going
+/// to it immediately, and each entry is written as it arrives because the body
+/// file doesn't need to be sorted. The body format is
+/// `MD5|name|inode|mode_as_string|UID|GID|size|atime|mtime|ctime|crtime`.
 pub struct Timeliner;
 
 /// The plugins that contribute to a timeline, in the order the reference
@@ -101,6 +106,7 @@ impl Plugin for Timeliner {
         ]
     }
 
+    /// Isolate each plugin and run it.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let registry = PluginRegistry::new();
         let wanted: Vec<String> = config
@@ -118,6 +124,10 @@ impl Plugin for Timeliner {
         // Which operating system this image is decides which plugins can run
         // at all. The rest cannot be satisfied and are passed over.
         let system = image_system(config);
+        // With no image at all there was nothing for the stacking step to work
+        // on, and the reference implementation says so once per plugin it then
+        // fails to construct.
+        let no_image = config.get_string("physical_layer").is_none();
 
         // The timeline is keyed by plugin and description, and keeps the order
         // entries were first seen in. A kind of timestamp a plugin never
@@ -151,6 +161,12 @@ impl Plugin for Timeliner {
             {
                 continue;
             }
+            if no_image {
+                eprintln!(
+                    "WARNING  volatility3.framework.plugins: Automagic exception occurred: \
+                     ValueError: Unable to run LayerStacker, single_location parameter not provided"
+                );
+            }
             // A plugin that needs a kernel of another system cannot be
             // satisfied. One that only reads the image itself always can.
             let needs_kernel = plugin.requirements().iter().any(|requirement| {
@@ -159,6 +175,30 @@ impl Plugin for Timeliner {
             if needs_kernel && !runs_on(plugin.operating_system(), system) {
                 log::debug!("Unable to satisfy {class}");
                 continue;
+            }
+            // A plugin that names the architectures its layer may have cannot
+            // be satisfied by an image of another one, and is passed over
+            // before it is ever run.
+            if let Some(layer) = config.get_string("primary") {
+                let architecture = context
+                    .layers
+                    .get(&layer)
+                    .ok()
+                    .and_then(|handle| handle.metadata().get("architecture").cloned());
+                let mismatched = plugin.requirements().iter().any(|requirement| {
+                    matches!(
+                        requirement.kind,
+                        crate::framework::plugins::RequirementKind::Kernel
+                            | crate::framework::plugins::RequirementKind::TranslationLayer
+                    ) && match (requirement.architectures, &architecture) {
+                        (Some(wanted), Some(found)) => !wanted.contains(&found.as_str()),
+                        _ => false,
+                    }
+                });
+                if mismatched {
+                    log::debug!("Unable to satisfy {class}");
+                    continue;
+                }
             }
 
             log::info!("Running {class}");

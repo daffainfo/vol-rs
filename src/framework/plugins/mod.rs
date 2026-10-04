@@ -1,5 +1,3 @@
-//! The plugin interface and registry.
-//!
 //! A plugin declares what configuration it needs, what columns it produces, and
 //! how to fill them in. Everything else (argument parsing, layer stacking,
 //! rendering) is handled by the framework around it.
@@ -20,24 +18,45 @@ use crate::framework::context::{ConfigValue, Configuration, Context};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
 /// The type of a configuration option a plugin accepts.
+///
+/// A requirement is a means for plugins and other framework components to
+/// request specific configuration data. Requirements can either be simple types
+/// (a boolean, a string, an integer or a series of bytes) or complex types (a
+/// translation layer, a symbol table or a class).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequirementKind {
+    /// A requirement type that contains a single integer.
     Int,
+    /// A requirement type that contains a single unicode string.
     String,
+    /// A requirement type that contains a boolean value.
     Bool,
+    /// A requirement type that contains a byte string.
     Bytes,
-    /// Repeated values of the inner kind.
+    /// Allows for a list of a specific type of requirement, all of which must
+    /// be met for this requirement to be met.
+    ///
+    /// This roughly correlates to allowing a number of arguments to follow a
+    /// command line parameter, such as a list of integers or a list of strings.
+    /// It is distinct from a multi-requirement, which stores the
+    /// subrequirements in a dictionary rather than a list and does not allow
+    /// for a dynamic number of values.
     List(Box<RequirementKind>),
-    /// A string restricted to a fixed set.
+    /// Allows one from a choice of strings.
     Choice(Vec<String>),
     /// The kernel module and symbols the plugin operates on, supplied by
     /// automagic rather than by the user.
+    ///
+    /// Maintains the limitations on what sort of symbol spaces are acceptable.
     Kernel,
     /// A layer name, likewise supplied by automagic.
+    ///
+    /// Maintains the limitations on what sort of translation layers are
+    /// acceptable.
     TranslationLayer,
 }
 
-/// One configuration option.
+/// Class that defines a requirement.
 #[derive(Debug, Clone)]
 pub struct Requirement {
     pub name: String,
@@ -195,7 +214,12 @@ pub mod timeline_helpers {
     }
 }
 
-/// What a plugin needs and what it produces.
+/// Class that defines the basic interface that all Plugins must maintain.
+///
+/// The constructor must only take a context and a config path, so that plugins
+/// can be launched automatically. As such all configuration information must be
+/// provided through the requirements and configuration information in the
+/// context it is passed.
 pub trait Plugin: Send + Sync {
     /// The dotted name the plugin is invoked by, such as `windows.pslist.PsList`.
     fn name(&self) -> &'static str;
@@ -496,8 +520,51 @@ mod tests {
 /// them reports the name it asked for.
 pub fn write_extracted(name: &str, data: &[u8]) -> std::io::Result<String> {
     let chosen = free_extracted_name(name);
-    std::fs::write(output_path(&chosen), data)?;
+    let mut file = create_output_file(&chosen)?;
+    std::io::Write::write_all(&mut file, data)?;
     Ok(chosen)
+}
+
+/// Open one of the files a plugin produces under a name nothing has taken,
+/// giving back that name alongside the open file.
+///
+/// Stores files in the plugin as a means to output a file when necessary. Until
+/// the file has been written, the preferred name may not be the final filename
+/// the data is written to, so the name actually used is given back.
+///
+/// A plugin that writes its contents a piece at a time uses this rather than
+/// gathering the whole file in memory first, which is also what lets a file
+/// with holes in it stay sparse on disk.
+pub fn open_extracted(name: &str) -> std::io::Result<(String, std::fs::File)> {
+    let chosen = free_extracted_name(name);
+    let file = create_output_file(&chosen)?;
+    Ok((chosen, file))
+}
+
+/// Create one of the files a plugin produces, in the directory the caller
+/// asked for, creating that directory if it is not there yet.
+///
+/// The name is sanitized to ensure only a specific allow list of characters is
+/// allowed through.
+///
+/// Upstream writes through a temporary file and renames it into place, which
+/// leaves the file readable only by its owner. An extracted file can hold
+/// anything that was in memory, so the same is done here.
+pub fn create_output_file(name: &str) -> std::io::Result<std::fs::File> {
+    let path = output_path(name);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 /// Where files plugins produce are written.
@@ -564,6 +631,10 @@ pub fn layer_data(
 }
 
 /// Which of a range's bytes the layer has no memory behind.
+///
+/// A byte the layer does not map is one a padded read filled in, and marking
+/// it keeps a run recovered in part visibly different from one recovered
+/// whole. A range the layer maps nothing of is marked throughout.
 fn unmapped_bytes(
     context: &std::sync::Arc<Context>,
     layer: &str,
@@ -576,25 +647,19 @@ fn unmapped_bytes(
     let entries = handle
         .mapping(&context.layers, start, length, true)
         .unwrap_or_default();
-    if entries.is_empty() {
-        return Vec::new();
-    }
 
-    let mut missing = Vec::new();
-    let mut index = 0usize;
-    let mut current = &entries[0];
-    for address in start..start + length {
-        if address < current.offset {
-            missing.push((address - start) as usize);
-        }
-        if address > current.offset + current.size && index + 1 < entries.len() {
-            index += 1;
-            current = &entries[index];
-        }
-        if address > current.offset + current.size {
-            missing.push((address - start) as usize);
+    let mut mapped = vec![false; length as usize];
+    for entry in &entries {
+        let from = entry.offset.max(start);
+        let to = (entry.offset + entry.size).min(start + length);
+        for address in from..to {
+            mapped[(address - start) as usize] = true;
         }
     }
-    missing.dedup();
-    missing
+    mapped
+        .iter()
+        .enumerate()
+        .filter(|(_, present)| !**present)
+        .map(|(index, _)| index)
+        .collect()
 }

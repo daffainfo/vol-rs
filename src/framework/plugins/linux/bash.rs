@@ -1,5 +1,3 @@
-//! Recover bash command history from process memory.
-//!
 //! Bash keeps its history as `hist_entry` structures, each pairing a command
 //! line with the time it ran. The timestamps are stored as a `#` followed by a
 //! Unix time, which gives a cheap pattern to scan the heap for. A hit is then
@@ -19,11 +17,15 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::conversion::unixtime_value;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::intermed::{create_table, SymbolFinder};
-use crate::framework::symbols::linux::{list_tasks, Task};
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Recovers bash command history from memory.
 pub struct Bash;
 
 /// Bash writes each history timestamp as `#` followed by the Unix time.
+///
+/// At this point in time, the epoch integer size will never be less than 10
+/// characters, and the stamp is always preceded by a pound/hash character.
 const TIMESTAMP_PREFIX: &[u8] = b"#";
 
 /// A command longer than this is not a real history entry.
@@ -106,11 +108,16 @@ impl Plugin for Bash {
         };
 
         let mut grid = TreeGrid::new(self.columns());
-        for task in list_tasks(&context, &kernel, false)? {
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
             let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
 
             // Only a shell keeps bash history.
             let comm = task.comm().unwrap_or_default();

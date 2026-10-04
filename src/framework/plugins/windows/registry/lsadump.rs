@@ -1,5 +1,3 @@
-//! Recover the secrets the LSA stores in the registry.
-//!
 //! LSA secrets hold service account passwords, cached domain credentials and
 //! machine account keys, material that is otherwise never written to disk in
 //! recoverable form.
@@ -14,13 +12,13 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::layers::registry::RegistryHive;
 use crate::framework::plugins::windows::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
-use crate::framework::renderers::format_hints::multi_type_data;
 use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::windows::registry::{read_key, subkeys, values, RegistryKey};
 use crate::framework::symbols::windows::sam::{
     assemble_bootkey, decrypt_secret, lsa_key, BOOTKEY_SUBKEYS,
 };
 
+/// Dumps lsa secrets from memory
 pub struct LsaDump;
 
 impl Plugin for LsaDump {
@@ -43,7 +41,7 @@ impl Plugin for LsaDump {
     fn columns(&self) -> Vec<Column> {
         vec![
             Column::string("Key"),
-            Column::string("Secret"),
+            Column::hex_bytes("Secret"),
             Column::bytes("Hex"),
         ]
     }
@@ -100,8 +98,11 @@ impl LsaDump {
             String::new(),
         )?;
 
-        // PolEKList marks a Vista-or-later system. The older key is only
-        // present on systems predating it.
+        // PolEKList marks a Vista-or-later system, decrypted with AES. The
+        // older PolSecretEncryptionKey is only present on systems predating it,
+        // and its secrets are decrypted with DES, which is the Python
+        // implementation of SystemFunction005. Note that the key can be longer
+        // than 7 bytes.
         let policy = descend(&context, &security_hive, &table, security_root.clone(), &["Policy"])
             .ok_or_else(|| {
                 VolatilityError::Other("Could not find the Policy key".to_string())
@@ -175,7 +176,9 @@ impl LsaDump {
                     0,
                     vec![
                         Value::string(name),
-                        multi_type_data(&plaintext),
+                        // Always a dump, which is what a secret is shown as
+                        // even where the bytes happen to read as text.
+                        Value::HexDump(plaintext.clone()),
                         Value::Bytes(plaintext),
                     ],
                 )?,
@@ -190,6 +193,8 @@ impl LsaDump {
 }
 
 /// Reassemble the boot key from the SYSTEM hive.
+///
+/// Based on code from <http://lab.mediaservice.net/code/cachedump.rb>.
 fn read_bootkey(
     context: &Arc<Context>,
     hive: &RegistryHive,

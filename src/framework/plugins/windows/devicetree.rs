@@ -1,5 +1,3 @@
-//! Report the device objects each driver owns, and what is attached to them.
-//!
 //! A driver owns a chain of devices, and devices may be stacked: a filter
 //! driver attaches its own device above another's. An unexpected attachment is
 //! how a rootkit interposes on I/O.
@@ -20,9 +18,14 @@ use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::object_name;
 use crate::framework::plugins::windows::driverscan::scan_drivers;
 
+/// Listing tree based on drivers and attached devices in a particular windows
+/// memory image.
 pub struct DeviceTree;
 
 /// The device type codes, by their numeric value.
+///
+/// The layer is scanned for drivers, then each driver is scanned to get its
+/// device information, and each device to get its attached devices.
 fn device_type_name(code: u64) -> String {
     // These are the FILE_DEVICE_* constants. Only the common ones are named,
     // and anything else is reported numerically rather than guessed at.
@@ -84,6 +87,7 @@ fn device_type_name(code: u64) -> String {
         0x37 => "FILE_DEVICE_SERENUM",
         0x38 => "FILE_DEVICE_TERMSRV",
         0x39 => "FILE_DEVICE_KSEC",
+        0x3A => "FILE_DEVICE_FIPS",
         // A code the table does not name is reported plainly, without the
         // number: the reference implementation's lookup has no fallback that
         // carries one.

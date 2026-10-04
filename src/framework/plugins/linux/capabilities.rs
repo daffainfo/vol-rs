@@ -1,5 +1,3 @@
-//! Report the capability sets held by each task.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -11,8 +9,9 @@ use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{pid_matches, pids_filter, OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, TreeGrid, Value};
-use crate::framework::symbols::linux::list_tasks;
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Lists process capabilities
 pub struct Capabilities;
 
 /// The capability names, indexed by bit position.
@@ -25,13 +24,18 @@ const CAPABILITY_NAMES: &[&str] = &[
     "wake_alarm", "block_suspend", "audit_read", "perfmon", "bpf", "checkpoint_restore",
 ];
 
-/// Render a capability mask as the comma-separated names it contains.
+/// Returns a textual representation of the capability set.
+///
+/// The format is a comma-separated list of capabilitites. In order to summarize
+/// the output and if all the capabilities are enabled, instead of the
+/// individual capabilities, the special name "all" will be shown.
 fn render_capabilities(mask: u64, full: u64) -> String {
     if mask == 0 {
         return String::new();
     }
-    // A set holding every capability the kernel defines is summarised, since
-    // listing forty names says less than the one word does.
+    // In order to summarize the output, a set holding every capability the
+    // kernel defines is shown as the special name "all", since listing forty
+    // names says less than the one word does.
     if full != 0 && mask == full {
         return "all".to_string();
     }
@@ -81,27 +85,41 @@ impl Plugin for Capabilities {
         let filter = pids_filter(config);
         let mut grid = TreeGrid::new(self.columns());
 
-        // Every capability this kernel knows about, used to summarise a full set.
+        // Checks that the framework supports at least as many capabilities as
+        // the kernel being analysed, and gives the mask used to summarise a
+        // full set. A kernel with no record of its own count should be a
+        // kernel < 3.2, see 73efc0394e148d0e15583e13712637831f926720.
         let full = context
-            .object_from_symbol(&kernel, "cap_last_cap", Some("unsigned int"))
+            .object_from_symbol(&kernel, "cap_last_cap", None)
             .and_then(|value| value.as_u64())
             .map(|last| (1u64 << (last + 1)) - 1)
             .unwrap_or(0);
 
-        for task in list_tasks(&context, &kernel, false)? {
-            let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
 
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
+            let Ok(pid) = task.pid() else { continue };
+
+            // A capability set the reference implementation cannot read ends
+            // the listing with a reported failure rather than skipping the one
+            // task, and that is a property of the kernel so it happens on the
+            // first one.
+            let sets = match task.capabilities() {
+                Ok(sets) => sets,
+                Err(error) => {
+                    grid.mark_failed(error);
+                    break;
+                }
+            };
             // The reference implementation reads these without guarding against
             // an unreadable page and stops producing output when one fails.
-            let (Ok(comm), Ok(tid), Ok(euid), Ok(sets)) = (
-                task.comm(),
-                task.tid(),
-                task.euid(),
-                task.capabilities(),
-            ) else {
+            let (Ok(comm), Ok(tid), Ok(euid)) = (task.comm(), task.tid(), task.euid()) else {
                 // The error is reported rather than fatal upstream, which
                 // leaves a blank line behind the truncated listing.
                 grid.mark_truncated_reported();

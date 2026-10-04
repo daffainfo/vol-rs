@@ -30,17 +30,21 @@ pub fn directory() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("vol-rs"))
+    Some(base.join("volatility3"))
 }
 
 /// A named place inside the cache.
+///
+/// The files themselves go in a directory of their own inside the cache, so
+/// that the cache this port reports and clears is the same one the reference
+/// implementation names while neither tool touches the other's files.
 pub fn entry(name: &str) -> Option<PathBuf> {
-    directory().map(|base| base.join(name))
+    directory().map(|base| base.join("vol-rs").join(name))
 }
 
 /// Throw away everything cached, so the next run works it all out again.
 pub fn clear() {
-    let Some(directory) = directory() else {
+    let Some(directory) = directory().map(|base| base.join("vol-rs")) else {
         return;
     };
     if !Path::new(&directory).is_dir() {

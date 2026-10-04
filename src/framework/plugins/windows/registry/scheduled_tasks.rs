@@ -1,8 +1,9 @@
-//! Decode the scheduled tasks the system keeps in its registry.
-//!
 //! Each task is stored as three blobs: what it does, what starts it, and when
 //! it last ran. The blobs are a serialisation of the scheduler's own objects,
 //! so reading them recovers tasks whose files on disk have been removed.
+//!
+//! Reference:
+//! https://cyber.wtf/2022/06/01/windows-registry-analysis-todays-episode-tasks/
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -21,6 +22,8 @@ use crate::framework::symbols::windows::registry::{
     read_key, subkeys, values, RegistryKey, RegistryValue, ValueType,
 };
 
+/// Decodes scheduled task information from the Windows registry, including
+/// information about triggers, actions, run times, and creation times.
 pub struct ScheduledTasks;
 
 /// Where the scheduler keeps its tasks.
@@ -814,6 +817,11 @@ fn decode_user(reader: &mut Reader) -> Option<UserInfo> {
     })
 }
 
+/// Decodes a windows SID from variable-length raw bytes
+///
+/// Returns the string representation of the SID if decoding was successful, or
+/// None if the data could not be parsed due to an insufficient number of bytes.
+///
 /// A security identifier, written the way one is written.
 fn decode_sid(data: &[u8]) -> Option<String> {
     if data.len() < 8 {
@@ -909,7 +917,9 @@ impl Plugin for ScheduledTasks {
     }
 
     fn requirements(&self) -> Vec<Requirement> {
-        vec![Requirement::kernel()]
+        // The architectures upstream lists carry a typo for the 32-bit one, so
+        // a 32-bit image satisfies neither and the requirement goes unmet.
+        vec![Requirement::kernel().for_architectures(&["Intel33", "Intel64"])]
     }
 
     fn operating_system(&self) -> OperatingSystem {

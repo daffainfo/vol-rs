@@ -1,6 +1,9 @@
 //! Conversions between the raw values found in memory and the forms plugins
 //! report: timestamps, GUIDs, IP addresses and alignment helpers.
 //!
+//! FIXME: Move the time conversions out of renderers, possibly into the object
+//! utilities.
+//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -19,6 +22,12 @@ const INTERVALS_PER_SECOND: i64 = 10_000_000;
 /// Returns `None` for zero (meaning "never set"), and for values that fall
 /// outside the range a calendar date can represent, which is the usual sign of
 /// a field that was misread rather than a genuine date.
+///
+/// Windows sometimes throws OSErrors rather than ValueError/OverflowError when
+/// it can't convert a value. Since Python 3.3 upstream should raise
+/// OverflowError instead of ValueError, however it was observed that even in
+/// Python 3.7.17 ValueError is still being raised, so upstream catches all
+/// three.
 pub fn wintime_to_datetime(wintime: u64) -> Option<DateTime<Utc>> {
     // Whole seconds only: the hundred-nanosecond part is divided away before
     // the epoch is shifted, so every Windows time reports as a round second.
@@ -253,6 +262,15 @@ pub fn round(address: u64, align: u64, up: bool) -> u64 {
 }
 
 /// Format a big-endian IPv4 address held in a 32-bit integer.
+///
+/// For vol3 devs: `convert_ipv4` and `convert_ipv6` are slightly modified
+/// versions of their counterparts from vol2:
+/// <https://github.com/volatilityfoundation/volatility/blob/master/volatility/utils.py#L84>
+///
+/// Furthermore, vol2 used an overlay for ip addresses that made the conversion
+/// string based, by using struct.pack with the given format string on data that
+/// was then gathered through `.v()`, which did an `obj_vm.read()` returning a
+/// string that struct.pack was then called on.
 pub fn convert_ipv4(address: u32) -> String {
     // The bytes are already in network order in memory. Reading them back out
     // little-endian reproduces that order, which is what upstream's

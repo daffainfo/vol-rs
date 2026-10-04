@@ -27,14 +27,18 @@ const BANNER_PREFIX: &str = "Linux version ";
 const SWAPPER_SIGNATURE: &str = r"swapper(/0|\x00\x00)\x00\x00\x00\x00\x00\x00";
 
 /// Detect a Linux image, load its symbols and build the kernel layer.
+///
+/// Bails out by default unless it can stack properly, and never stacks on top
+/// of an intel layer.
 pub fn detect(
     context: &Arc<Context>,
     physical_layer: &str,
     finder: &SymbolFinder,
 ) -> Result<Option<DetectedOs>> {
-    // The index is built first so the scan can stop at the first banner whose
-    // symbols are actually installed, rather than reading the whole image to
-    // collect banners that will not be used.
+    // If we have no banners, don't bother scanning. The index is built first
+    // so the scan can stop at the first banner whose symbols are actually
+    // installed, rather than reading the whole image to collect banners that
+    // will not be used.
     let started = std::time::Instant::now();
     let index = BannerIndex::build(finder, "linux");
     log::debug!("Indexing symbol files took {:?}", started.elapsed());
@@ -94,6 +98,8 @@ pub fn detect(
         // The kernel is loaded at a randomised address, so the symbol
         // addresses in the file are offset from where things actually are.
         // Recovering that shift is what makes every later read land correctly.
+        // Upstream does not raise where it finds none, because an image may
+        // legitimately have no ASLR shift, but it does report it.
         let started = std::time::Instant::now();
         let confirmed = remembered.as_ref().and_then(|facts| {
             let probe = TaskProbe::new(context, physical_layer, &table_name).ok()??;
@@ -311,10 +317,12 @@ impl<'a> TaskProbe<'a> {
             return None;
         }
 
-        // A fragment of the on-disk kernel image would satisfy the checks
-        // above. Requiring the task list to be self-referential rules it out,
-        // since only the live structure links to itself before any other task
-        // is created.
+        // The idle task steals `mm` from the previously running task, i.e.
+        // `init_mm` is only used as long as no CPU has ever been idle. This
+        // catches cases where we found a fragment of the unrelocated ELF file
+        // instead of the running kernel: requiring the task list to be
+        // self-referential rules it out, since only the live structure links to
+        // itself before any other task is created.
         if let Some(init_mm) = &self.init_mm {
             let active_mm = task
                 .member("active_mm")

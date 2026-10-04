@@ -1,5 +1,3 @@
-//! List the kauth scopes and their registered listeners.
-//!
 //! kauth is the kernel's authorisation framework: an extension registers a
 //! listener on a scope and is consulted on every decision in it. That makes a
 //! listener a complete view of, and veto over, the activity in its scope.
@@ -17,6 +15,7 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::mac::{walk_tailq, ExtensionResolver};
 
+/// Lists kauth scopes and their status
 pub struct KauthScopes;
 
 impl Plugin for KauthScopes {
@@ -47,6 +46,9 @@ impl Plugin for KauthScopes {
         ]
     }
 
+    /// Enumerates the registered kauth scopes and yields each object.
+    ///
+    /// Uses a smear-safe enumeration API.
     fn run(&self, context: Arc<Context>, config: &Configuration) -> Result<TreeGrid> {
         let kernel = kernel_module(&context, config)?;
         let resolver = ExtensionResolver::new(&context, &kernel).ok();

@@ -1,5 +1,3 @@
-//! Find tasks by scanning memory rather than walking the task list.
-//!
 //! A task unlinked from the list to hide it still occupies memory, so scanning
 //! for structures that look like tasks recovers it.
 //!
@@ -17,6 +15,7 @@ use crate::framework::renderers::format_hints::or_unreadable;
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::linux::Task;
 
+/// Scans for processes present in a particular linux image.
 pub struct PsScan;
 
 
@@ -165,6 +164,11 @@ impl Plugin for PsScan {
 }
 
 /// Sign-extend a kernel address the way the layer canonicalises it.
+///
+/// All `sched_class` names are found by searching for those that include
+/// `_sched_class`, such as `fair_sched_class`, and canonicalize sets the
+/// appropriate sign extension for the address before the packed bytes are
+/// appended to the needles to search for.
 fn canonical(address: u64) -> u64 {
     if address & (1 << 47) != 0 {
         address | 0xFFFF_0000_0000_0000

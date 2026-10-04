@@ -1,5 +1,3 @@
-//! Report the kernel's physical address map.
-//!
 //! `iomem` describes which device or subsystem owns each region of physical
 //! address space, which is how an unexpected claim on memory becomes visible.
 //!
@@ -17,9 +15,14 @@ use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Generates an output similar to /proc/iomem on a running system.
 pub struct IoMem;
 
 /// Guard against a corrupt tree.
+///
+/// Each resource is marked as seen. Normally this should not be needed but it
+/// protects against possible infinite loops, and the user is warned where one
+/// would have happened.
 const MAX_RESOURCES: usize = 100_000;
 
 impl Plugin for IoMem {
@@ -62,6 +65,11 @@ impl Plugin for IoMem {
 }
 
 /// Emit a resource and everything nested beneath it.
+///
+/// The resource object is created with protection against memory smear, and
+/// its name with the same protection, since following a pointer may lead
+/// anywhere. Information on the resource is yielded, then its child if that
+/// exists, then its sibling.
 fn emit(resource: &Object, depth: usize, grid: &mut TreeGrid, count: &mut usize) -> Result<()> {
     if *count >= MAX_RESOURCES || depth > 16 {
         return Ok(());

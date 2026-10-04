@@ -1,8 +1,9 @@
-//! Check the ftrace subsystem for callbacks attached to kernel functions.
-//!
 //! ftrace can attach a callback to almost any kernel function. It is the
 //! kernel's own tracing mechanism, and equally a supported way to hook any
 //! function without patching code, so what is registered matters.
+//!
+//! Public researches:
+//! <https://i.blackhat.com/USA21/Wednesday-Handouts/us-21-Fixing-A-Memory-Forensics-Blind-Spot-Linux-Kernel-Tracing-wp.pdf>
 //!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
@@ -17,6 +18,10 @@ use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::linux::resolver::ModuleResolver;
 
+/// Detect ftrace hooking
+///
+/// Investigate the ftrace infrastructure to uncover kernel attached callbacks,
+/// which can be leveraged to hook kernel functions and modify their behaviour.
 pub struct CheckFtrace;
 
 impl Plugin for CheckFtrace {
@@ -62,8 +67,21 @@ impl Plugin for CheckFtrace {
         let resolver = ModuleResolver::new(&context, &kernel).ok();
         let mask = context.layers.address_mask(&kernel.layer_name);
 
-        // The registered operations form a singly-linked list whose end is a
-        // sentinel the kernel keeps at a known symbol.
+        // Without the list there is nothing to check, which the reference
+        // implementation says on the error stream and then reports an empty
+        // listing rather than failing.
+        if context.symbol_offset(&kernel, "ftrace_ops_list").is_err() {
+            eprintln!(
+                "ERROR    volatility3.plugins.linux.tracing.ftrace: The provided symbol table \
+                 does not include the \"ftrace_ops_list\" symbol. This means you are either \
+                 analyzing an unsupported kernel version or that your symbol table is corrupted."
+            );
+            return Ok(TreeGrid::new(columns_for(show_flags)));
+        }
+
+        // Iterate over (ftrace_ops *)ftrace_ops_list. ftrace_list_end is not
+        // considered a valid struct, see kernel function
+        // test_rec_ops_needs_regs.
         let mut address = context
             .object_from_symbol(&kernel, "ftrace_ops_list", None)?
             .pointer_value()?;
@@ -93,7 +111,8 @@ impl Plugin for CheckFtrace {
                 break;
             };
 
-            // Which module the callback belongs to, and where that module sits.
+            // Determine the symbols associated with a hook, and which module
+            // the callback belongs to.
             let (module, symbol) = match &resolver {
                 Some(resolver) => resolver.describe(&context, callback),
                 None => (None, None),
@@ -115,7 +134,8 @@ impl Plugin for CheckFtrace {
                 .map(describe_ftrace_flags)
                 .unwrap_or_default();
 
-            // One row per function the operation is attached to.
+            // Iterate over the ftrace_func_entry list, one row per function
+            // the operation is attached to.
             for hooked in filter_entries(&context, &kernel, &operations, &entry_type) {
                 let hook = hooked & mask;
                 let names = resolver
@@ -167,7 +187,10 @@ fn columns_for(show_flags: bool) -> Vec<Column> {
     columns
 }
 
-/// The names of the state bits an ftrace operation carries.
+/// Denote the state of an ftrace_ops struct.
+///
+/// Based on
+/// <https://elixir.bootlin.com/linux/v6.13-rc3/source/include/linux/ftrace.h#L255>.
 fn describe_ftrace_flags(flags: u64) -> String {
     const NAMES: [&str; 19] = [
         "FTRACE_OPS_FL_ENABLED",
@@ -199,10 +222,11 @@ fn describe_ftrace_flags(flags: u64) -> String {
         .join(",")
 }
 
-/// The addresses an ftrace operation is attached to.
+/// Wrap the process of walking to every ftrace_func_entry of an ftrace_ops.
 ///
-/// The filter is a hash table, but the reference implementation follows only
-/// the chain hanging off its first bucket, so this does the same.
+/// Those are stored in a hash table of filters that indicates the addresses
+/// hooked. The reference implementation follows only the chain hanging off the
+/// table's first bucket, so this does the same.
 fn filter_entries(
     context: &Arc<Context>,
     kernel: &crate::framework::context::Module,

@@ -1,9 +1,9 @@
 //! Finding kernel objects by the pool allocations that hold them.
 //!
-//! Every kernel pool allocation is prefixed by a header carrying a
-//! four-character tag naming what was allocated, so searching memory for a tag
-//! finds objects that are no longer on any list (freed, or deliberately
-//! unlinked), which is what the `*scan` plugins are for.
+//! A kernel pool allocation header exists at the base of the allocation and
+//! provides a tag that we can scan for, so searching memory for a tag finds
+//! objects that are no longer on any list (freed, or deliberately unlinked),
+//! which is what the `*scan` plugins are for.
 //!
 //! A tag match alone is weak evidence: the same four bytes occur constantly in
 //! ordinary data. Each tag therefore comes with a constraint on the
@@ -133,19 +133,27 @@ impl PoolConstraint {
 /// protected pool, which is why several objects appear twice.
 pub fn builtin_constraints(tags: &[&[u8]]) -> Vec<PoolConstraint> {
     let all = vec![
+        // atom tables
         PoolConstraint::new(b"AtmT", "_RTL_ATOM_TABLE", PAGED | NONPAGED | FREE).sized(200),
+        // processes on windows starting with windows 8
+        // -> "protected" allocation, MSB is set
         PoolConstraint::new(b"Pro\xe3", "_EPROCESS", NONPAGED | FREE)
             .of_type("Process")
             .sized(600)
             .trusting_the_tag(),
+        // processes on windows before windows 8
         PoolConstraint::new(b"Proc", "_EPROCESS", NONPAGED | FREE)
             .of_type("Process")
             .sized(600)
             .trusting_the_tag(),
+        // threads on windows starting with windows 8
+        // -> "protected" allocation, MSB is set
         PoolConstraint::new(b"Thr\xe5", "_ETHREAD", NONPAGED | FREE)
             .of_type("Thread")
             .sized(600)
             .trusting_the_tag(),
+        // threads on windows before windows 8
+        // -> 0x0258 is the size of the struct in win5.1
         PoolConstraint::new(b"Thre", "_ETHREAD", NONPAGED | FREE)
             .of_type("Thread")
             .sized(600),
@@ -272,9 +280,8 @@ fn pool_scan(
     constraints: &[PoolConstraint],
     alignment: u64,
 ) -> Result<Vec<(PoolConstraint, Object)>> {
-    let header_type = context
-        .symbol_space
-        .get_type(&kernel.qualified("_POOL_HEADER"))?;
+    let (header_name, vista) = pool_header_type(context, kernel)?;
+    let header_type = context.symbol_space.get_type(&header_name)?;
     let tag_offset = context
         .symbol_space
         .find_member(&header_type, "PoolTag")?
@@ -306,7 +313,7 @@ fn pool_scan(
         };
         let header = context.object_from_template(header_type.clone(), layer_name, address);
 
-        if !matches_constraint(&header, constraint, alignment) {
+        if !matches_constraint(&header, constraint, alignment, vista) {
             continue;
         }
         found.push(((*constraint).clone(), header));
@@ -314,8 +321,62 @@ fn pool_scan(
     Ok(found)
 }
 
+/// The type describing a pool allocation header, and whether it is read the
+/// way Vista and later read it.
+///
+/// Most kernels describe `_POOL_HEADER` themselves. Those that do not get a
+/// description of their own from one of three files, chosen by bitness and by
+/// whether the kernel is Windows 7.
+///
+/// The two generations swapped which pool kind the low bit of the type means.
+/// A kernel that describes the header says which generation it belongs to by
+/// whether its big page tracker carries either of two members. One that does
+/// not is decided by its version instead.
+fn pool_header_type(context: &Arc<Context>, kernel: &Module) -> Result<(String, bool)> {
+    if context
+        .symbol_space
+        .has_type(&kernel.qualified("_POOL_HEADER"))
+    {
+        let vista = context
+            .symbol_space
+            .get_type(&kernel.qualified("_POOL_TRACKER_BIG_PAGES"))
+            .map(|tracker| {
+                ["PoolType", "SlushSize"].iter().any(|member| {
+                    context
+                        .symbol_space
+                        .find_member(&tracker, member)
+                        .map(|found| found.is_some())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        return Ok((kernel.qualified("_POOL_HEADER"), vista));
+    }
+
+    let file = if pointer_size(context, kernel) == 8 {
+        if super::versions::matches(context, kernel, &super::versions::IS_WINDOWS_7) {
+            "poolheader-x64-win7"
+        } else {
+            "poolheader-x64"
+        }
+    } else {
+        "poolheader-x86"
+    };
+    let vista = super::versions::matches(context, kernel, &super::versions::IS_VISTA_OR_LATER);
+    context.ensure_table(file, "windows", file)?;
+    Ok((
+        crate::framework::symbols::join_name(file, "_POOL_HEADER"),
+        vista,
+    ))
+}
+
 /// Whether an allocation is the shape the constraint calls for.
-fn matches_constraint(header: &Object, constraint: &PoolConstraint, alignment: u64) -> bool {
+fn matches_constraint(
+    header: &Object,
+    constraint: &PoolConstraint,
+    alignment: u64,
+    vista: bool,
+) -> bool {
     let Ok(block_size) = header.member("BlockSize").and_then(|value| value.as_u64()) else {
         return false;
     };
@@ -336,11 +397,13 @@ fn matches_constraint(header: &Object, constraint: &PoolConstraint, alignment: u
     let Ok(pool_type) = header.member("PoolType").and_then(|value| value.as_u64()) else {
         return false;
     };
-    // Vista and later swapped the sense of the low bit. Every kernel this runs
-    // against is later than that.
+    // The two generations swapped which kind the low bit means.
     let free = pool_type == 0;
-    let nonpaged = pool_type % 2 == 0 && pool_type > 0;
-    let paged = pool_type % 2 == 1;
+    let (nonpaged, paged) = if vista {
+        (pool_type % 2 == 0 && pool_type > 0, pool_type % 2 == 1)
+    } else {
+        (pool_type % 2 == 1, pool_type % 2 == 0 && pool_type > 0)
+    };
     let allowed = (constraint.page_type & FREE != 0 && free)
         || (constraint.page_type & NONPAGED != 0 && nonpaged)
         || (constraint.page_type & PAGED != 0 && paged);
@@ -395,7 +458,9 @@ fn carve(
 
     // A structure that is not an executive object simply follows the header.
     if constraint.object_type.is_none() {
-        return vec![context.object_from_template(body_type, &layer, start)];
+        return vec![context
+            .object_from_template(body_type, &layer, start)
+            .with_native_layer(&kernel.layer_name)];
     }
 
     let Ok(object_header_type) = context
@@ -418,7 +483,9 @@ fn carve(
 
     if !top_down {
         // Earlier kernels place the object at the end of the allocation, so its
-        // size is what says where it starts.
+        // size is what says where it starts. `top_down` delineates how a
+        // windows version finds the size of the object body, and is used for
+        // windows 8 and later.
         let Ok(block_size) = header.member("BlockSize").and_then(|value| value.as_u64()) else {
             return Vec::new();
         };
@@ -432,7 +499,14 @@ fn carve(
         let Some(address) = (header.offset() + block_size * alignment).checked_sub(rounded) else {
             return Vec::new();
         };
-        return vec![context.object_from_template(body_type, &layer, address)];
+        let object = context
+            .object_from_template(body_type, &layer, address)
+            .with_native_layer(&kernel.layer_name);
+        let valid = match constraint.validator {
+            Some(validator) => validator(&object),
+            None => is_valid_object(context, kernel, &object, &constraint.type_name),
+        };
+        return if valid { vec![object] } else { Vec::new() };
     }
 
     let (Some((infomask_offset, _)), Some((pointercount_offset, pointercount_size))) =
@@ -447,8 +521,13 @@ fn carve(
     let Ok(block_size) = header.member("BlockSize").and_then(|value| value.as_u64()) else {
         return Vec::new();
     };
+    // Define the starting and ending bounds for the scan.
     let limit = longest.min(block_size * alignment);
-    // One read rather than many: the bytes examined are the same either way.
+    // A single read is better than lots of little one-byte reads. We're ok
+    // padding this, because the byte we'd check would be 0, which would only be
+    // valid if there were no optional headers in the first place (ie, if we
+    // read too much for headers that don't exist, but the bit we could read
+    // were valid).
     let Ok(data) = context
         .layers
         .read(&layer, start, (limit + infomask_offset) as usize, true)
@@ -490,6 +569,10 @@ fn carve(
             }
         }
 
+        // PADDING_INFO is a special case: four bytes that contain the total
+        // padding length. They are read from just before the next
+        // `headers_length` minus the padding info size, which sits between the
+        // end of the other optional headers and the POOL_HEADER.
         let mut padding_length = 0u64;
         if padding_present {
             let Some(padding_at) = address.checked_sub(headers_length) else {
@@ -516,11 +599,9 @@ fn carve(
             continue;
         }
 
-        let object = context.object_from_template(
-            body_type.clone(),
-            &layer,
-            address + body_offset + start,
-        );
+        let object = context
+            .object_from_template(body_type.clone(), &layer, address + body_offset + start)
+            .with_native_layer(&kernel.layer_name);
         let valid = match constraint.validator {
             Some(validator) => validator(&object),
             None => is_valid_object(context, kernel, &object, &constraint.type_name),
@@ -575,15 +656,22 @@ pub fn object_type_map(context: &Arc<Context>, kernel: &Module) -> HashMap<u64, 
         return map;
     };
 
+    // The table is an array of pointers, so its stride is the kernel's own
+    // pointer width.
+    let width = pointer_size(context, kernel);
     for index in 0..100u64 {
-        let Ok(data) = context
-            .layers
-            .read(&kernel.layer_name, address + index * 8, 8, false)
-        else {
+        let Ok(data) = context.layers.read(
+            &kernel.layer_name,
+            address + index * width as u64,
+            width,
+            false,
+        ) else {
             break;
         };
-        let pointer = u64::from_le_bytes(data.try_into().unwrap_or([0; 8]))
-            & context.layers.address_mask(&kernel.layer_name);
+        let mut raw = [0u8; 8];
+        raw[..width.min(8)].copy_from_slice(&data[..width.min(8)]);
+        let pointer =
+            u64::from_le_bytes(raw) & context.layers.address_mask(&kernel.layer_name);
         // The first entry is always null. The next one that is ends the table.
         if pointer == 0 {
             if index > 0 {
@@ -630,13 +718,49 @@ pub fn object_type_of(
         .find_member(&object_header_type, "Body")
         .ok()??;
     let address = object.offset().checked_sub(body_offset)?;
-    let header = context.object_from_template(object_header_type, object.layer_name(), address);
+    // The header's own pointers name the kernel's address space even when the
+    // header itself was carved out of physical memory.
+    let header = context
+        .object_from_template(object_header_type, object.layer_name(), address)
+        .with_native_layer(object.native_layer_name());
+    object_type_of_header(&header, type_map, cookie)
+}
+
+/// What the kernel says the object behind an object header is.
+///
+/// Vista and earlier name the type in the header itself, through a pointer to
+/// the type's own structure. The name has to be a plausible length at both
+/// ends of the read, since a header carved out of unrelated bytes reads as a
+/// pointer to anything. Windows 7 and later record an index into the kernel's
+/// table of types instead, and Windows 10 mixes that index with the header's
+/// own address and a per-boot value.
+pub fn object_type_of_header(
+    header: &Object,
+    type_map: &HashMap<u64, String>,
+    cookie: Option<u64>,
+) -> Option<String> {
+    if let Ok(object_type) = header.member("Type") {
+        let length = object_type
+            .member("Name")
+            .and_then(|name| name.member("Length"))
+            .and_then(|length| length.as_u64())
+            .ok()?;
+        if length == 0 || length > 128 {
+            return None;
+        }
+        let name = object_type
+            .member("Name")
+            .and_then(|name| crate::framework::symbols::windows::unicode_string(&name))
+            .ok()?;
+        if name.is_empty() || name.chars().count() > 128 {
+            return None;
+        }
+        return Some(name);
+    }
 
     let type_index = header.member("TypeIndex").ok()?.as_u64().ok()?;
-    // Windows 10 obfuscates the index with the header's own address and a
-    // per-boot cookie.
     let index = match cookie {
-        Some(cookie) => ((address >> 8) ^ cookie ^ type_index) & 0xFF,
+        Some(cookie) => ((header.offset() >> 8) ^ cookie ^ type_index) & 0xFF,
         None => type_index,
     };
     type_map.get(&index).cloned()
@@ -669,38 +793,17 @@ fn pointer_size(context: &Arc<Context>, kernel: &Module) -> usize {
 
 /// Whether this kernel is Windows 10 or later.
 pub fn is_windows_10(context: &Arc<Context>, kernel: &Module) -> bool {
-    context
-        .symbol_space
-        .has_symbol(&kernel.qualified("ObHeaderCookie"))
+    super::versions::matches(context, kernel, &super::versions::IS_WINDOWS_10)
 }
 
 /// Whether this kernel is Windows 8 or later.
 pub fn is_windows_8_or_later(context: &Arc<Context>, kernel: &Module) -> bool {
-    // The handle table lost its count member in Windows 8.
-    match context
-        .symbol_space
-        .get_type(&kernel.qualified("_HANDLE_TABLE"))
-    {
-        Ok(template) => !context
-            .symbol_space
-            .find_member(&template, "HandleCount")
-            .map(|found| found.is_some())
-            .unwrap_or(false),
-        Err(_) => true,
-    }
+    super::versions::matches(context, kernel, &super::versions::IS_WINDOWS_8_OR_LATER)
 }
 
 /// Whether this kernel is Windows 8.1 or later.
 pub fn is_windows_8_1_or_later(context: &Arc<Context>, kernel: &Module) -> bool {
-    // The processor control block gained a pending-tick field in Windows 8.1.
-    match context.symbol_space.get_type(&kernel.qualified("_KPRCB")) {
-        Ok(template) => context
-            .symbol_space
-            .find_member(&template, "PendingTickFlags")
-            .map(|found| found.is_some())
-            .unwrap_or(false),
-        Err(_) => false,
-    }
+    super::versions::matches(context, kernel, &super::versions::IS_WINDOWS_8_1_OR_LATER)
 }
 
 /// The layer holding physical memory beneath a virtual one.

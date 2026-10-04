@@ -1,5 +1,3 @@
-//! Show Linux tasks as a tree.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -13,8 +11,9 @@ use crate::framework::plugins::{
     pid_filter, pid_matches, OperatingSystem, Plugin, Requirement, RequirementKind,
 };
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::linux::{list_tasks, Task};
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Plugin for listing processes in a tree based on their parent process ID.
 pub struct PsTree;
 
 struct Node {
@@ -77,20 +76,27 @@ impl Plugin for PsTree {
         // is the process that started it.
         let mut order: Vec<u64> = Vec::new();
         let mut tasks: HashMap<u64, Node> = HashMap::new();
-        for task in list_tasks(&context, &kernel, include_threads)? {
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+        for task in list_tasks_filtered(&context, &kernel, include_threads, &selected)? {
             let (Ok(pid), Ok(tid), Ok(ppid)) = (task.pid(), task.tid(), task.ppid()) else {
                 continue;
             };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
             if tasks.insert(tid, Node { pid, tid, ppid, task }).is_none() {
                 order.push(tid);
             }
         }
 
-        // How deep each task sits, found by climbing to the top and counting.
-        // The climb also records who each task's children are.
+        // Finds how deep each PID is in the tasks hierarchy, by climbing to
+        // the top and counting, and builds the child/level maps on the way.
+        // We don't want swapper in the tree, and only pid 1 (init/systemd) or 2
+        // (kthreadd) should have swapper as a parent: any other process with a
+        // ppid of 0 is smeared or terminated.
         let mut levels: HashMap<u64, usize> = HashMap::new();
         let mut children: HashMap<u64, BTreeSet<u64>> = HashMap::new();
         for start in &order {

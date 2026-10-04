@@ -1,5 +1,3 @@
-//! List the virtual address descriptors of each process.
-//!
 //! The VAD tree describes every reserved or committed region of a process's
 //! address space. It is a balanced binary tree, so listing it means an in-order
 //! traversal from the root held in the process.
@@ -20,6 +18,7 @@ use crate::framework::plugins::{pid_filter, pid_matches, OperatingSystem, Plugin
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 use crate::framework::symbols::windows::{list_processes, Process};
 
+/// Lists process memory ranges.
 pub struct VadInfo;
 
 /// Guard against a corrupt tree turning into an unbounded walk.
@@ -160,6 +159,15 @@ impl Plugin for VadInfo {
 /// The largest range written out unless a smaller limit is given.
 const MAXSIZE_DEFAULT: u64 = 1024 * 1024 * 1024;
 
+/// Extracts the complete data for Vad as a FileInterface.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+/// * `vad` - The suspected VAD to extract (ObjectInterface)
+/// * `maxsize` - Max size of VAD section (default MAXSIZE_DEFAULT)
+///
 /// Write one memory range out, named after the process and the range.
 ///
 /// The range is read a piece at a time, and pages the image does not hold are
@@ -173,32 +181,48 @@ pub fn vad_dump(
     maxsize: i64,
 ) -> Option<String> {
     let (start, end) = (start_vpn(vad)?, end_vpn(vad)?);
-    let size = end - start + 1;
-    if maxsize > 0 && size > maxsize as u64 {
+    // A damaged entry can hold a range the wrong way round, which leaves the
+    // size negative. Upstream carries that through: the limit does not catch
+    // it, nothing is read, and the file is written empty and still named.
+    let size = (end as i64) - (start as i64) + 1;
+    if maxsize > 0 && size > maxsize {
         log::debug!("Skip VAD dump {start:#x}-{end:#x} due to maxsize limit");
         return None;
     }
     let layer = process.address_space(physical).ok()?;
 
     let name = format!("pid.{pid}.vad.{start:#x}-{end:#x}.dmp");
+    // Upstream opens the file before it starts reading and commits it when the
+    // handle is dropped, so a dump that gave up part way still leaves what it
+    // had behind. It reads in ten megabyte pieces, and so does this, rather
+    // than holding a whole mapping in memory.
+    let (stored, mut handle) = crate::framework::plugins::open_extracted(&name).ok()?;
     const CHUNK: u64 = 1024 * 1024 * 10;
-    let mut contents: Vec<u8> = Vec::with_capacity(size as usize);
+    let wanted = size.max(0) as u64;
     let mut offset = start;
-    while offset < start + size {
-        let take = CHUNK.min(start + size - offset);
-        let data = context
-            .layers
-            .read(&layer, offset, take as usize, true)
-            .ok()?;
+    let mut complete = true;
+    while offset < start.wrapping_add(wanted) {
+        let take = CHUNK.min(start + wanted - offset);
+        let Ok(data) = context.layers.read(&layer, offset, take as usize, true) else {
+            complete = false;
+            break;
+        };
         if data.is_empty() {
             break;
         }
-        contents.extend_from_slice(&data);
+        if std::io::Write::write_all(&mut handle, &data).is_err() {
+            complete = false;
+            break;
+        }
         offset += take;
+    }
+
+    if !complete {
+        return None;
     }
     // The name reported is the one written, which is not the one asked for
     // when a file of that name was already there.
-    crate::framework::plugins::write_extracted(&name, &contents).ok()
+    Some(stored)
 }
 
 /// Walk the VAD tree of one process, in order.
@@ -410,14 +434,24 @@ fn flag_field(vad: &Object, name: &str) -> Option<u64> {
 
 /// The four-character pool tag preceding the VAD allocation.
 pub fn tag(context: &Arc<Context>, node: &Object) -> Option<String> {
-    let address = node.offset().checked_sub(12)?;
+    // The allocation header sits in front of the node, and how far in front
+    // depends on the width of a pointer.
+    let sixty_four_bit = node
+        .table_name()
+        .and_then(|table| context.symbol_space.table(&table).ok())
+        .map(|table| table.pointer_size())
+        .unwrap_or(8)
+        == 8;
+    let address = node.offset().checked_sub(if sixty_four_bit { 12 } else { 4 })?;
     let data = context
         .layers
         .read(node.layer_name(), address, 4, false)
         .ok()?;
     // The bytes are the name: a tag like `Vad ` is three letters and a space,
-    // and standing in for that space would rename it.
-    Some(String::from_utf8_lossy(&data).to_string())
+    // and standing in for that space would rename it. Bytes that are not text
+    // are not a tag at all, which is how a node that only looked like one is
+    // told apart.
+    String::from_utf8(data).ok()
 }
 
 /// Page protection, rendered as the constant name Windows uses.
@@ -454,35 +488,58 @@ pub fn file_name_of(node: &Object) -> Option<String> {
 }
 
 fn file_name(node: &Object) -> Option<String> {
-    let subsection = node.member("Subsection").ok()?.dereference().ok()?;
-    let control_area = subsection.member("ControlArea").ok()?.dereference().ok()?;
-    let file_pointer = control_area.member("FilePointer").ok()?;
+    // Windows XP and Server 2003 hang the control area off the range itself.
+    // Vista and later reach it through a subsection, and there the pointer to
+    // the file is a fast reference rather than a plain one.
+    let name = match node.member("ControlArea") {
+        Ok(area) => area
+            .member("FilePointer")
+            .and_then(|file| file.member("FileName"))
+            .ok()?,
+        Err(_) => {
+            let file_pointer = node
+                .member("Subsection")
+                .and_then(|subsection| subsection.member("ControlArea"))
+                .and_then(|area| area.member("FilePointer"))
+                .ok()?;
+            let address =
+                crate::framework::symbols::windows::fast_reference(&file_pointer).ok()?;
+            if address == 0 {
+                return None;
+            }
+            let context = node.context().clone();
+            let template = context
+                .symbol_space
+                .get_type(&crate::framework::symbols::join_name(
+                    &node.table_name()?,
+                    "_FILE_OBJECT",
+                ))
+                .ok()?;
+            context
+                .object_from_template(template, node.layer_name(), address)
+                .with_native_layer(node.native_layer_name())
+                .member("FileName")
+                .ok()?
+        }
+    };
 
-    // FilePointer is an _EX_FAST_REF: on a 64-bit kernel the low four bits
-    // carry a reference count rather than part of the address.
-    let address = file_pointer
-        .member("Object")
-        .and_then(|object| object.pointer_value())
-        .or_else(|_| file_pointer.pointer_value())
-        .ok()?
-        & !0xF;
-    if address == 0 {
+    // A name of no length is no name, which is reported as not applicable
+    // rather than as an empty one.
+    if name.member("Length").and_then(|f| f.as_u64()).unwrap_or(0) == 0 {
         return None;
     }
-
-    let context = node.context().clone();
-    let resolved = node.resolved_template().ok()?;
-    let table = resolved.as_struct()?.table.clone();
-    let template = context
-        .symbol_space
-        .get_type(&crate::framework::symbols::join_name(&table, "_FILE_OBJECT"))
-        .ok()?;
-    let file = context.object_from_template(template, node.layer_name(), address);
-    unicode_string(&file.member("FileName").ok()?)
-        .ok()
-        .filter(|name| !name.is_empty())
+    unicode_string(&name).ok()
 }
 
+/// Look up the array of memory protection constants from the memory sample.
+/// These don't change often, but if they do in the future, then finding them
+/// dynamically versus hard-coding here will ensure we parse them properly.
+///
+/// # Args
+///
+/// * `context` - The context to retrieve required elements (layers, symbol
+///   tables) from
+///
 /// The protection constants this kernel uses, read from its own table.
 ///
 /// A range's protection is an index into `MmProtectToValue`, and the value
@@ -504,6 +561,8 @@ pub fn protect_values(context: &Arc<Context>, kernel: &Module) -> Vec<u32> {
 }
 
 /// The names Windows gives each protection bit, in the order it reports them.
+///
+/// These are from WinNT.h.
 const WINNT_PROTECTIONS: &[(&str, u32)] = &[
     ("PAGE_NOACCESS", 0x01),
     ("PAGE_READONLY", 0x02),
@@ -572,14 +631,14 @@ pub fn private_memory_of(vad: &Object) -> Option<i64> {
 
 /// The control area describing what a range is mapped from.
 pub fn control_area(vad: &Object) -> Option<Object> {
-    // Older kernels name it directly. Newer ones reach it through the
-    // subsection.
+    // Windows xp and 2003 name it directly.
     if let Ok(area) = vad
         .member("ControlArea")
         .and_then(|area| area.dereference())
     {
         return Some(area);
     }
+    // Vista and beyond reach it through the subsection.
     vad.member("Subsection")
         .and_then(|subsection| subsection.dereference())
         .and_then(|subsection| subsection.member("ControlArea"))
@@ -590,13 +649,10 @@ pub fn control_area(vad: &Object) -> Option<Object> {
 /// The file object a control area refers to.
 pub fn file_object(control_area: &Object) -> Option<Object> {
     let pointer = control_area.member("FilePointer").ok()?;
-    // A fast reference keeps four bits of state in the low bits of the address.
-    let address = pointer
-        .member("Object")
-        .and_then(|object| object.pointer_value())
-        .or_else(|_| pointer.pointer_value())
-        .ok()?
-        & !0xF;
+    // A fast reference keeps a small count in the bits below the alignment a
+    // pointer is guaranteed to have, and how many of them there are follows
+    // the architecture.
+    let address = crate::framework::symbols::windows::fast_reference(&pointer).ok()?;
     if address == 0 {
         return None;
     }

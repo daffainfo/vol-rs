@@ -1,5 +1,3 @@
-//! List the framebuffer devices and their state.
-//!
 //! A framebuffer holds what is on screen. Recovering its parameters is the
 //! first step towards reconstructing the display at the time of capture.
 //!
@@ -16,6 +14,7 @@ use crate::framework::objects::Object;
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Extract framebuffers from the fbdev graphics subsystem
 pub struct Fbdev;
 
 impl Plugin for Fbdev {
@@ -284,9 +283,12 @@ impl Framebuffer {
 
 /// Unpack a framebuffer's pixels into eight bit red, green, blue and alpha.
 ///
-/// Each pixel is as wide as the mode says and holds its colours at the offsets
-/// the bitfields give. A colour the format does not carry is left alone, which
-/// leaves an image opaque where it has no alpha channel.
+/// This is not designed to be extremely fast, but convenient and dynamic for
+/// any colour field layout. The framebuffer is expected to have been
+/// correctly constructed to get the needed RGBA mappings, naturally ordered by
+/// RGBA. Each pixel is as wide as the mode says and holds its colours at the
+/// offsets the bitfields give. A colour the format does not carry is left
+/// alone, which leaves an image opaque where it has no alpha channel.
 fn to_rgba(
     data: &[u8],
     width: u64,

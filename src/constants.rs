@@ -3,9 +3,11 @@
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
-/// Framework interface version (major, minor, patch), following SemVer:
-/// major changes break plugin compatibility, minor additions are backwards
-/// compatible, patch is bug fixes only.
+/// Framework interface version, using the SemVer 2.0.0 versioning scheme.
+///
+/// The major is the number of releases of the library with a breaking change,
+/// the minor the number of changes that only add to the interface, and the
+/// patch the number of changes that do not change the interface.
 pub const VERSION_MAJOR: u32 = 2;
 pub const VERSION_MINOR: u32 = 28;
 pub const VERSION_PATCH: u32 = 0;

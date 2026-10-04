@@ -1,5 +1,3 @@
-//! Scan memory for Master Boot Records.
-//!
 //! An MBR occupies the first sector of a disk: boot code, a disk signature, a
 //! four-entry partition table, and a fixed two-byte signature that closes the
 //! sector. Recovering one from memory shows what the machine booted from, and
@@ -20,6 +18,7 @@ use crate::framework::plugins::windows::{kernel_module, physical_layer};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Scans for and parses potential Master Boot Records (MBRs)
 pub struct MbrScan;
 
 /// A sector is 512 bytes, and the record's signature closes it.
@@ -62,11 +61,13 @@ impl Plugin for MbrScan {
         let layer_name = physical_layer(config);
         let full = config.get_bool("full").unwrap_or(false);
         let layer = context.layers.get(&layer_name)?;
-        // The record's own structures ship as a file of their own.
+        // Read in the Symbol File: the record's own structures ship as a file
+        // of their own.
         context.ensure_table("mbr", "windows", "mbr")?;
 
-        // The signature is only two bytes, so most hits are coincidence. A
-        // record with no boot code at all is the one case ruled out.
+        // Define Signature and Data Length. The signature is only two bytes,
+        // so most hits are coincidence, and a record with no boot code at all
+        // is the one case ruled out.
         let scanner = BytesScanner::new(BOOT_SIGNATURE.to_vec());
         let mut hits: Vec<u64> = Vec::new();
         scan_layer(layer.as_ref(), &context.layers, &scanner, None, |offset| {
@@ -75,8 +76,25 @@ impl Plugin for MbrScan {
 
         let mut grid = TreeGrid::new(columns_for(full));
 
+        // Decide of Memory Dump Architecture: the boot code is decoded for
+        // the kernel's own bitness, which is the only architecture this plugin
+        // is offered.
+        let architecture = if context
+            .symbol_space
+            .table(&kernel.symbol_table_name)
+            .map(|table| table.pointer_size())
+            .unwrap_or(8)
+            == 8
+        {
+            "intel64"
+        } else {
+            "intel"
+        };
+
         for hit in hits {
-            // The signature closes the sector, so the record begins before it.
+            // Scan the Layer for Raw Master Boot Record (MBR) and parse the
+            // fields. The signature closes the sector, so the record begins
+            // before it.
             let Some(start) = hit.checked_sub((SECTOR_SIZE - BOOT_SIGNATURE.len()) as u64) else {
                 continue;
             };
@@ -107,13 +125,20 @@ impl Plugin for MbrScan {
                 Value::not_applicable(),
             ];
             if full {
-                for _ in 0..8 {
+                // The nine columns that only describe a partition entry, which
+                // the record's own row has nothing to say about.
+                for _ in 0..9 {
                     row.push(Value::not_applicable());
                 }
             }
-            // Boot code is shown as instructions where they can be decoded and
-            // as the bytes themselves otherwise.
-            row.push(Value::HexPairs(bootcode.to_vec()));
+            // Extract only BootCode, shown as instructions. The offset is
+            // zero rather than the sector's address, which is what upstream
+            // passes.
+            row.push(Value::Disassembly {
+                data: bootcode.to_vec(),
+                offset: 0,
+                architecture: architecture.to_string(),
+            });
             if full {
                 row.push(Value::HexDump(bootcode.to_vec()));
             }
@@ -182,7 +207,6 @@ impl Plugin for MbrScan {
                 grid.push(1, row)?;
             }
         }
-        let _ = kernel;
         Ok(grid)
     }
 }
@@ -214,9 +238,9 @@ fn columns_for(full: bool) -> Vec<Column> {
         ]);
     }
     columns.push(Column::new("SectorInSize", ColumnType::UInt));
-    columns.push(Column::string("Disasm"));
+    columns.push(Column::new("Disasm", ColumnType::Disassembly));
     if full {
-        columns.push(Column::bytes("Bootcode"));
+        columns.push(Column::layer_data("Bootcode"));
     }
     columns
 }

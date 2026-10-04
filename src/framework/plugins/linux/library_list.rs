@@ -1,5 +1,3 @@
-//! List the shared libraries mapped into each task.
-//!
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
@@ -11,8 +9,9 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::linux::kernel_module;
 use crate::framework::plugins::{pid_matches, pids_filter, OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
-use crate::framework::symbols::linux::list_tasks;
+use crate::framework::symbols::linux::{list_tasks_filtered, Task};
 
+/// Enumerate libraries loaded into processes
 pub struct LibraryList;
 
 impl Plugin for LibraryList {
@@ -46,11 +45,16 @@ impl Plugin for LibraryList {
         let filter = pids_filter(config);
         let mut grid = TreeGrid::new(self.columns());
 
-        for task in list_tasks(&context, &kernel, false)? {
+        // Upstream filters on the kernel's own `pid`, which is the thread
+        // identifier, and does it while walking the list, so a process that
+        // matches brings its threads with it.
+        let selected = |task: &Task| match task.tid() {
+            Ok(tid) => pid_matches(&filter, tid),
+            Err(_) => false,
+        };
+
+        for task in list_tasks_filtered(&context, &kernel, false, &selected)? {
             let Ok(pid) = task.pid() else { continue };
-            if !pid_matches(&filter, pid) {
-                continue;
-            }
             let comm = task.comm().unwrap_or_default();
 
             let Ok(Some(layer)) = task.process_layer() else {
@@ -58,10 +62,11 @@ impl Plugin for LibraryList {
             };
             let mapped = task.vmas().unwrap_or_default();
 
-            // The dynamic loader records every library it has mapped in a
-            // linked list, which is what `ldd` and `/proc/<pid>/maps` agree on.
-            // One entry may be reachable from several mappings, so each load
-            // address is reported once.
+            // Get the task libraries from the ELF headers found within the
+            // memory maps. The dynamic loader records every library it has
+            // mapped in a linked list, which is what `ldd` and
+            // `/proc/<pid>/maps` agree on. One entry may be reachable from
+            // several mappings, so each load address is reported once.
             let mut seen: HashSet<u64> = HashSet::new();
 
             for vma in &mapped.areas {
@@ -104,12 +109,14 @@ const MAX_DYNAMIC_ENTRIES: u64 = 256;
 /// Libraries one process is believed to have loaded.
 const MAX_LINK_MAPS: usize = 1024;
 
-/// The libraries reachable from an ELF image mapped at `base`.
+/// Get the ELF link map objects for the given VMA address.
 ///
 /// The loader keeps a `link_map` list whose head sits in the second entry of
 /// the global offset table, and the GOT's address is recorded in the image's
-/// dynamic section. So: find PT_DYNAMIC, read DT_PLTGOT out of it, and follow
-/// the list from there.
+/// dynamic section. So: find the PT_DYNAMIC segment, read DT_PLTGOT out of it,
+/// and follow the list from there, since link_map is stored at the second GOT
+/// entry. A section that reads as corrupt is protection against memory smear in
+/// the VMA.
 fn link_maps(context: &Arc<Context>, layer: &str, base: u64) -> Vec<(u64, String)> {
     let mut results = Vec::new();
 

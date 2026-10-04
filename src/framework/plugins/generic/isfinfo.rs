@@ -1,5 +1,3 @@
-//! List the ISF symbol files available to this installation.
-//!
 //! This describes the tool's own installation rather than any memory image, so
 //! what it reports is necessarily about *this* port: the files on its symbol
 //! path and what each of them holds. The columns are the ones the reference
@@ -15,6 +13,8 @@ use crate::framework::context::{Configuration, Context};
 use crate::framework::plugins::{Plugin, Requirement, RequirementKind};
 use crate::framework::renderers::{Column, TreeGrid, Value};
 
+/// Determines information about the currently available ISF files, or a
+/// specific one
 pub struct IsfInfo;
 
 impl Plugin for IsfInfo {
@@ -76,8 +76,10 @@ impl Plugin for IsfInfo {
             .collect::<Vec<String>>();
         let mut grid = TreeGrid::new(self.columns());
 
-        // Every symbol file under every directory searched, whichever
-        // operating system it describes.
+        // Lists all the ISF files that can be found, under every directory
+        // searched, whichever operating system each describes. By ending with
+        // an extension (and therefore, not /), we should not return any
+        // directories.
         let mut listed: Vec<(String, crate::framework::symbols::intermed::SymbolLocation)> =
             Vec::new();
         if let Some(single) = config.get_string("isf") {
@@ -92,13 +94,20 @@ impl Plugin for IsfInfo {
             }
         }
 
+        // Without `--live` the reference implementation lists only what its
+        // identifier cache knows about, which is the files that name the
+        // kernel they describe. The helper files the tool ships, which name
+        // nothing, appear only when every file is asked for.
+        let live = config.get_bool("live").unwrap_or(false);
+
         for (_, location) in listed {
             let uri = location.url();
             if !filters.is_empty() && !filters.iter().any(|filter| uri.contains(filter.as_str())) {
                 continue;
             }
 
-            // A file that cannot be read is still listed, with nothing to say
+            // Try to open the file, load it as JSON, read the data from it. A
+            // file that cannot be read is still listed, with nothing to say
             // about what is in it.
             let Ok(isf) = location.load() else {
                 grid.push(
@@ -118,19 +127,28 @@ impl Plugin for IsfInfo {
 
             // What the file says it describes: the kernel banner for a Linux
             // or Mac file, the database it was converted from for a Windows
-            // one.
+            // one. It is bytes upstream, and what reaches the table is its
+            // representation rather than its contents.
+            use crate::framework::objects::utility::python_bytes_repr;
             let identity = match (&isf.metadata.pdb_database, &isf.metadata.pdb_guid) {
-                (Some(database), Some(guid)) => Value::string(format!(
-                    "{database}|{guid}|{}",
-                    isf.metadata.pdb_age.unwrap_or(0)
+                (Some(database), Some(guid)) => Some(python_bytes_repr(
+                    format!("{database}|{guid}|{}", isf.metadata.pdb_age.unwrap_or(0)).as_bytes(),
                 )),
                 _ => isf
                     .symbols
                     .get("linux_banner")
                     .or_else(|| isf.symbols.get("version"))
                     .and_then(|symbol| symbol.constant_data.clone())
-                    .map(|data| Value::string(String::from_utf8_lossy(&data).to_string()))
-                    .unwrap_or_else(Value::not_available),
+                    .map(|data| python_bytes_repr(&data)),
+            };
+            // A file that names nothing is not in the cache, so it is listed
+            // only when every file was asked for.
+            if identity.is_none() && !live {
+                continue;
+            }
+            let identity = match identity {
+                Some(identity) => Value::string(identity),
+                None => Value::not_available(),
             };
 
             grid.push(

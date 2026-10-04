@@ -1,5 +1,3 @@
-//! Recover bash command history from Mac process memory.
-//!
 //! Bash keeps its history the same way on Mac as on Linux, so the same
 //! two-pass scan applies: find every `#` on the heap, then find the pointers to
 //! those addresses, each of which is a history entry's timestamp.
@@ -21,6 +19,7 @@ use crate::framework::renderers::{Column, TreeGrid, Value};
 use crate::framework::symbols::intermed::{create_table, SymbolFinder};
 use crate::framework::symbols::mac::{list_processes, Proc};
 
+/// Recovers bash command history from memory.
 pub struct Bash;
 
 /// Bash writes each history timestamp as `#` followed by the Unix time.
@@ -59,20 +58,28 @@ impl Plugin for Bash {
         let kernel = kernel_module(&context, config)?;
         let filter = pid_filter(config);
 
-        // Mac is 64-bit throughout, so only the 64-bit description applies.
+        // Find '#' values on the heap. The description of a history entry
+        // follows the kernel's own width, and so does the pointer the second
+        // pass searches for.
+        let pointer_size = context
+            .symbol_space
+            .table(&kernel.symbol_table_name)
+            .map(|table| table.pointer_size())
+            .unwrap_or(8);
+        let description = if pointer_size == 8 { "bash64" } else { "bash32" };
+
         let finder = SymbolFinder::with_defaults();
-        let bash_table = match finder.find("linux", "bash64") {
+        let bash_table = match finder.find("linux", description) {
             Some(location) => {
                 let name = context.symbol_space.free_table_name("bash");
                 context.add_symbol_table(create_table(&name, location.load()?));
                 name
             }
             None => {
-                return Err(VolatilityError::Other(
-                    "Could not find the bundled 'bash64' symbol file; \
+                return Err(VolatilityError::Other(format!(
+                    "Could not find the bundled '{description}' symbol file; \
                      bash history cannot be decoded without it"
-                        .to_string(),
-                ))
+                )))
             }
         };
 
@@ -100,7 +107,7 @@ impl Plugin for Bash {
                 continue;
             }
 
-            for entry in recover(&context, &process, &template, timestamp_offset)? {
+            for entry in recover(&context, &process, &template, timestamp_offset, pointer_size)? {
                 grid.push(
                     0,
                     vec![
@@ -127,6 +134,7 @@ fn recover(
     process: &Proc,
     template: &Arc<crate::framework::objects::template::Template>,
     timestamp_offset: u64,
+    pointer_size: usize,
 ) -> Result<Vec<(i64, String)>> {
     let Some(layer_name) = process.process_layer()? else {
         return Ok(Vec::new());
@@ -156,7 +164,7 @@ fn recover(
         &context.layers,
         &BytesScanner::new(TIMESTAMP_PREFIX.to_vec()),
         Some(&sections),
-        |offset| candidates.push(offset.to_le_bytes().to_vec()),
+        |offset| candidates.push(offset.to_le_bytes()[..pointer_size].to_vec()),
     )?;
 
     if candidates.is_empty() {

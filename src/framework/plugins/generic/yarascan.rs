@@ -1,5 +1,3 @@
-//! Scan a whole layer with YARA rules.
-//!
 //! Where the per-process variants scan one address space at a time, this scans
 //! the layer as a whole, which finds matches in memory belonging to no live
 //! process.
@@ -17,6 +15,7 @@ use crate::framework::plugins::common::yarascan::{
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
+/// Scans kernel memory using yara rules (string or file).
 pub struct YaraScan;
 
 impl Plugin for YaraScan {
@@ -48,7 +47,7 @@ impl Plugin for YaraScan {
             Column::new("Offset", ColumnType::UInt),
             Column::string("Rule"),
             Column::string("Component"),
-            Column::bytes("Value"),
+            Column::layer_data("Value"),
         ]
     }
 
@@ -60,7 +59,20 @@ impl Plugin for YaraScan {
             .or_else(|| config.get_string("physical_layer"))
             .unwrap_or_else(|| "base".to_string());
 
-        let rules = Rules::from_config(config)?;
+        let mut grid = TreeGrid::new(self.columns());
+        // The reference implementation reads the rules only once it has begun
+        // producing rows, so the header is already out when it finds none.
+        // Upstream also keeps a separate option for running compiled rule
+        // files, since compiled rules could potentially be used to execute
+        // malicious code.
+        let rules = match Rules::from_config(config) {
+            Ok(rules) => rules,
+            Err(error) => {
+                eprintln!("ERROR    volatility3.plugins.yarascan: {error}");
+                grid.mark_aborted();
+                return Ok(grid);
+            }
+        };
         let layer = context.layers.get(&layer_name)?;
         let scanner = YaraScanner::new(&rules);
 
