@@ -75,18 +75,22 @@ impl Plugin for BigPools {
                 vec![
                     Value::hex(allocation.address),
                     Value::string(allocation.tag),
+                    // Neither member exists before Vista, and the pool type
+                    // went away again on later releases. Upstream reports a
+                    // member that is not there as not applicable rather than as
+                    // unreadable, which is a different mark in the table.
                     allocation
                         .entry
                         .member("PoolType")
                         .and_then(|kind| kind.as_u64())
                         .map(|kind| Value::string(pool_type_name(&context, &kernel, kind)))
-                        .unwrap_or_else(|_| Value::unreadable()),
+                        .unwrap_or_else(|_| Value::not_applicable()),
                     allocation
                         .entry
                         .member("NumberOfBytes")
                         .and_then(|bytes| bytes.as_u64())
                         .map(Value::hex)
-                        .unwrap_or_else(|_| Value::unreadable()),
+                        .unwrap_or_else(|_| Value::not_applicable()),
                     Value::string(if allocation.free { "Free" } else { "Allocated" }),
                 ],
             )?;

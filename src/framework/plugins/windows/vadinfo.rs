@@ -373,22 +373,31 @@ fn field(node: &Object, name: &str) -> Option<Object> {
 }
 
 /// The starting virtual page number, reassembled from its high and low halves.
+///
+/// This is the first accessible byte in the range.
 pub fn start_vpn(node: &Object) -> Option<u64> {
     let low = field(node, "StartingVpn")?.as_u64().ok()?;
-    // 64-bit kernels split the page number across two fields.
+    // 64-bit kernels split the page number across two fields, with the high
+    // part placed at bit 44 of the address rather than of the page number.
     let high = field(node, "StartingVpnHigh")
         .and_then(|value| value.as_u64().ok())
         .unwrap_or(0);
-    Some(((high << 32) | low) << 12)
+    Some((low << 12) | (high << 44))
 }
 
+/// The ending virtual page number, reassembled the same way.
+///
+/// This is the last accessible byte in the range.
 pub fn end_vpn(node: &Object) -> Option<u64> {
     let low = field(node, "EndingVpn")?.as_u64().ok()?;
     let high = field(node, "EndingVpnHigh")
         .and_then(|value| value.as_u64().ok())
         .unwrap_or(0);
-    // The end VPN names the last page, so the range covers it entirely.
-    Some(((((high << 32) | low) + 1) << 12) - 1)
+    // The end VPN names the last page, so the range covers it entirely. The
+    // one is added to the low part before it is shifted, and the high part is
+    // then or-ed in, so a carry out of the low part stays inside its own field
+    // instead of reaching the high one.
+    Some((((low + 1) << 12) | (high << 44)) - 1)
 }
 
 pub fn parent(node: &Object) -> Option<u64> {

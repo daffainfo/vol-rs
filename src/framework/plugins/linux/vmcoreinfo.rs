@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::framework::context::{Configuration, Context};
-use crate::framework::layers::scanners::{scan_layer, BytesScanner};
+use crate::framework::layers::scanners::{BytesScanner, scan_layer, scan_layer_until};
 use crate::framework::plugins::{OperatingSystem, Plugin, Requirement};
 use crate::framework::renderers::{Column, ColumnType, TreeGrid, Value};
 
@@ -62,42 +62,7 @@ impl Plugin for VmCoreInfo {
             .unwrap_or_else(|| crate::framework::plugins::windows::physical_layer(config));
         let mut grid = TreeGrid::new(self.columns());
 
-        // The note is found by searching rather than by symbol: a crashed
-        // kernel can leave more than one copy behind, and each is reported.
-        for offset in scan_for_note(&context, &layer_name)? {
-            // The name is preceded by the note header and followed by the
-            // payload. The header says how long that payload is.
-            let note = offset - ELF_NOTE_SIZE;
-            let Ok(header) = context
-                .layers
-                .read(&layer_name, note, ELF_NOTE_SIZE as usize, false)
-            else {
-                continue;
-            };
-            let name_size = u32::from_le_bytes(header[0..4].try_into().unwrap());
-            let payload_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
-            let note_type = u32::from_le_bytes(header[8..12].try_into().unwrap());
-            // The name length counts the terminator but not the padding.
-            if name_size as usize != NOTE_NAME.len() - 1 || note_type != 0 || payload_size == 0 {
-                continue;
-            }
-
-            let Ok(data) = context.layers.read(
-                &layer_name,
-                offset + NOTE_NAME.len() as u64,
-                payload_size as usize,
-                false,
-            ) else {
-                continue;
-            };
-            // Every note this recognises opens with the kernel release.
-            if !data.starts_with(b"OSRELEASE=") {
-                continue;
-            }
-
-            let Some(pairs) = parse_note(&data) else {
-                continue;
-            };
+        for (note, pairs) in search_notes(&context, &layer_name)? {
             for (key, value) in pairs {
                 grid.push(
                     0,
@@ -111,6 +76,96 @@ impl Plugin for VmCoreInfo {
         }
         Ok(grid)
     }
+}
+
+/// One note: where it was found, and the key/value pairs it holds.
+pub(crate) type Note = (u64, Vec<(String, String)>);
+
+/// Every VMCOREINFO note in a layer, as its offset and its key/value pairs.
+///
+/// The note is found by searching rather than by symbol: a crashed kernel can
+/// leave more than one copy behind, and each is returned. The stacker wants
+/// them for the same reason the plugin does, so the search lives here and both
+/// read it.
+pub(crate) fn search_notes(context: &Arc<Context>, layer_name: &str) -> Result<Vec<Note>> {
+    let mut found = Vec::new();
+    for offset in scan_for_note(context, layer_name)? {
+        if let Some(note) = read_note(context, layer_name, offset) {
+            found.push(note);
+        }
+    }
+    Ok(found)
+}
+
+/// The first note `accept` is happy with, stopping the search as soon as it
+/// finds one.
+///
+/// The stacker only ever uses one note, the same way upstream takes the first
+/// VMCOREINFO that yields what it needs. Collecting the rest means reading to
+/// the end of the image, which on a multi-gigabyte capture costs more than
+/// everything else the stacker does put together.
+pub(crate) fn first_note_matching<F>(
+    context: &Arc<Context>,
+    layer_name: &str,
+    mut accept: F,
+) -> Result<Option<Note>>
+where
+    F: FnMut(&Note) -> bool,
+{
+    let layer = context.layers.get(layer_name)?;
+    let scanner = BytesScanner::new(NOTE_NAME.to_vec());
+
+    let mut chosen = None;
+    scan_layer_until(
+        layer.as_ref(),
+        &context.layers,
+        &scanner,
+        None,
+        |offset| match read_note(context, layer_name, offset) {
+            Some(note) if accept(&note) => {
+                chosen = Some(note);
+                false
+            }
+            _ => true,
+        },
+    )?;
+    Ok(chosen)
+}
+
+/// Read the note whose name was found at `offset`, if what is there really is
+/// one.
+///
+/// The name is preceded by the note header and followed by the payload, and
+/// the header says how long that payload is. A chance match on the name is
+/// rejected here rather than by the caller.
+fn read_note(context: &Arc<Context>, layer_name: &str, offset: u64) -> Option<Note> {
+    let note = offset - ELF_NOTE_SIZE;
+    let header = context
+        .layers
+        .read(layer_name, note, ELF_NOTE_SIZE as usize, false)
+        .ok()?;
+    let name_size = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let payload_size = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let note_type = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    // The name length counts the terminator but not the padding.
+    if name_size as usize != NOTE_NAME.len() - 1 || note_type != 0 || payload_size == 0 {
+        return None;
+    }
+
+    let data = context
+        .layers
+        .read(
+            layer_name,
+            offset + NOTE_NAME.len() as u64,
+            payload_size as usize,
+            false,
+        )
+        .ok()?;
+    // Every note this recognises opens with the kernel release.
+    if !data.starts_with(b"OSRELEASE=") {
+        return None;
+    }
+    Some((note, parse_note(&data)?))
 }
 
 /// Find the note by searching for its name.

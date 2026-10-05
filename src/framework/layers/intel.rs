@@ -190,14 +190,17 @@ pub const WINDOWS_INTEL_32E: IntelConfig = IntelConfig {
 /// in tools like crashtool.
 pub const LINUX_INTEL: IntelConfig = IntelConfig {
     flavour: Flavour::Linux,
+    class_name: "LinuxIntel",
     ..INTEL
 };
 pub const LINUX_INTEL_PAE: IntelConfig = IntelConfig {
     flavour: Flavour::Linux,
+    class_name: "LinuxIntelPAE",
     ..INTEL_PAE
 };
 pub const LINUX_INTEL_32E: IntelConfig = IntelConfig {
     flavour: Flavour::Linux,
+    class_name: "LinuxIntel32e",
     maxphyaddr: 46,
     ..INTEL_32E
 };

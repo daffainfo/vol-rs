@@ -16,7 +16,9 @@ use crate::framework::automagic::symbol_finder::{first_known_banner, BannerIndex
 use crate::framework::layers::scanners::{scan_layer_until, RegExScanner};
 use crate::framework::automagic::DetectedOs;
 use crate::framework::context::{Context, Module};
-use crate::framework::layers::intel::{IntelLayer, LINUX_INTEL, LINUX_INTEL_32E};
+use crate::framework::layers::intel::{
+    INTEL, INTEL_32E, INTEL_PAE, IntelLayer, LINUX_INTEL, LINUX_INTEL_32E,
+};
 use crate::framework::symbols::intermed::{create_table, SymbolFinder};
 
 /// The banner prefix every Linux kernel writes.
@@ -149,10 +151,23 @@ pub fn detect(
         };
         let dtb = unshifted.wrapping_add(shifts.physical);
 
-        let config = if pointer_size == 8 {
-            LINUX_INTEL_32E
-        } else {
-            LINUX_INTEL
+        // Which class the layer gets is observable, and upstream decides it by
+        // which of its two Linux stackers claims the image. Stackers are tried
+        // in ascending `stack_order`, so `LinuxIntelVMCOREINFOStacker` (34)
+        // goes before `LinuxIntelStacker` (35). A kernel that left a usable
+        // VMCOREINFO note behind is therefore claimed by the first, which
+        // builds a plain `Intel` layer, and only a kernel without one falls
+        // through to the second and its `LinuxIntel` layer. The difference is
+        // not only the name: the Linux classes carry `LinuxMixin`, which
+        // inverts PROT_NONE entries and narrows MAXPHYADDR to 46 bits.
+        //
+        // The page table address and the shifts are the ones derived from the
+        // symbols above rather than from the note, because both routes agree
+        // on them wherever the note is usable at all.
+        let config = match vmcoreinfo_layer_config(context, physical_layer, &found.banner) {
+            Some(config) => config,
+            None if pointer_size == 8 => LINUX_INTEL_32E,
+            None => LINUX_INTEL,
         };
         let layer_name = context.layers.free_name("layer_name");
         context.layers.add(Arc::new(IntelLayer::new(
@@ -488,5 +503,82 @@ fn confirm_banner(
     (data == wanted).then(|| FoundBanner {
         banner: facts.banner.clone(),
         offset: facts.banner_offset,
+    })
+}
+
+/// The layer configuration upstream's VMCOREINFO stacker would build, if that
+/// stacker would claim this image at all.
+///
+/// A note counts only when it describes the same kernel as the banner that was
+/// matched, and when it carries everything the stacker needs: `phys_base` and
+/// `KERNELOFFSET` to recover the shifts, and `SYMBOL(swapper_pg_dir)` to find
+/// the page tables. A note missing any of them is passed over, exactly as
+/// upstream passes it over and tries the next one.
+fn vmcoreinfo_layer_config(
+    context: &Arc<Context>,
+    physical_layer: &str,
+    banner: &str,
+) -> Option<crate::framework::layers::intel::IntelConfig> {
+    use crate::framework::plugins::linux::vmcoreinfo;
+
+    // The note is searched for rather than read from `vmcoreinfo_note`, whose
+    // address the symbols do give. On the kernels that matter that symbol is a
+    // `u32 *`, so it holds a pointer to the note rather than the note itself,
+    // and the pages it points at live in the direct map, whose base is itself
+    // randomised. Searching avoids having to undo two shifts to find something
+    // the search finds anyway.
+    //
+    // The search stops at the first note that would satisfy upstream, which is
+    // also the one upstream would use. It still reads a good part of the image
+    // on a capture whose note sits late, which costs a second or so. If that
+    // ever matters it belongs in the image cache beside the banner offset and
+    // the shifts, which are already remembered per image.
+    let chosen = vmcoreinfo::first_note_matching(context, physical_layer, |(_, pairs)| {
+        note_layer_config(banner, pairs).is_some()
+    })
+    .ok()??;
+    note_layer_config(banner, &chosen.1)
+}
+
+/// The configuration one VMCOREINFO note implies, or nothing if upstream would
+/// pass this note over.
+fn note_layer_config(
+    banner: &str,
+    pairs: &[(String, String)],
+) -> Option<crate::framework::layers::intel::IntelConfig> {
+    let value = |key: &str| {
+        pairs
+            .iter()
+            .find(|(held, _)| held == key)
+            .map(|(_, value)| value.as_str())
+    };
+
+    // The note has to be describing the kernel the banner named. See how the
+    // kernel builds `linux_banner` from its release.
+    let release = value("OSRELEASE")?;
+    if !banner.starts_with(&format!("Linux version {release} (")) {
+        return None;
+    }
+
+    // Kernels before 4.10 may carry a `SYMBOL(phys_base)` instead, which is
+    // not usable for this, so only the number will do. Without `KERNELOFFSET`,
+    // added in 3.14, KASLR may not be implemented at all, and upstream only
+    // proceeds when both are present.
+    value("NUMBER(phys_base)")?;
+    value("KERNELOFFSET")?;
+
+    // A note that does not name the page tables is passed over.
+    let dtb_virtual = value("SYMBOL(swapper_pg_dir)")
+        .and_then(|text| text.strip_prefix("0x"))
+        .and_then(|digits| u64::from_str_radix(digits, 16).ok())?;
+
+    // PAE implies 32-bit. Otherwise the width of the page table's own virtual
+    // address says which it is.
+    let pae = value("CONFIG_X86_PAE").unwrap_or("n") == "y";
+    let bits32 = pae || dtb_virtual <= 1u64 << 32;
+    Some(match (bits32, pae) {
+        (true, true) => INTEL_PAE,
+        (true, false) => INTEL,
+        (false, _) => INTEL_32E,
     })
 }

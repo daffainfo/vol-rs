@@ -23,12 +23,26 @@ use crate::framework::renderers::{Column, TreeGrid, Value};
 /// `MD5|name|inode|mode_as_string|UID|GID|size|atime|mtime|ctime|crtime`.
 pub struct Timeliner;
 
-/// The plugins that contribute to a timeline, in the order the reference
-/// implementation discovers them.
+/// The plugins that contribute to a timeline.
 ///
-/// The order is part of the output: the timeline is built up plugin by plugin
-/// and written out again after each one, so which plugin ran first decides how
-/// many times its entries appear.
+/// The order is part of the output. The timeline is built up plugin by plugin
+/// and written out again after each one, so a plugin that runs early has its
+/// entries repeated once for every plugin that follows it.
+///
+/// Upstream finds the contributors through `class_subclasses`, which yields
+/// subclasses in the order Python created the classes, which is the order the
+/// plugin modules were imported. `import_files` imports them by walking the
+/// plugins directory with `os.walk`, and that walk is not sorted, so the order
+/// is whatever order the filesystem returns the directory entries in. Two
+/// installs of the same release can therefore run the contributors in
+/// different orders and report different unfiltered totals. The list below is
+/// one such order, read off a 2.28.0 install.
+///
+/// A run restricted with `--plugin-filter` only exercises the relative order
+/// of the plugins it selects, so it can agree with an install whose full order
+/// differs. `PsList` and `PsScan` come first almost everywhere, because the
+/// other plugin modules import them, which is why small selections built
+/// around them tend to match.
 const CONTRIBUTORS: &[&str] = &[
     "windows.pslist.PsList",
     "windows.psscan.PsScan",

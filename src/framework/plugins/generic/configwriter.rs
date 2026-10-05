@@ -67,10 +67,15 @@ impl Plugin for ConfigWriter {
         }
 
         // The same thing is written out as a file, so a later run can be told
-        // to use it instead of working it out again.
+        // to use it instead of working it out again. The file is written with
+        // the keys sorted, while the table keeps the order the configuration
+        // was walked in, because upstream dumps the file with `sort_keys` and
+        // then iterates the same dictionary for the table.
+        let mut sorted = entries.clone();
+        sorted.sort_by(|left, right| left.0.cmp(&right.0));
         let document = format!(
             "{{\n{}\n}}",
-            entries
+            sorted
                 .iter()
                 .map(|(key, value)| format!("  {}: {value}", json_string(key)))
                 .collect::<Vec<String>>()
@@ -150,8 +155,17 @@ pub fn describe_layer(
             format!("{prefix}.class"),
             json_string(&layer.class_path()),
         ));
-        if let Some(base) = layer.dependencies().first() {
+        let dependencies = layer.dependencies();
+        if let Some(base) = dependencies.first() {
             children.push(("base_layer".to_string(), base.clone()));
+        }
+        // A VMware snapshot is described by two files: the memory itself and
+        // the metadata saying which segments of it are present. Upstream names
+        // the second `meta_layer`, and records it alongside the first.
+        if layer.kind() == "VmwareLayer"
+            && let Some(meta) = dependencies.get(1)
+        {
+            children.push(("meta_layer".to_string(), meta.clone()));
         }
     }
 

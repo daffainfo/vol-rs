@@ -74,10 +74,11 @@ impl Plugin for VadRegExScan {
         let pattern = config
             .get_string("pattern")
             .ok_or_else(|| VolatilityError::Other("A --pattern is required".to_string()))?;
-        let maxsize = config
-            .get_int("maxsize")
-            .unwrap_or(MATCH_PREVIEW as i64)
-            .max(0) as usize;
+        // The option is declared because upstream declares it, but upstream
+        // reads `MAXSIZE_DEFAULT` rather than the configured value here, so
+        // the value is accepted and then not used. Only the generic
+        // `regexscan` honours it.
+        let maxsize = MATCH_PREVIEW;
         let scanner = RegExScanner::new(&pattern)?;
         let filter = pid_filter(config);
 

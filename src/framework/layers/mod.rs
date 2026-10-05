@@ -261,19 +261,37 @@ pub trait DataLayer: Send + Sync {
 #[derive(Default)]
 pub struct LayerContainer {
     layers: RwLock<HashMap<String, Arc<dyn DataLayer>>>,
+    /// The names in the order they were added.
+    ///
+    /// Upstream holds its layers in a `Dict`, which iterates in insertion
+    /// order, and that order is observable: `layerwriter` with no layer named
+    /// writes out the last one that is not a view of another, so a stack whose
+    /// names happen to sort differently would write a different layer.
+    order: RwLock<Vec<String>>,
 }
 
 impl LayerContainer {
     pub fn new() -> Self {
         Self {
             layers: RwLock::new(HashMap::new()),
+            order: RwLock::new(Vec::new()),
         }
     }
 
     /// Add a layer, replacing any existing layer of the same name.
     pub fn add(&self, layer: Arc<dyn DataLayer>) {
         let name = layer.name().to_string();
-        self.layers.write().unwrap().insert(name, layer);
+        // Re-adding under a name already taken keeps that name's original
+        // place, which is what replacing a value in a dict does.
+        if self
+            .layers
+            .write()
+            .unwrap()
+            .insert(name.clone(), layer)
+            .is_none()
+        {
+            self.order.write().unwrap().push(name);
+        }
     }
 
     /// Fetch a layer by name.
@@ -298,18 +316,25 @@ impl LayerContainer {
         let mut layers = self.layers.write().unwrap();
         if let Some(layer) = layers.remove(from) {
             layers.insert(to.to_string(), layer);
+            // The new name takes the old one's place in the order, so a rename
+            // does not move the layer to the end of the listing.
+            let mut order = self.order.write().unwrap();
+            order.retain(|held| held != to);
+            match order.iter_mut().find(|held| *held == from) {
+                Some(held) => *held = to.to_string(),
+                None => order.push(to.to_string()),
+            }
         }
     }
 
     pub fn remove(&self, name: &str) {
         self.layers.write().unwrap().remove(name);
+        self.order.write().unwrap().retain(|held| held != name);
     }
 
-    /// All layer names currently registered.
+    /// All layer names currently registered, in the order they were added.
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.layers.read().unwrap().keys().cloned().collect();
-        names.sort();
-        names
+        self.order.read().unwrap().clone()
     }
 
     /// A layer name not currently in use, derived from `prefix`.

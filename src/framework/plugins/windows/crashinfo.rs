@@ -180,10 +180,12 @@ impl Plugin for CrashInfo {
             };
             (field("HeaderSize"), field("BitmapSize"), field("Pages"))
         } else {
+            // A full dump carries no summary block, so these three describe
+            // nothing rather than being unavailable.
             (
-                Value::not_available(),
-                Value::not_available(),
-                Value::not_available(),
+                Value::not_applicable(),
+                Value::not_applicable(),
+                Value::not_applicable(),
             )
         };
 

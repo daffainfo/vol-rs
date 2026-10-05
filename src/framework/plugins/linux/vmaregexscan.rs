@@ -73,10 +73,11 @@ impl Plugin for VmaRegExScan {
         let pattern = config.get_string("pattern").ok_or_else(|| {
             VolatilityError::Other("A --pattern is required".to_string())
         })?;
-        let maxsize = config
-            .get_int("maxsize")
-            .unwrap_or(MATCH_PREVIEW as i64)
-            .max(0) as usize;
+        // The option is declared because upstream declares it, but upstream
+        // reads `MAXSIZE_DEFAULT` rather than the configured value here, so
+        // the value is accepted and then not used. Only the generic
+        // `regexscan` honours it.
+        let maxsize = MATCH_PREVIEW;
         let scanner = RegExScanner::new(&pattern)?;
         let filter = pid_filter(config);
 
@@ -94,6 +95,15 @@ impl Plugin for VmaRegExScan {
             let Ok(pid) = task.pid() else { continue };
             let comm = task.comm().unwrap_or_default();
 
+            // The scan has to run in the process's own address space, because
+            // the addresses the areas name are only meaningful there. Attempt
+            // to create a process layer for each task and skip those that
+            // cannot (e.g. kernel threads), which is also how upstream passes
+            // over a task with no `mm`.
+            let Ok(Some(layer_name)) = task.process_layer() else {
+                continue;
+            };
+
             // get process sections for scanning. Scanning the whole address
             // space would mostly search unmapped memory.
             let mapped = task.vmas().unwrap_or_default();
@@ -110,7 +120,7 @@ impl Plugin for VmaRegExScan {
                 continue;
             }
 
-            let layer = context.layers.get(task.object.layer_name())?;
+            let layer = context.layers.get(&layer_name)?;
             let mut hits: Vec<u64> = Vec::new();
             scan_layer(
                 layer.as_ref(),
@@ -123,13 +133,13 @@ impl Plugin for VmaRegExScan {
             for offset in hits {
                 let data = context
                     .layers
-                    .read(task.object.layer_name(), offset, maxsize, true)
+                    .read(&layer_name, offset, maxsize, true)
                     .unwrap_or_default();
-                let text: String = data
-                    .iter()
-                    .take_while(|byte| byte.is_ascii_graphic() || **byte == b' ')
-                    .map(|&byte| byte as char)
-                    .collect();
+                // The pattern is applied a second time at the hit itself so
+                // that the match alone is reported. A match too long to fit in
+                // what was read leaves the whole of it standing instead.
+                let matched = scanner.match_at_start(&data).unwrap_or(data);
+                let text = String::from_utf8_lossy(&matched).to_string();
 
                 grid.push(
                     0,
@@ -138,7 +148,7 @@ impl Plugin for VmaRegExScan {
                         Value::string(comm.clone()),
                         Value::hex(offset),
                         Value::string(text),
-                        Value::Bytes(data),
+                        Value::Bytes(matched),
                     ],
                 )?;
             }
