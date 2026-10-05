@@ -164,11 +164,32 @@ pub fn detect(
         // The page table address and the shifts are the ones derived from the
         // symbols above rather than from the note, because both routes agree
         // on them wherever the note is usable at all.
-        let config = match vmcoreinfo_layer_config(context, physical_layer, &found.banner) {
-            Some(config) => config,
-            None if pointer_size == 8 => LINUX_INTEL_32E,
-            None => LINUX_INTEL,
+        // Searching for the note reads a good part of the capture, so the
+        // class it decided is remembered per image and only worked out once.
+        // Only for the banner it was decided from. A record that was kept for
+        // this file but names another kernel says nothing about this one, and
+        // the rest of this module checks what it recalls rather than trusting
+        // it.
+        let remembered_class = remembered
+            .as_ref()
+            .filter(|facts| facts.banner == found.banner)
+            .map(|facts| facts.layer_class.as_str())
+            .filter(|name| !name.is_empty())
+            .and_then(crate::framework::layers::intel::config_by_name);
+        let config = match remembered_class {
+            Some(config) => {
+                log::debug!("Layer class recalled from the last run of this image");
+                config
+            }
+            None => match vmcoreinfo_layer_config(context, physical_layer, &found.banner) {
+                Some(config) => config,
+                None if pointer_size == 8 => LINUX_INTEL_32E,
+                None => LINUX_INTEL,
+            },
         };
+        // Taken before the configuration is handed over, so the class can be
+        // written down for the next run.
+        let class_name = config.class_name;
         let layer_name = context.layers.free_name("layer_name");
         context.layers.add(Arc::new(IntelLayer::new(
             &layer_name,
@@ -235,6 +256,7 @@ pub fn detect(
                     virtual_shift: shifts.virtual_shift,
                     kernel_offset: 0,
                     dtb: 0,
+                    layer_class: class_name.to_string(),
                 },
             );
         }

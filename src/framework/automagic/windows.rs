@@ -549,6 +549,9 @@ pub fn detect(
                 virtual_shift: 0,
                 kernel_offset: found.virtual_offset,
                 dtb,
+                // Windows picks its layer class from the candidate itself, so
+                // there is nothing to save here.
+                layer_class: String::new(),
             },
         );
     }

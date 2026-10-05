@@ -32,12 +32,19 @@ pub struct ImageFacts {
     /// other way.
     pub kernel_offset: u64,
     pub dtb: u64,
+    /// The layer class the stacker settled on, so the work that decided it does
+    /// not have to be repeated. Empty where nothing was recorded.
+    ///
+    /// Deciding it on Linux means looking for a VMCOREINFO note, and that
+    /// search reads a good part of the capture, which is more than the rest of
+    /// the stacking costs put together.
+    pub layer_class: String,
 }
 
 impl ImageFacts {
     fn encode(&self) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.operating_system,
             self.banner_offset,
             self.symbols,
@@ -46,6 +53,7 @@ impl ImageFacts {
             self.virtual_shift,
             self.kernel_offset,
             self.dtb,
+            self.layer_class,
             self.banner,
         )
     }
@@ -53,7 +61,9 @@ impl ImageFacts {
     fn decode(line: &str) -> Option<Self> {
         // The banner comes last because it is the only field that may itself
         // contain anything.
-        let mut fields = line.splitn(9, '\t');
+        // A line written before the layer class was recorded has one field
+        // too few, so it decodes to nothing and simply misses the cache.
+        let mut fields = line.splitn(10, '\t');
         Some(Self {
             operating_system: fields.next()?.to_string(),
             banner_offset: fields.next()?.parse().ok()?,
@@ -63,6 +73,7 @@ impl ImageFacts {
             virtual_shift: fields.next()?.parse().ok()?,
             kernel_offset: fields.next()?.parse().ok()?,
             dtb: fields.next()?.parse().ok()?,
+            layer_class: fields.next()?.to_string(),
             banner: fields.next()?.to_string(),
         })
     }
@@ -126,10 +137,19 @@ mod tests {
             virtual_shift: 0x29800000,
             kernel_offset: 0,
             dtb: 0,
+            layer_class: "LinuxIntel32e".to_string(),
         };
         let decoded = ImageFacts::decode(&facts.encode()).unwrap();
         assert_eq!(decoded.banner, facts.banner);
         assert_eq!(decoded.physical_shift, facts.physical_shift);
         assert_eq!(decoded.symbols, facts.symbols);
+        assert_eq!(decoded.layer_class, facts.layer_class);
+    }
+
+    #[test]
+    fn a_record_written_before_the_layer_class_is_passed_over() {
+        // One field short, which is what the previous format looked like.
+        let line = "linux\t4660\t/symbols/kernel.json.xz\t22136\t0\t0\t0\t0\tLinux version 6.8.0";
+        assert!(ImageFacts::decode(line).is_none());
     }
 }
