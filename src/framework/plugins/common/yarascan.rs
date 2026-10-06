@@ -62,7 +62,10 @@ pub fn requirements() -> Vec<Requirement> {
 
 /// Compiled rules, ready to scan with.
 pub struct Rules {
-    rules: yara_x::Rules,
+    /// Held for as long as the process runs so that each thread can keep a
+    /// scanner borrowing it. One rule set is built per run of a plugin, so
+    /// nothing accumulates.
+    rules: &'static yara_x::Rules,
 }
 
 impl Rules {
@@ -96,34 +99,56 @@ impl Rules {
             .map_err(|e| VolatilityError::Other(format!("Could not compile YARA rules: {e}")))?;
 
         Ok(Self {
-            rules: compiler.build(),
+            rules: Box::leak(Box::new(compiler.build())),
         })
     }
 
     /// Scan one region, returning every pattern match within it.
+    ///
+    /// A virtual address space is mapped a page at a time and the pieces are
+    /// scanned one by one, so this is called hundreds of thousands of times
+    /// for one image. Building a scanner costs about as much as scanning a
+    /// whole page, so each thread keeps the one it built and hands it the next
+    /// region rather than building another. Which bytes are examined does not
+    /// change, only how often a scanner is constructed.
     pub fn scan(&self, data: &[u8]) -> Vec<Match> {
-        let mut scanner = yara_x::Scanner::new(&self.rules);
-        let Ok(results) = scanner.scan(data) else {
-            // A region that cannot be scanned yields nothing rather than
-            // aborting the walk over the remaining regions.
-            return Vec::new();
-        };
+        thread_local! {
+            static SCANNERS: std::cell::RefCell<
+                std::collections::HashMap<usize, yara_x::Scanner<'static>>,
+            > = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
 
-        let mut matches = Vec::new();
-        for rule in results.matching_rules() {
-            for pattern in rule.patterns() {
-                for found in pattern.matches() {
-                    let range = found.range();
-                    matches.push(Match {
-                        rule: rule.identifier().to_string(),
-                        component: pattern.identifier().to_string(),
-                        offset: range.start,
-                        data: found.data().to_vec(),
-                    });
+        // Keyed by the rules themselves, so a run that compiles more than one
+        // set keeps a scanner for each rather than rebuilding on every call.
+        let key = self.rules as *const yara_x::Rules as usize;
+        SCANNERS.with(|held| {
+            let mut held = held.borrow_mut();
+            let scanner = held
+                .entry(key)
+                .or_insert_with(|| yara_x::Scanner::new(self.rules));
+
+            let Ok(results) = scanner.scan(data) else {
+                // A region that cannot be scanned yields nothing rather than
+                // aborting the walk over the remaining regions.
+                return Vec::new();
+            };
+
+            let mut matches = Vec::new();
+            for rule in results.matching_rules() {
+                for pattern in rule.patterns() {
+                    for found in pattern.matches() {
+                        let range = found.range();
+                        matches.push(Match {
+                            rule: rule.identifier().to_string(),
+                            component: pattern.identifier().to_string(),
+                            offset: range.start,
+                            data: found.data().to_vec(),
+                        });
+                    }
                 }
             }
-        }
-        matches
+            matches
+        })
     }
 }
 
