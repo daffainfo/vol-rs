@@ -254,4 +254,85 @@ mod tests {
         let config = Configuration::new();
         assert!(Rules::from_config(&config).is_err());
     }
+
+    /// A scanner is kept per thread and handed one region after another, so a
+    /// scan must not be affected by what the scanner was shown before it.
+    #[test]
+    fn repeated_scans_do_not_affect_one_another() {
+        let config = Configuration::new();
+        config.set(
+            "yara_string",
+            crate::framework::context::ConfigValue::Str("secret".to_string()),
+        );
+        let rules = Rules::from_config(&config).unwrap();
+
+        // A region that matches, then one that does not, then the first again.
+        let hit = b"a secret value";
+        let miss = b"nothing of interest here";
+        for _ in 0..4 {
+            let first = rules.scan(hit);
+            assert_eq!(first.len(), 1, "a match must be found every time");
+            assert_eq!(first[0].offset, 2);
+            assert_eq!(first[0].data, b"secret");
+
+            assert!(
+                rules.scan(miss).is_empty(),
+                "a region with nothing in it must report nothing, whatever came before"
+            );
+        }
+    }
+
+    /// Two rule sets live at once, and each has to keep its own scanner.
+    #[test]
+    fn two_rule_sets_do_not_share_a_scanner() {
+        let first = Configuration::new();
+        first.set(
+            "yara_string",
+            crate::framework::context::ConfigValue::Str("alpha".to_string()),
+        );
+        let second = Configuration::new();
+        second.set(
+            "yara_string",
+            crate::framework::context::ConfigValue::Str("beta".to_string()),
+        );
+
+        let alpha = Rules::from_config(&first).unwrap();
+        let beta = Rules::from_config(&second).unwrap();
+
+        let data = b"..alpha....beta..";
+        for _ in 0..3 {
+            let a = alpha.scan(data);
+            let b = beta.scan(data);
+            assert_eq!(a.len(), 1);
+            assert_eq!(a[0].data, b"alpha");
+            assert_eq!(b.len(), 1);
+            assert_eq!(b[0].data, b"beta");
+        }
+    }
+
+    /// The same rules scanned from several threads at once, which is how a
+    /// layer scan uses them.
+    #[test]
+    fn scanning_from_several_threads_gives_the_same_answer() {
+        let config = Configuration::new();
+        config.set(
+            "yara_string",
+            crate::framework::context::ConfigValue::Str("secret".to_string()),
+        );
+        let rules = std::sync::Arc::new(Rules::from_config(&config).unwrap());
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let rules = rules.clone();
+                std::thread::spawn(move || {
+                    (0..50)
+                        .map(|_| rules.scan(b"a secret value").len())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().unwrap().iter().all(|found| *found == 1));
+        }
+    }
 }

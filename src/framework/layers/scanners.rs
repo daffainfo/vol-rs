@@ -27,6 +27,8 @@
 //! Derived from Volatility 3, Copyright Volatility Foundation, licensed under
 //! the Volatility Software License 1.0.
 
+use std::sync::Arc;
+
 use aho_corasick::AhoCorasick;
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -331,11 +333,31 @@ where
             .mapping(layers, section_start, section_length, true)
             .unwrap_or_default();
         for block in blocks {
+            // A run of a linearly mapped layer lands on one run of the layer
+            // beneath it, so the bytes can be taken from there and the tables
+            // walked once for the run instead of once per page. A layer that
+            // does not map linearly has to be read through, because the
+            // offsets either side are not a fixed distance apart.
+            let source = if layer.is_linear() && block.size == block.mapped_size {
+                layers
+                    .get(&block.layer)
+                    .ok()
+                    .map(|lower| (lower, block.mapped_offset))
+            } else {
+                None
+            };
             let end = block.offset.saturating_add(block.size);
             let mut offset = block.offset;
             while offset < end {
                 let want = ((chunk_size + overlap) as u64).min(end - offset) as usize;
-                chunks.push(Chunk { offset, want });
+                chunks.push(Chunk {
+                    offset,
+                    want,
+                    // Carried forward by the same distance the run was shifted.
+                    source: source
+                        .as_ref()
+                        .map(|(lower, at)| (lower.clone(), at + (offset - block.offset))),
+                });
                 // Advance by the fresh portion only, so the overlap is
                 // re-read as the start of the next chunk.
                 offset += chunk_size as u64;
@@ -366,9 +388,15 @@ where
                 // zeroes it introduces will simply not match. The bytes are
                 // borrowed where the layer can lend them, which for a scan of
                 // a whole image saves copying every byte of it.
-                let examined = layer.with_bytes(
+                // Read from beneath where those are the same bytes. A hit is
+                // still reported against the layer being scanned either way.
+                let (reader, at) = match &chunk.source {
+                    Some((lower, at)) => (lower.as_ref(), *at),
+                    None => (layer, chunk.offset),
+                };
+                let examined = reader.with_bytes(
                     layers,
-                    chunk.offset,
+                    at,
                     chunk.want,
                     true,
                     &mut |data: &[u8]| {
@@ -414,14 +442,25 @@ where
 
 /// One unit of scanning work: where to read and how much.
 struct Chunk {
+    /// Where the chunk begins in the layer being scanned, which is what a hit
+    /// found inside it is reported against.
     offset: u64,
     want: usize,
+    /// Where the same bytes can be read without translating them again.
+    ///
+    /// Upstream's `LinearlyMappedLayer` scans with `linear` set, which has the
+    /// iterator hand back the layer underneath and the offset already
+    /// converted, so reading a chunk does not walk the tables a second time
+    /// for every page of it.
+    source: Option<(Arc<dyn DataLayer>, u64)>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::framework::layers::physical::BufferLayer;
+    use crate::framework::layers::segmented::{Segment, SegmentedLayer};
+    use std::collections::HashMap;
 
     #[test]
     fn bytes_scanner_finds_every_occurrence() {
@@ -454,6 +493,73 @@ mod tests {
         let mut hits = Vec::new();
         scan_layer(&layer, &layers, &scanner, None, |offset| hits.push(offset)).unwrap();
         assert_eq!(hits, vec![0x1500]);
+    }
+
+    /// Two runs that sit next to each other in this layer but come from
+    /// places far apart in the one beneath it.
+    ///
+    /// The second run's bytes are stored before the first's, so a read that
+    /// forgot to convert the offset would come back with the wrong half and
+    /// the needle planted in each run would be reported at the wrong place.
+    fn two_run_layer(prepare: impl Fn(&mut [u8])) -> (LayerContainer, Arc<dyn DataLayer>) {
+        let mut data = vec![0u8; 0x3000];
+        prepare(&mut data);
+        let layers = LayerContainer::new();
+        layers.add(Arc::new(BufferLayer::new("base", data)));
+        let segments = vec![
+            // 0x0000..0x1000 of this layer is 0x2000..0x3000 of the base
+            Segment::linear(0x0000, 0x2000, 0x1000),
+            // 0x1000..0x2000 of this layer is 0x0000..0x1000 of the base
+            Segment::linear(0x1000, 0x0000, 0x1000),
+        ];
+        let layer = SegmentedLayer::new("over", "base", segments, HashMap::new()).unwrap();
+        (layers, Arc::new(layer))
+    }
+
+    #[test]
+    fn a_hit_in_each_run_is_reported_where_it_sits_in_the_scanned_layer() {
+        // Planted at 0x2010 and 0x0020 of the base, which are 0x0010 and
+        // 0x1020 of the layer being scanned.
+        let (layers, layer) = two_run_layer(|data| {
+            data[0x2010..0x2014].copy_from_slice(b"FIND");
+            data[0x0020..0x0024].copy_from_slice(b"FIND");
+        });
+
+        let scanner = BytesScanner::new(b"FIND".to_vec());
+        let mut hits = Vec::new();
+        scan_layer(layer.as_ref(), &layers, &scanner, None, |offset| {
+            hits.push(offset)
+        })
+        .unwrap();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![0x0010, 0x1020]);
+    }
+
+    #[test]
+    fn a_hit_lying_across_two_runs_is_not_reported() {
+        // Upstream hands the scanner one run at a time and never reads across
+        // the boundary between two of them, so a needle that begins in one and
+        // ends in the next is not found. Joining the runs would find it, and
+        // would report matches this port's reference implementation does not.
+        let (layers, layer) = two_run_layer(|data| {
+            // The last two bytes of the base's 0x2000..0x3000 run, which is
+            // the end of the first run of the layer above.
+            data[0x2ffe..0x3000].copy_from_slice(b"FI");
+            // The first two bytes of the base's 0x0000..0x1000 run, which
+            // carries straight on from it in the layer above.
+            data[0x0000..0x0002].copy_from_slice(b"ND");
+        });
+
+        let scanner = BytesScanner::new(b"FIND".to_vec());
+        let mut hits = Vec::new();
+        scan_layer(layer.as_ref(), &layers, &scanner, None, |offset| {
+            hits.push(offset)
+        })
+        .unwrap();
+        assert!(
+            hits.is_empty(),
+            "a needle split across two runs must not be found, got {hits:?}"
+        );
     }
 }
 
