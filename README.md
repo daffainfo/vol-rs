@@ -38,83 +38,136 @@ Symbol packs go in `$XDG_DATA_HOME/vol-rs/symbols`, or `~/.local/share/vol-rs/sy
 
 Both sides were run against the same captures and diffed, header framing and trailing newlines included:
 
-| Check | Result |
+| Capture | Plugins run | Identical |
+|---|---:|---:|
+| Windows 11 24H2, build 26100, 4.3 GB crash dump | 113 | 105 |
+| Ubuntu 22.04, kernel 6.5.0-41, 4.3 GB VMware snapshot | 69 | 61 |
+| Windows 10 19041, 2.0 GB crash dump | 114 | 112 |
+| Windows XP, 512 MB raw capture | 114 | 113 |
+| Linux 3.2, 512 MB raw capture | 60 | 60 |
+
+The eight plugins that take a pattern or a rule were given one, the same on both sides, rather than left out. Three of the differences found that way were defects in this port and are fixed.
+
+| Other check | Result |
 |---|---|
-| Windows plugins with no arguments, Windows 10 19041 crash dump | 112 of 114 identical |
-| Windows plugins with no arguments, Windows XP raw capture | 113 of 114 identical |
-| Linux plugins with no arguments, Linux 3.2 raw capture | 60 of 60 identical |
-| Files written by extracting plugins | 24,441 compared across the three captures, every one equal |
+| Files written by extracting plugins | 24,441 compared, every one equal |
 | Plugin help pages | 197 of 197 identical |
 | Renderers | `csv`, `json`, `jsonl`, `quick` and `pretty` compared on several plugins, all identical |
 
-Two plugins account for every row that is not identical. `isfinfo` without `--live` lists the Python version's own identifier database rather than the image, in that database's own order, where this port lists the symbol directories, so neither answer is derivable from the other. `windows.memmap.Memmap` on the Windows 10 capture is killed by the out of memory killer part way through, and where it stops depends on the free memory at the time, so two Python runs do not agree with each other either. This port finishes all 9,014,410 lines of it, and every line the Python version wrote first is reproduced exactly. On the Windows XP capture both finish and the output matches.
-
 Instructions are decoded by the same library the Python version uses, compiled in at version 5.0.6, which is the version the reference was pinned to for these comparisons. Version 5.0.7 decodes one more instruction form, which changes how about two percent of `windows.mbrscan`'s lines are spelled on the Windows 10 capture and nothing else.
 
-Windows symbols for the captures used here come from the symbol packs the Volatility Foundation publishes, read by both tools. For an earlier Windows 10 19045 capture whose kernel no pack described, the description this port builds from the database Microsoft publishes matched the one the Python version builds from the same database exactly, across all 16 base types, 293 enumerations, 1,653 structures and 40,007 symbols.
-
-Across every plugin that runs with no arguments, the Windows 10 sweep takes 233 seconds here against 6113 seconds, the Windows XP sweep 48 seconds against 1674 seconds, and the Linux sweep 36 seconds against 1896 seconds.
+Windows symbols for the captures used here come from the symbol packs the Volatility Foundation publishes, read by both tools, except the Windows 11 24H2 kernel, which no pack describes and whose description is built from the database Microsoft publishes. For an earlier Windows 10 19045 capture the description this port builds that way matched the one the Python version builds from the same database exactly, across all 16 base types, 293 enumerations, 1,653 structures and 40,007 symbols.
 
 ## Speed
 
-The ten widest gaps on each capture, out of every plugin that runs with no arguments:
+The ten widest gaps on each capture. Every figure, and every plugin compared, is in [BENCHMARKS.md](BENCHMARKS.md).
 
-### Windows 10 19041 crash dump
-
-| Plugin | Rust | Python | Faster |
-|---|---:|---:|---:|
-| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.574 s | 346 s | x603 |
-| `windows.suspicious_threads.SuspiciousThreads` | 0.725 s | 343 s | x473 |
-| `windows.malware.malfind.Malfind` | 0.687 s | 313 s | x456 |
-| `windows.malware.hollowprocesses.HollowProcesses` | 0.555 s | 240 s | x432 |
-| `windows.malfind.Malfind` | 0.792 s | 320 s | x404 |
-| `windows.hollowprocesses.HollowProcesses` | 0.615 s | 244 s | x396 |
-| `windows.vadinfo.VadInfo` | 1.11 s | 412 s | x371 |
-| `yarascan.YaraScan` | 0.035 s | 11.7 s | x336 |
-| `configwriter.ConfigWriter` | 0.055 s | 14.5 s | x265 |
-| `windows.registry.hivelist.HiveList` | 0.036 s | 7.54 s | x211 |
-
-### Windows XP raw capture
+### Windows 11 24H2 crash dump, 4.3 GB
 
 | Plugin | Rust | Python | Faster |
 |---|---:|---:|---:|
-| `windows.suspicious_threads.SuspiciousThreads` | 0.148 s | 34.5 s | x233 |
-| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.152 s | 33.2 s | x218 |
-| `windows.hollowprocesses.HollowProcesses` | 0.142 s | 28.1 s | x197 |
-| `windows.malware.hollowprocesses.HollowProcesses` | 0.192 s | 31.0 s | x161 |
-| `windows.mftscan.MFTScan` | 0.322 s | 48.2 s | x150 |
-| `windows.etwpatch.EtwPatch` | 0.103 s | 15.2 s | x147 |
-| `windows.malware.malfind.Malfind` | 0.203 s | 28.2 s | x139 |
-| `windows.mftscan.ADS` | 0.189 s | 25.0 s | x132 |
-| `windows.malfind.Malfind` | 0.201 s | 26.3 s | x131 |
-| `windows.vadinfo.VadInfo` | 0.294 s | 38.5 s | x131 |
+| `windows.malfind.Malfind` | 0.494 s | 392 s | x793 |
+| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.621 s | 488 s | x786 |
+| `windows.malware.malfind.Malfind` | 0.569 s | 393 s | x691 |
+| `windows.suspicious_threads.SuspiciousThreads` | 0.739 s | 461 s | x624 |
+| `windows.hollowprocesses.HollowProcesses` | 0.646 s | 326 s | x504 |
+| `windows.malware.hollowprocesses.HollowProcesses` | 0.661 s | 322 s | x487 |
+| `layerwriter.LayerWriter` | 0.044 s | 17.4 s | x395 |
+| `configwriter.ConfigWriter` | 0.046 s | 16.7 s | x363 |
+| `windows.vadinfo.VadInfo` | 1.36 s | 488 s | x358 |
+| `windows.verinfo.VerInfo` | 0.541 s | 159 s | x294 |
 
-### Linux 3.2 raw capture
+### Ubuntu 22.04 VMware snapshot, 4.3 GB
 
 | Plugin | Rust | Python | Faster |
 |---|---:|---:|---:|
-| `linux.library_list.LibraryList` | 0.657 s | 917 s | x1396 |
-| `linux.pscallstack.PsCallStack` | 0.314 s | 98.8 s | x315 |
-| `linux.lsmod.Lsmod` | 0.076 s | 9.58 s | x127 |
-| `linux.check_idt.Check_idt` | 0.132 s | 15.1 s | x114 |
-| `linux.malware.tty_check.Tty_Check` | 0.132 s | 15.0 s | x114 |
-| `linux.malware.check_idt.Check_idt` | 0.136 s | 15.2 s | x112 |
+| `linux.sockstat.Sockstat` | 6.36 s | 2030 s | x319 |
+| `timeliner.Timeliner` | 9.56 s | 1070 s | x112 |
+| `linux.lsmod.Lsmod` | 0.282 s | 29.0 s | x103 |
+| `linux.psscan.PsScan` | 1.09 s | 111 s | x102 |
+| `linux.mountinfo.MountInfo` | 0.697 s | 70.3 s | x101 |
+| `yarascan.YaraScan` | 0.909 s | 79.6 s | x88 |
+| `linux.malware.netfilter.Netfilter` | 0.6 s | 49.9 s | x83 |
+| `linux.ptrace.Ptrace` | 0.253 s | 20.4 s | x81 |
+| `linux.pstree.PsTree` | 0.213 s | 16.2 s | x76 |
+| `linux.ip.Link` | 0.22 s | 16.4 s | x74 |
+
+### Windows 10 19041 crash dump, 2.0 GB
+
+| Plugin | Rust | Python | Faster |
+|---|---:|---:|---:|
+| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.677 s | 346 s | x511 |
+| `windows.suspicious_threads.SuspiciousThreads` | 0.677 s | 343 s | x507 |
+| `windows.malfind.Malfind` | 0.734 s | 320 s | x436 |
+| `windows.hollowprocesses.HollowProcesses` | 0.565 s | 244 s | x432 |
+| `windows.malware.malfind.Malfind` | 0.73 s | 313 s | x429 |
+| `windows.vadinfo.VadInfo` | 0.983 s | 412 s | x419 |
+| `windows.malware.hollowprocesses.HollowProcesses` | 0.648 s | 240 s | x370 |
+| `configwriter.ConfigWriter` | 0.043 s | 14.5 s | x337 |
+| `layerwriter.LayerWriter` | 0.039 s | 11.9 s | x304 |
+| `windows.registry.hivelist.HiveList` | 0.038 s | 7.54 s | x198 |
+
+### Windows XP raw capture, 512 MB
+
+| Plugin | Rust | Python | Faster |
+|---|---:|---:|---:|
+| `windows.suspicious_threads.SuspiciousThreads` | 0.184 s | 34.5 s | x188 |
+| `windows.malware.suspicious_threads.SuspiciousThreads` | 0.2 s | 33.2 s | x166 |
+| `windows.malware.hollowprocesses.HollowProcesses` | 0.209 s | 31.0 s | x148 |
+| `windows.vadinfo.VadInfo` | 0.263 s | 38.5 s | x146 |
+| `windows.hollowprocesses.HollowProcesses` | 0.207 s | 28.1 s | x136 |
+| `windows.mftscan.ResidentData` | 0.205 s | 27.6 s | x135 |
+| `windows.malfind.Malfind` | 0.203 s | 26.3 s | x130 |
+| `windows.mftscan.MFTScan` | 0.393 s | 48.2 s | x123 |
+| `windows.malware.malfind.Malfind` | 0.24 s | 28.2 s | x118 |
+| `windows.verinfo.VerInfo` | 0.215 s | 25.1 s | x117 |
+
+### Linux 3.2 raw capture, 512 MB
+
+| Plugin | Rust | Python | Faster |
+|---|---:|---:|---:|
+| `linux.library_list.LibraryList` | 0.525 s | 917 s | x1747 |
+| `linux.pscallstack.PsCallStack` | 0.31 s | 98.8 s | x319 |
+| `linux.lsmod.Lsmod` | 0.059 s | 9.58 s | x162 |
+| `linux.malware.check_idt.Check_idt` | 0.11 s | 15.2 s | x138 |
+| `linux.check_idt.Check_idt` | 0.115 s | 15.1 s | x131 |
+| `linux.tty_check.tty_check` | 0.114 s | 14.3 s | x125 |
+| `linux.malware.tty_check.Tty_Check` | 0.129 s | 15.0 s | x116 |
 | `linux.malware.check_modules.Check_modules` | 0.055 s | 5.74 s | x104 |
-| `linux.kallsyms.Kallsyms` | 0.291 s | 28.9 s | x99 |
-| `linux.keyboard_notifiers.Keyboard_notifiers` | 0.110 s | 10.8 s | x98 |
-| `linux.boottime.Boottime` | 0.060 s | 5.48 s | x92 |
-
-[BENCHMARKS.md](BENCHMARKS.md) has the rest: every plugin on all three captures and the machine the numbers were measured on.
+| `linux.kallsyms.Kallsyms` | 0.278 s | 28.9 s | x104 |
+| `linux.capabilities.Capabilities` | 0.056 s | 5.82 s | x104 |
 
 ## Known differences
 
-A handful of things cannot match, and each is deliberate:
+These are deliberate, and will not change:
 
-* `linux.pagecache.RecoverFs` stamps every file in the tarball it writes with the moment the plugin ran, so no two runs agree, not even two Python runs. The table matches and so does the unpacked tree.
 * `--save-config` and `timeliner --record-config` record every setting that describes the image, but not the Python version's checks that an imported component is new enough, because this port has no such checks to record.
-* `linux.mountinfo --mount-format` joins a Python set, so its column order changes between two Python runs. This port lists the mount options first and the filesystem options after, in the order the kernel holds them.
 * `frameworkinfo` and `isfinfo` describe the tool rather than the image, so they report this port's own layers, plugins and symbol files.
 * The line in `--help` naming the cache directory names this port's own cache.
+* `windows.callbacks` leaves out the shutdown notifications it cannot parse. On a 64-bit image the Python version runs no check on them at all, so it reports two entries on the Windows 11 capture that are ntoskrnl's own instruction bytes rather than callbacks, marked as unparsed.
+
+## Not reproducible
+
+Nothing here can match, because the output is not the same twice even from one tool:
+
+* `linux.pagecache.RecoverFs` stamps every file in the tarball it writes with the moment the plugin ran, so no two runs agree, not even two Python runs. The table matches and so does the unpacked tree.
+* `linux.mountinfo --mount-format` joins a Python set, so its column order changes between two Python runs. This port lists the mount options first and the filesystem options after, in the order the kernel holds them.
+* `timeliner` with no filter appends the timeline again after every plugin, and the order the plugins run in is the order `os.walk` returned the plugin directory, which is a property of the install rather than of the release. Two Python installs of the same version report different totals on the same image. This port runs a fixed list, the order a stock install on ext4 produces.
+* `windows.memmap.Memmap` on the larger captures is killed by the out of memory killer part way through, and where it stops depends on the free memory at the time, so two Python runs do not agree with each other either. On the Windows XP capture both finish and the output matches.
+
+## Where the Python version stops first
+
+These differ because the Python version ends early and this port does not. Every line the Python version wrote before stopping is reproduced exactly, and the rest is what it did not reach:
+
+| Plugin | What happens |
+|---|---|
+| `windows.hashdump`, `windows.cachedump`, `windows.lsadump` | the Python version raises on a hive page that is not resident, where this port reports what it could read and carries on |
+| `linux.kallsyms` | `TypeError: pointer_to_string takes a Pointer` after 196,399 of 208,258 rows |
+| `linux.kmsg`, `linux.hidden_modules` | `AttributeError: 'NativeTable' object has no attribute 'producer'` before the first row |
+| `linux.pagecache.RecoverFs` | `AttributeError: StructType has no attribute: page.mapping` after 3,639 of 34,625 rows on the Ubuntu capture |
+| `linux.library_list`, `linux.pscallstack` | still running after 45 minutes, where this port finishes in seconds |
+
+`isfinfo` is in neither list. Without `--live` the Python version lists its own identifier database in that database's order, where this port lists the symbol directories, so neither answer is derivable from the other.
 
 ## To do
 
@@ -122,7 +175,7 @@ Everything below is ported and builds, but has not been run against real evidenc
 
 - [ ] Test the 23 macOS plugins against a real Mac capture. All 23 were read line by line against the Python source, and every type, member and symbol they touch was checked against the 129 published Darwin symbol files covering 10.6 to 10.15, so the version fallbacks are known to be complete. What is left is a real Mac image to run them on.
 - [ ] Test the remaining image formats. Raw, VMware, LiME and Windows crash dump captures have all been used, so the AVML, QEMU, ELF core and Xen layers are the ones still unproven on real files.
-- [ ] Test more kernel versions. Windows XP, Windows 10 19041 and 19045, Linux 3.2 and Linux 6.8 is still a narrow base, and plugins that read version specific structures are where a port is most likely to drift.
+- [ ] Test more kernel versions. Windows XP, Windows 10 19041 and 19045, Windows 11 24H2, Linux 3.2, Ubuntu 22.04 on 6.5 and Linux 6.8 is still a narrow base, and plugins that read version specific structures are where a port is most likely to drift.
 - [ ] Add the arrow and parquet renderers. They are accepted on the command line and refused, which is what the Python version does when its table library is missing.
 
 ## Credit

@@ -206,9 +206,9 @@ impl SymbolLocation {
     /// reports the symbols it used.
     pub fn url(&self) -> String {
         match self {
-            SymbolLocation::File(path) => format!("file://{}", absolute(path).display()),
+            SymbolLocation::File(path) => file_url(&absolute(path)),
             SymbolLocation::ZipEntry { archive, entry } => {
-                format!("jar:file://{}!/{entry}", absolute(archive).display())
+                format!("jar:{}!/{entry}", file_url(&absolute(archive)))
             }
             SymbolLocation::Bundled { name } => format!("bundled://{name}"),
         }
@@ -828,5 +828,99 @@ mod parsed_cache {
         if std::fs::write(&temporary, &data).is_ok() {
             let _ = std::fs::rename(&temporary, &path);
         }
+    }
+}
+
+/// A path as a `file://` URL.
+///
+/// Upstream builds these with `pathlib.Path.as_uri`, which is `quote` with
+/// `/` left alone, so everything outside the unreserved set is written as a
+/// percent escape. A Debian kernel's symbol file has a `+` in its name, and
+/// leaving that as it stands produces a URL the reference implementation does
+/// not, which shows up in any configuration written out.
+pub fn file_url(path: &std::path::Path) -> String {
+    format!("file://{}", percent_encode(&path.display().to_string()))
+}
+
+/// Escape everything outside the unreserved set, leaving the separators.
+///
+/// `quote` keeps the letters, the digits, `_.-~` and whatever is named safe,
+/// which for a path is `/`. The escapes are written in upper case, as Python
+/// writes them.
+pub fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Undo `percent_encode`, so a configuration written by either tool reads back.
+pub fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &text[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_is_escaped_the_way_as_uri_escapes_it() {
+        // The values on the right are what `pathlib.Path(..).as_uri()` returns.
+        let cases = [
+            ("/a/b+c.json", "file:///a/b%2Bc.json"),
+            ("/a/b c.json", "file:///a/b%20c.json"),
+            ("/a/b#c", "file:///a/b%23c"),
+            ("/a/b%c", "file:///a/b%25c"),
+            ("/a/b&c", "file:///a/b%26c"),
+            ("/a/b=c", "file:///a/b%3Dc"),
+            ("/a/b,c", "file:///a/b%2Cc"),
+            ("/a/b@c", "file:///a/b%40c"),
+            // Left alone, being unreserved or a separator.
+            ("/a/b~c", "file:///a/b~c"),
+            ("/a/b-c_d.e", "file:///a/b-c_d.e"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(file_url(std::path::Path::new(path)), want, "for {path}");
+        }
+    }
+
+    #[test]
+    fn a_symbol_file_named_like_a_debian_kernel_round_trips() {
+        let path = "/syms/linux/Debian_3.2.57-3+deb7u2_3.2.0-4-amd64_x64.json.xz";
+        let url = file_url(std::path::Path::new(path));
+        assert!(url.contains("%2B"), "the plus has to be escaped, got {url}");
+        assert_eq!(percent_decode(url.strip_prefix("file://").unwrap()), path);
+    }
+
+    #[test]
+    fn a_location_with_no_escapes_decodes_to_itself() {
+        assert_eq!(percent_decode("/plain/path.json"), "/plain/path.json");
+    }
+
+    #[test]
+    fn a_trailing_stray_percent_is_left_as_it_stands() {
+        assert_eq!(percent_decode("/a/b%"), "/a/b%");
+        assert_eq!(percent_decode("/a/b%zz"), "/a/b%zz");
     }
 }

@@ -141,9 +141,8 @@ pub fn describe_layer(
     {
         entries.push((
             format!("{prefix}.location"),
-            json_string(&format!(
-                "file://{}",
-                crate::framework::symbols::intermed::absolute(file.location()).display()
+            json_string(&crate::framework::symbols::intermed::file_url(
+                &crate::framework::symbols::intermed::absolute(file.location()),
             )),
         ));
         entries.push((

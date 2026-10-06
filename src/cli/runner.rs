@@ -526,7 +526,10 @@ fn json_to_config(value: &serde_json::Value) -> Option<ConfigValue> {
 /// The path a `file://` location names.
 fn location_to_path(location: &str) -> Result<std::path::PathBuf> {
     match location.strip_prefix("file://") {
-        Some(path) => Ok(std::path::PathBuf::from(path)),
+        // The escapes a written configuration carries have to come back off.
+        Some(path) => Ok(std::path::PathBuf::from(
+            crate::framework::symbols::intermed::percent_decode(path),
+        )),
         None => Err(VolatilityError::Other(format!(
             "Only file locations are supported, not '{location}'"
         ))),

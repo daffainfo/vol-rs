@@ -1,21 +1,12 @@
 # Runtime against volatility3
 
-Same plugin, same image, same machine, same arguments, byte-identical output,
-wall clock. One plugin at a time with warm caches and nothing else running.
-Only plugins where both tools finished and agreed byte for byte are listed.
+Same plugin, same image, same machine, same arguments, byte-identical output, wall clock. One plugin at a time with warm caches and nothing else running. Only plugins where both tools finished and agreed byte for byte are listed.
 
-The Rust column is the median of three runs after a discarded warm up run,
-measured at `e872b2c`. The Python column was measured the same way but not in
-the same pass, so a figure here is two measurements taken against the same
-image rather than a single race. `vol` is unchanged between them, and its runs
-had the page cache already warm, so where the two disagree the error favours
-`vol` and the ratio is the conservative one.
+The Rust column is the median of three runs after a discarded warm up run, measured at `e872b2c`. The Python column was measured the same way but not in the same pass, so a figure here is two measurements taken against the same image rather than a single race. `vol` is unchanged between them, and its runs had the page cache already warm, so where the two disagree the error favours `vol` and the ratio is the conservative one.
 
-Every row was checked against the row count `vol` produced for the same plugin
-and arguments. A plugin whose output moved would not be timed here at all.
+Every row was checked against the row count `vol` produced for the same plugin and arguments. A plugin whose output moved would not be timed here at all.
 
-Measured on one machine with one set of captures, so the figures will differ on
-other hardware, other images and a different amount of free memory.
+Measured on one machine with one set of captures, so the figures will differ on other hardware, other images and a different amount of free memory.
 
 ## Machine
 
@@ -30,8 +21,7 @@ other hardware, other images and a different amount of free memory.
 
 ## Images
 
-The figures below were measured on the Volatility Foundation's own test data,
-release [v0.0.1](https://github.com/volatilityfoundation/volatility3-test-data/releases/tag/v0.0.1).
+The figures below were measured on the Volatility Foundation's own test data, release [v0.0.1](https://github.com/volatilityfoundation/volatility3-test-data/releases/tag/v0.0.1).
 
 | Image | Size | Format | System | Source |
 |---|---:|---|---|---|
@@ -39,8 +29,7 @@ release [v0.0.1](https://github.com/volatilityfoundation/volatility3-test-data/r
 | `win-xp-laptop-2005-06-25.img` | 512 MB | raw | Windows XP, 47 processes | [win-xp-laptop-2005-06-25.img.gz](https://github.com/volatilityfoundation/volatility3-test-data/releases/download/v0.0.1/win-xp-laptop-2005-06-25.img.gz) |
 | `linux-sample-1.bin` | 512 MB | raw | Linux 3.2, 133 tasks | [linux-sample-1.bin.gz](https://github.com/volatilityfoundation/volatility3-test-data/releases/download/v0.0.1/linux-sample-1.bin.gz) |
 
-Two larger captures check that the output stays byte identical on a recent
-Windows build and a recent Linux kernel.
+Two larger captures check that the output stays byte identical on a recent Windows build and a recent Linux kernel.
 
 | Image | Size | Format | System | Source |
 |---|---:|---|---|---|
