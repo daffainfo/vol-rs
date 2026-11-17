@@ -123,7 +123,7 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
     // A configuration file is read first, so anything given on the command line
     // takes precedence over it.
     if let Some(path) = &arguments.config {
-        apply_configuration_file(plugin.as_ref(), &config, path)?;
+        apply_configuration_file(plugin.as_ref(), &context, &config, path)?;
     }
 
     // Plugin options first, so a failure here is reported before the expensive
@@ -183,9 +183,13 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
                     .to_string(),
             ));
         };
-        if let Some(value) = json_to_config(&serde_json::from_str(value).map_err(|error| {
+        let parsed: serde_json::Value = serde_json::from_str(value).map_err(|error| {
             VolatilityError::Other(format!("Could not read the setting '{extension}': {error}"))
-        })?) {
+        })?;
+        if record_image_setting(&context, path, &parsed) {
+            continue;
+        }
+        if let Some(value) = json_to_config(&parsed) {
             config.set(setting_name(path), value);
         }
     }
@@ -474,6 +478,7 @@ pub fn run_cli(argv: &[String]) -> Result<i32> {
 /// own options are the ones applied.
 fn apply_configuration_file(
     plugin: &dyn crate::framework::plugins::Plugin,
+    context: &Arc<Context>,
     config: &Configuration,
     path: &std::path::Path,
 ) -> Result<()> {
@@ -489,7 +494,7 @@ fn apply_configuration_file(
     };
 
     let requirements = plugin.requirements();
-    for (key, value) in settings {
+    for (key, value) in settings.iter().filter(|(key, _)| !is_image_setting(key)) {
         let name = setting_name(key);
         if !requirements
             .iter()
@@ -502,7 +507,83 @@ fn apply_configuration_file(
             config.set(name, value);
         }
     }
+    // Where the kernel sits and which file describes it are worked out by the
+    // automagic, but an image can carry a second copy of its kernel's header
+    // that the search mistakes for the real one, and then nothing can be read.
+    // A configuration names the right ones, so they are taken in the order the
+    // search itself would prefer them.
+    for key in [
+        "kernel.layer_name.kernel_virtual_offset",
+        "kernel.offset",
+        "kernel.symbol_table_name.isf_url",
+    ] {
+        if let Some(value) = settings.get(key) {
+            record_image_setting(context, key, value);
+        }
+    }
     Ok(())
+}
+
+/// Whether a setting describes the image rather than a plugin option.
+fn is_image_setting(key: &str) -> bool {
+    matches!(
+        key,
+        "kernel.offset"
+            | "kernel.layer_name.kernel_virtual_offset"
+            | "kernel.symbol_table_name.isf_url"
+    )
+}
+
+/// Store one of the settings that name where the kernel and its symbols are.
+///
+/// Returns whether the setting was one of those.
+fn record_image_setting(
+    context: &Arc<Context>,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    match key {
+        // The module carries the address every symbol is read from, which is
+        // the kernel's base. A configuration that only records the layer's
+        // virtual offset says the same thing.
+        "kernel.offset" | "kernel.layer_name.kernel_virtual_offset" => {
+            if let Some(offset) = value.as_u64() {
+                log::debug!("Kernel base {offset:#x} taken from the configuration");
+                context.config.set(
+                    "automagic.kernel_virtual_offset",
+                    ConfigValue::Int(offset as i64),
+                );
+            }
+            true
+        }
+        "kernel.symbol_table_name.isf_url" => {
+            let Some(url) = value.as_str() else {
+                return true;
+            };
+            match symbol_path(url) {
+                Some(path) => context.config.set(
+                    "automagic.symbol_file",
+                    ConfigValue::Str(path.display().to_string()),
+                ),
+                None => log::warn!("Only file symbol locations are supported, not '{url}'"),
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The file a symbol URL names.
+///
+/// A bare `file:` path is relative to the working directory, which is how the
+/// reference implementation reads one, and the escapes a written
+/// configuration carries have to come back off.
+fn symbol_path(url: &str) -> Option<std::path::PathBuf> {
+    let path = url.strip_prefix("file:")?;
+    let path = path.strip_prefix("//").unwrap_or(path);
+    Some(std::path::PathBuf::from(
+        crate::framework::symbols::intermed::percent_decode(path),
+    ))
 }
 
 /// The option a dotted setting path names.
@@ -847,5 +928,28 @@ fn announce(arguments: &args::Arguments) {
         eprintln!("{banner}");
     } else {
         println!("{banner}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_url_names_a_path_that_may_be_absolute_or_relative() {
+        assert_eq!(
+            symbol_path("file:ntkrnlmp.pdb/ABCDEF-2.json.xz"),
+            Some(std::path::PathBuf::from("ntkrnlmp.pdb/ABCDEF-2.json.xz"))
+        );
+        assert_eq!(
+            symbol_path("file:///tmp/a%20directory/ABCDEF-2.json.xz"),
+            Some(std::path::PathBuf::from("/tmp/a directory/ABCDEF-2.json.xz"))
+        );
+    }
+
+    #[test]
+    fn a_location_this_port_cannot_read_names_nothing() {
+        assert_eq!(symbol_path("https://example.invalid/ABCDEF-2.json.xz"), None);
+        assert_eq!(symbol_path("ABCDEF-2.json.xz"), None);
     }
 }
