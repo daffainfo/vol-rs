@@ -19,7 +19,7 @@ use crate::framework::automagic::DetectedOs;
 use crate::framework::context::{Context, Module};
 use crate::framework::layers::intel::{IntelLayer, WINDOWS_INTEL, WINDOWS_INTEL_32E, WINDOWS_INTEL_PAE};
 use crate::framework::layers::DataLayer;
-use crate::framework::symbols::intermed::{create_table, SymbolFinder};
+use crate::framework::symbols::intermed::{create_table, SymbolFinder, SymbolLocation};
 
 const PAGE_SIZE: usize = 0x1000;
 
@@ -440,32 +440,56 @@ pub fn detect(
     log::info!("Windows kernel layer '{layer_name}' built with DTB {dtb:#x}");
 
     // The kernel names the symbol file that describes it, so finding the kernel
-    // and loading its symbols are one step. A kernel found before is looked for
-    // where it was, which either answers at once or falls through to the
-    // search that found it the first time.
+    // and loading its symbols are one step. Three answers are tried in turn:
+    // the one a configuration gives, the one a previous run found, and a
+    // search of the image.
+    //
+    // A configuration may name the kernel's base outright. An image can carry
+    // a second copy of the kernel's header, older than the running one, and a
+    // search cannot tell the two apart: it stops at the first record it finds
+    // and every symbol read is then made at the wrong address. Where an answer
+    // is given it is confirmed rather than searched for.
     let started = std::time::Instant::now();
-    let recalled = remembered.as_ref().and_then(|facts| {
-        if facts.kernel_offset == 0 || facts.banner_offset == 0 {
-            return None;
+    let mut found = None;
+    if let Some(offset) = context
+        .config
+        .get_int("automagic.kernel_virtual_offset")
+        .map(|offset| offset as u64)
+    {
+        match pdbscan::kernel_at(context, &layer_name, offset) {
+            Some(kernel) => {
+                log::debug!("Kernel base {offset:#x} taken from the configuration");
+                found = Some(kernel);
+            }
+            None => log::warn!(
+                "The configured kernel base {offset:#x} does not hold a kernel, \
+                 so it is searched for instead"
+            ),
         }
-        let found = pdbscan::kernel_at_known_record(
-            context,
-            &layer_name,
-            facts.kernel_offset,
-            facts.banner_offset,
-        )?;
-        (found.candidate.symbol_file_name() == facts.banner).then_some(found)
-    });
-    let found = match recalled {
-        Some(found) => {
+    }
+    if found.is_none() {
+        found = remembered.as_ref().and_then(|facts| {
+            if facts.kernel_offset == 0 || facts.banner_offset == 0 {
+                return None;
+            }
+            let found = pdbscan::kernel_at_known_record(
+                context,
+                &layer_name,
+                facts.kernel_offset,
+                facts.banner_offset,
+            )?;
+            (found.candidate.symbol_file_name() == facts.banner).then_some(found)
+        });
+        if let Some(kernel) = &found {
             log::debug!(
                 "Kernel base {:#x} confirmed where it was last found",
-                found.virtual_offset
+                kernel.virtual_offset
             );
-            Some(found)
         }
-        None => pdbscan::find_kernel(context, &layer_name, physical_layer),
-    };
+    }
+    if found.is_none() {
+        found = pdbscan::find_kernel(context, &layer_name, physical_layer);
+    }
     log::debug!("Finding the kernel took {:?}", started.elapsed());
 
     let Some(found) = found else {
@@ -477,22 +501,51 @@ pub fn detect(
 
     let identity = found.candidate.symbol_file_name();
     let directory = found.candidate.symbol_directory();
-    let location = match finder.find(&directory, &identity) {
-        Some(location) => location,
-        // Nothing describes this kernel yet, so the database Microsoft
-        // publishes for it is fetched and turned into one.
-        None => match build_symbols(&found.candidate, finder) {
-            Ok(location) => location,
-            Err(error) => {
+    // A configuration may also name the symbol file itself. It is used in
+    // place of the search, so that a file outside the symbol directories can
+    // be named without moving it, and a name that is not there falls back to
+    // the search rather than failing the run.
+    let configured_symbols = context
+        .config
+        .get_string("automagic.symbol_file")
+        .and_then(|path| {
+            let path = std::path::PathBuf::from(path);
+            if path.is_file() {
+                Some(path)
+            } else {
                 log::warn!(
-                    "This kernel is described by {directory}/{identity}, \
-                     which is not installed and could not be built: {error}"
+                    "The symbol file {} named by the configuration is not there, \
+                     so symbols are searched for instead",
+                    path.display()
                 );
-                return Ok(Some(DetectedOs {
-                    layer_name,
-                    module_name: None,
-                }));
+                None
             }
+        });
+    let location = match configured_symbols {
+        Some(path) => {
+            log::debug!(
+                "Symbol file {} taken from the configuration",
+                path.display()
+            );
+            SymbolLocation::File(path)
+        }
+        None => match finder.find(&directory, &identity) {
+            Some(location) => location,
+            // Nothing describes this kernel yet, so the database Microsoft
+            // publishes for it is fetched and turned into one.
+            None => match build_symbols(&found.candidate, finder) {
+                Ok(location) => location,
+                Err(error) => {
+                    log::warn!(
+                        "This kernel is described by {directory}/{identity}, \
+                         which is not installed and could not be built: {error}"
+                    );
+                    return Ok(Some(DetectedOs {
+                        layer_name,
+                        module_name: None,
+                    }));
+                }
+            },
         },
     };
     log::info!(
